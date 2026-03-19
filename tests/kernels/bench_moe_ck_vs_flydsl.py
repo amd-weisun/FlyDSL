@@ -60,11 +60,11 @@ MXFP4_PAD_ALIGN = 256
 MODEL_DIM_PADDED = (MODEL_DIM + MXFP4_PAD_ALIGN - 1) // MXFP4_PAD_ALIGN * MXFP4_PAD_ALIGN  # 3072
 INTER_DIM_PADDED = (INTER_DIM + MXFP4_PAD_ALIGN - 1) // MXFP4_PAD_ALIGN * MXFP4_PAD_ALIGN  # 3072
 
-# Inference scenario: prompt=1K, output=8K, decode-dominated
-# M = concurrency in decode (1 token/request/step), or prompt_len in prefill
-DECODE_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128]   # concurrency points
-PREFILL_TOKENS = [1024]                            # 1K prompt (processed once)
-SWEEP_TOKENS = DECODE_TOKENS + PREFILL_TOKENS
+# MoE is a per-token FFN — performance depends only on M (number of tokens),
+# not on sequence length. Prefill M=1024 and decode concurrency=1024 are identical
+# from MoE's perspective. In decode-dominated serving (1K prompt, 8K output),
+# M = concurrency (number of concurrent requests generating 1 token each).
+SWEEP_CONCURRENCY = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +578,7 @@ def print_results(rows: List[MoeBenchRow]) -> None:
     print(f"MoE Benchmark — GPT-OSS 120B A4W4 (E={NUM_EXPERTS}, topk={TOPK}, "
           f"hidden={MODEL_DIM}, inter={INTER_DIM})")
     print("=" * 90)
-    hdr = f"{'Tokens':>7s}  {'Kernel':<16s}  {'Latency(us)':>12s}  {'TFLOPS':>8s}"
+    hdr = f"{'M(conc)':>7s}  {'Kernel':<16s}  {'Latency(us)':>12s}  {'TFLOPS':>8s}"
     print(hdr)
     print("-" * 90)
 
@@ -619,10 +619,10 @@ def print_results(rows: List[MoeBenchRow]) -> None:
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(description="MoE benchmark: CK A4W4 vs FlyDSL")
-    parser.add_argument("--tokens", type=str, default="1,32,128",
-                        help="Comma-separated token counts")
+    parser.add_argument("--concurrency", type=str, default="1,32,128",
+                        help="Comma-separated M values (decode concurrency or prefill tokens)")
     parser.add_argument("--sweep", action="store_true",
-                        help="Sweep all decode+prefill batch sizes")
+                        help="Sweep all concurrency points (1..1024)")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--flydsl-only", action="store_true",
@@ -635,9 +635,9 @@ def main():
     torch.set_default_device("cuda")
 
     if args.sweep:
-        token_list = SWEEP_TOKENS
+        token_list = SWEEP_CONCURRENCY
     else:
-        token_list = [int(t.strip()) for t in args.tokens.split(",")]
+        token_list = [int(t.strip()) for t in args.concurrency.split(",")]
 
     rows: List[MoeBenchRow] = []
 
