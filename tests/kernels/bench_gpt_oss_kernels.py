@@ -202,6 +202,7 @@ def _bench_flydsl_rmsnorm(s: KernelShape, warmup: int, iters: int) -> float:
 def _bench_flydsl_gemm_bf16(s: KernelShape, warmup: int, iters: int) -> float:
     """Benchmark FlyDSL preshuffle GEMM (BF16)."""
     from kernels.preshuffle_gemm import compile_preshuffle_gemm_a8
+    from tests.utils import shuffle_weight
 
     tile_m = min(64, max(16, s.M))
     for tm in [16, 32, 64, 128]:
@@ -209,23 +210,36 @@ def _bench_flydsl_gemm_bf16(s: KernelShape, warmup: int, iters: int) -> float:
             tile_m = tm
             break
 
+    # tile_n and tile_k must divide N and K respectively
+    tile_n = 128
+    while tile_n > 16 and s.N % tile_n != 0:
+        tile_n //= 2
+    tile_k = 256
+    while tile_k > 64 and s.K % tile_k != 0:
+        tile_k //= 2
+
     launch_fn = compile_preshuffle_gemm_a8(
         M=s.M, N=s.N, K=s.K,
-        tile_m=tile_m, tile_n=128, tile_k=256,
+        tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
         in_dtype="bf16", out_dtype="bf16",
     )
-    a = torch.randn(s.M, s.K, dtype=torch.bfloat16, device="cuda")
-    # B needs preshuffle — for now use random bytes in the right shape
-    b = torch.randint(0, 256, (s.N, s.K), dtype=torch.uint8, device="cuda")
-    scale_a = torch.ones(s.M, dtype=torch.float32, device="cuda")
-    scale_b = torch.ones(s.N, dtype=torch.float32, device="cuda")
-    c = torch.empty(s.M, s.N, dtype=torch.bfloat16, device="cuda")
+    device = torch.device("cuda")
+    a = torch.randn(s.M, s.K, dtype=torch.bfloat16, device=device)
+    b = torch.randn(s.N, s.K, dtype=torch.bfloat16, device=device)
+    # B must be preshuffle-formatted using the same layout as the test
+    b_shuffled = shuffle_weight(b, layout=(16, 16))
+    # BF16 has no per-token scales — pass empty tensors
+    sa_flat = torch.empty((0,), device=device, dtype=torch.float32)
+    sb_flat = torch.empty((0,), device=device, dtype=torch.float32)
+    c = torch.empty(s.M, s.N, dtype=torch.bfloat16, device=device)
     stream = torch.cuda.current_stream()
 
     return bench_gpu_us_torch(
         lambda: launch_fn(
-            c.view(-1), a.view(-1), b.view(-1),
-            scale_a.view(-1), scale_b.view(-1),
+            c.contiguous().view(-1),
+            a.contiguous().view(-1),
+            b_shuffled.contiguous().view(-1),
+            sa_flat, sb_flat,
             s.M, s.N, stream,
         ),
         warmup=warmup, iters=iters,
@@ -302,6 +316,17 @@ def bench_flydsl(s: KernelShape, warmup: int, iters: int) -> Tuple[Optional[floa
         key = "gemm_bf16"
     else:
         return None, f"no FlyDSL bench for {s.kernel_type}/{s.dtype}"
+
+    # Validate shapes before launching (GPU faults are unrecoverable)
+    if key == "gemm_bf16":
+        # N must be divisible by 16 (preshuffle NLane=16)
+        if s.N % 16 != 0:
+            return None, f"N={s.N} not divisible by 16 (preshuffle req)"
+        if s.K < 64:
+            return None, f"K={s.K} too small for preshuffle GEMM"
+    elif key == "gemm_mxfp4":
+        if s.N % 32 != 0 or s.K % 32 != 0:
+            return None, f"N={s.N}/K={s.K} not divisible by 32 (MXFP4 req)"
 
     fn = FLYDSL_BENCH_DISPATCH.get(key)
     if fn is None:
