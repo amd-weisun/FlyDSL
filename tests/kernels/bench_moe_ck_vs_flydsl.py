@@ -67,38 +67,30 @@ SWEEP_TOKENS = DECODE_TOKENS + PREFILL_TOKENS
 # ---------------------------------------------------------------------------
 @dataclass
 class MoeBenchRow:
-    stage: int
+    label: str       # "CK fused", "FlyDSL S1", "FlyDSL S2", "FlyDSL S1+S2"
     tokens: int
-    ck_us: Optional[float]
-    flydsl_us: Optional[float]
-
-    @property
-    def speedup(self) -> Optional[float]:
-        if self.ck_us is None or self.flydsl_us is None:
-            return None
-        return self.ck_us / self.flydsl_us
+    us: Optional[float]
 
     @property
     def flops(self) -> int:
-        # MoE GEMM: each token hits topk experts
-        # Stage1: gate+up fused = 2 * tokens * topk * (2*inter_dim) * model_dim
-        # Stage2: down = 2 * tokens * topk * model_dim * inter_dim
-        if self.stage == 1:
-            return 2 * self.tokens * TOPK * (2 * INTER_DIM) * MODEL_DIM
-        else:
-            return 2 * self.tokens * TOPK * MODEL_DIM * INTER_DIM
+        # Total MoE FLOPs (both stages combined):
+        # S1: 2 * tokens * topk * (2*inter) * model
+        # S2: 2 * tokens * topk * model * inter
+        s1 = 2 * self.tokens * TOPK * (2 * INTER_DIM) * MODEL_DIM
+        s2 = 2 * self.tokens * TOPK * MODEL_DIM * INTER_DIM
+        if "S1+S2" in self.label or "fused" in self.label:
+            return s1 + s2
+        elif "S1" in self.label:
+            return s1
+        elif "S2" in self.label:
+            return s2
+        return s1 + s2
 
     @property
-    def ck_tflops(self) -> Optional[float]:
-        if self.ck_us is None:
+    def tflops(self) -> Optional[float]:
+        if self.us is None:
             return None
-        return self.flops / (self.ck_us / 1e6) / 1e12
-
-    @property
-    def flydsl_tflops(self) -> Optional[float]:
-        if self.flydsl_us is None:
-            return None
-        return self.flops / (self.flydsl_us / 1e6) / 1e12
+        return self.flops / (self.us / 1e6) / 1e12
 
 
 # ---------------------------------------------------------------------------
@@ -132,89 +124,56 @@ def build_routing(tokens: int, device: torch.device):
 # ---------------------------------------------------------------------------
 # CK MoE benchmark (via AITER)
 # ---------------------------------------------------------------------------
-def bench_ck_moe_stage1(
+def bench_ck_moe_fused(
     tokens: int, warmup: int, iters: int,
 ) -> Optional[float]:
-    """Benchmark CK MoE stage1 (gate+up GEMM)."""
+    """Benchmark CK fused_moe (stage1+stage2 combined) with MXFP4 (A4W4).
+
+    GPT-OSS uses MXFP4 for MoE: per-1x32 block scales, FP4 packed weights.
+    CK's fused_moe handles sorting + stage1 + stage2 internally.
+    """
     if not maybe_enable_aiter():
         return None
     try:
-        from aiter.ops.moe_op import ck_moe_stage1_fwd
-        from aiter.ops.enum import QuantType, ActivationType
+        import aiter
+        from aiter.fused_moe import fused_moe
     except ImportError:
-        print("  [CK] Could not import ck_moe_stage1_fwd")
+        print("  [CK] Could not import aiter.fused_moe")
         return None
 
     device = torch.device("cuda")
-    routing = build_routing(tokens, device)
-    if routing is None:
-        return None
-    sorted_ids, sorted_w, sorted_expert_ids, num_valid_ids = routing
 
-    hidden = torch.randn(tokens, MODEL_DIM, dtype=torch.float16, device=device)
-    w1 = torch.randn(NUM_EXPERTS, 2 * INTER_DIM, MODEL_DIM, dtype=torch.float16, device=device)
-    w2 = torch.randn(NUM_EXPERTS, MODEL_DIM, INTER_DIM, dtype=torch.float16, device=device)
-    out = torch.empty(tokens, TOPK, INTER_DIM, dtype=torch.float16, device=device)
+    # MXFP4 packed weights: each element is 4 bits, packed 2 per byte
+    w1 = torch.randint(0, 256, (NUM_EXPERTS, 2 * INTER_DIM, MODEL_DIM // 2),
+                        dtype=torch.uint8, device=device)
+    w2 = torch.randint(0, 256, (NUM_EXPERTS, MODEL_DIM, INTER_DIM // 2),
+                        dtype=torch.uint8, device=device)
+    # E8M0 block scales (per 32 elements)
+    w1_scale = torch.randint(124, 130, (NUM_EXPERTS, 2 * INTER_DIM, MODEL_DIM // 32),
+                              dtype=torch.uint8, device=device)
+    w2_scale = torch.randint(124, 130, (NUM_EXPERTS, MODEL_DIM, INTER_DIM // 32),
+                              dtype=torch.uint8, device=device)
+
+    # Input: BF16 hidden states (A4 quantization happens inside fused_moe)
+    hidden = torch.randn(tokens, MODEL_DIM, dtype=torch.bfloat16, device=device)
+
+    # Router scores -> topk
+    router_logits = torch.randn(tokens, NUM_EXPERTS, dtype=torch.float32, device=device)
 
     def run():
-        ck_moe_stage1_fwd(
-            hidden_states=hidden, w1=w1, w2=w2,
-            sorted_token_ids=sorted_ids,
-            sorted_expert_ids=sorted_expert_ids,
-            num_valid_ids=num_valid_ids,
-            out=out, topk=TOPK,
-            quant_type=QuantType.No,
-            activation=ActivationType.Silu,
+        fused_moe(
+            hidden_states=hidden,
+            w1=w1, w2=w2,
+            gating_output=router_logits,
+            topk=TOPK,
+            w1_scale=w1_scale, w2_scale=w2_scale,
+            renormalize=True,
         )
 
     try:
         return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
     except Exception as e:
-        print(f"  [CK] Stage1 failed: {e}")
-        return None
-
-
-def bench_ck_moe_stage2(
-    tokens: int, warmup: int, iters: int,
-) -> Optional[float]:
-    """Benchmark CK MoE stage2 (down GEMM)."""
-    if not maybe_enable_aiter():
-        return None
-    try:
-        from aiter.ops.moe_op import ck_moe_stage2_fwd
-        from aiter.ops.enum import QuantType, ActivationType
-    except ImportError:
-        print("  [CK] Could not import ck_moe_stage2_fwd")
-        return None
-
-    device = torch.device("cuda")
-    routing = build_routing(tokens, device)
-    if routing is None:
-        return None
-    sorted_ids, sorted_w, sorted_expert_ids, num_valid_ids = routing
-
-    inter_states = torch.randn(tokens, TOPK, INTER_DIM, dtype=torch.float16, device=device)
-    w1 = torch.randn(NUM_EXPERTS, 2 * INTER_DIM, MODEL_DIM, dtype=torch.float16, device=device)
-    w2 = torch.randn(NUM_EXPERTS, MODEL_DIM, INTER_DIM, dtype=torch.float16, device=device)
-    out = torch.zeros(tokens, MODEL_DIM, dtype=torch.float16, device=device)
-
-    def run():
-        out.zero_()
-        ck_moe_stage2_fwd(
-            inter_states=inter_states, w1=w1, w2=w2,
-            sorted_token_ids=sorted_ids,
-            sorted_expert_ids=sorted_expert_ids,
-            num_valid_ids=num_valid_ids,
-            out=out, topk=TOPK,
-            sorted_weights=sorted_w,
-            quant_type=QuantType.No,
-            activation=ActivationType.Silu,
-        )
-
-    try:
-        return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
-    except Exception as e:
-        print(f"  [CK] Stage2 failed: {e}")
+        print(f"  [CK] fused_moe failed: {e}")
         return None
 
 
@@ -226,7 +185,10 @@ def bench_flydsl_moe_stage1(
     tile_m: int = 32, tile_n: int = 128, tile_k: int = 128,
     in_dtype: str = "fp8",
 ) -> Optional[float]:
-    """Benchmark FlyDSL MoE stage1 (gate+up GEMM)."""
+    """Benchmark FlyDSL MoE stage1 (gate+up GEMM).
+
+    Follows the same setup as tests/kernels/test_moe_gemm.py::run_moe_stage1.
+    """
     try:
         from kernels.moe_gemm_2stage import compile_moe_gemm1
     except ImportError:
@@ -246,56 +208,71 @@ def bench_flydsl_moe_stage1(
     if routing is None:
         return None
     sorted_ids, sorted_w, sorted_expert_ids, num_valid_ids = routing
-
-    from tests.utils import pertoken_quant, shuffle_weight
-
-    # Create FP8 inputs with per-token quantization
-    a_fp32 = torch.randn(tokens, MODEL_DIM, device=device, dtype=torch.float32)
-    a_q, scale_a = pertoken_quant(a_fp32, quant_dtype=dtype_fp8)
-
-    w1_fp32 = torch.randn(NUM_EXPERTS, 2 * INTER_DIM, MODEL_DIM, device=device, dtype=torch.float32)
-    # Per-row quantize and shuffle each expert's weights
-    w1_list = []
-    scale_w1_list = []
-    for e in range(NUM_EXPERTS):
-        wq, sw = pertoken_quant(w1_fp32[e], quant_dtype=dtype_fp8)
-        w1_list.append(shuffle_weight(wq, layout=(16, 16)))
-        scale_w1_list.append(sw)
-    w1_shuffled = torch.stack(w1_list)
-    scale_w1 = torch.stack(scale_w1_list).squeeze(-1)
-
     sorted_size = int(sorted_ids.numel())
     blocks = int(sorted_expert_ids.numel())
 
+    from tests.utils import pertoken_quant, shuffle_weight
+
+    # Quantize and preshuffle (matching test_moe_gemm.py setup)
+    x_fp32 = torch.randn(tokens, MODEL_DIM, device=device, dtype=torch.float32)
+    w1_fp32 = torch.randn(NUM_EXPERTS, 2 * INTER_DIM, MODEL_DIM, device=device, dtype=torch.float32)
+
+    if in_dtype == "fp8":
+        x_q, scale_x = pertoken_quant(x_fp32, quant_dtype=dtype_fp8)
+        w1_q, scale_w1 = pertoken_quant(w1_fp32, quant_dtype=dtype_fp8)
+    elif in_dtype in ("fp16", "bf16"):
+        torch_dt = torch.float16 if in_dtype == "fp16" else torch.bfloat16
+        x_q = x_fp32.to(torch_dt)
+        w1_q = w1_fp32.to(torch_dt)
+        scale_x = None
+        scale_w1 = None
+    else:
+        print(f"  [FlyDSL] Unsupported in_dtype={in_dtype}")
+        return None
+
+    # Preshuffle weights and flatten expert dim
+    w1_shuffled = shuffle_weight(w1_q)
+    w_kernel = w1_shuffled.view(NUM_EXPERTS * (2 * INTER_DIM), MODEL_DIM).contiguous()
+
+    # Flatten scales to 1D
+    if scale_x is None:
+        scale_x_1d = torch.empty((0,), device=device, dtype=torch.float32)
+    else:
+        scale_x_1d = scale_x.view(-1).contiguous()
+    if scale_w1 is None:
+        scale_w1_1d = torch.empty((0,), device=device, dtype=torch.float32)
+    else:
+        scale_w1_1d = scale_w1.view(-1).contiguous()
+    sorted_w_1d = sorted_w.contiguous().view(-1)
+
     try:
-        launch_fn = compile_moe_gemm1(
-            M=sorted_size, N=2 * INTER_DIM, K=MODEL_DIM,
-            E=NUM_EXPERTS, topk=TOPK,
+        exe = compile_moe_gemm1(
+            model_dim=MODEL_DIM,
+            inter_dim=INTER_DIM,
+            experts=NUM_EXPERTS,
+            topk=TOPK,
             tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-            in_dtype=in_dtype, out_dtype="bf16",
-            num_blocks=blocks,
+            doweight_stage1=False,
+            in_dtype=in_dtype,
+            out_dtype="f16",
         )
     except Exception as e:
         print(f"  [FlyDSL] Stage1 compile failed: {e}")
         return None
 
-    out = torch.empty(tokens * TOPK, INTER_DIM, dtype=torch.bfloat16, device=device)
-    stream = torch.cuda.current_stream()
+    out = torch.empty(tokens, TOPK, INTER_DIM, dtype=torch.float16, device=device)
 
     def _as_i8(t):
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
     def run():
-        launch_fn(
-            out.contiguous().view(-1),
-            _as_i8(a_q).contiguous().view(-1),
-            _as_i8(w1_shuffled).contiguous().view(-1),
-            scale_a.contiguous().view(-1),
-            scale_w1.contiguous().view(-1),
-            sorted_ids.contiguous().view(-1),
-            sorted_expert_ids.contiguous().view(-1),
-            num_valid_ids.contiguous().view(-1),
-            sorted_size, blocks,
+        stream = torch.cuda.current_stream()
+        exe(
+            out, _as_i8(x_q), _as_i8(w_kernel),
+            scale_x_1d, scale_w1_1d,
+            sorted_ids, sorted_expert_ids, sorted_w_1d,
+            num_valid_ids,
+            tokens, INTER_DIM, MODEL_DIM, blocks,
             stream,
         )
 
@@ -311,9 +288,12 @@ def bench_flydsl_moe_stage2(
     tile_m: int = 32, tile_n: int = 128, tile_k: int = 128,
     in_dtype: str = "fp8",
 ) -> Optional[float]:
-    """Benchmark FlyDSL MoE stage2 (down GEMM)."""
+    """Benchmark FlyDSL MoE stage2 (down GEMM).
+
+    Follows the same setup as tests/kernels/test_moe_gemm.py::run_moe_stage2.
+    """
     try:
-        from kernels.moe_gemm_2stage import compile_moe_gemm2, MoeGemm2Mode
+        from kernels.moe_gemm_2stage import compile_moe_gemm2
     except ImportError:
         print("  [FlyDSL] Could not import compile_moe_gemm2")
         return None
@@ -331,59 +311,72 @@ def bench_flydsl_moe_stage2(
     if routing is None:
         return None
     sorted_ids, sorted_w, sorted_expert_ids, num_valid_ids = routing
-
-    from tests.utils import pertoken_quant, shuffle_weight
-
-    # Inter states (stage1 output) — FP8 quantized
-    inter_fp32 = torch.randn(tokens * TOPK, INTER_DIM, device=device, dtype=torch.float32)
-    inter_q, scale_a2 = pertoken_quant(inter_fp32, quant_dtype=dtype_fp8)
-
-    # W2 weights — per-row quantized and shuffled
-    w2_fp32 = torch.randn(NUM_EXPERTS, MODEL_DIM, INTER_DIM, device=device, dtype=torch.float32)
-    w2_list = []
-    scale_w2_list = []
-    for e in range(NUM_EXPERTS):
-        wq, sw = pertoken_quant(w2_fp32[e], quant_dtype=dtype_fp8)
-        w2_list.append(shuffle_weight(wq, layout=(16, 16)))
-        scale_w2_list.append(sw)
-    w2_shuffled = torch.stack(w2_list)
-    scale_w2 = torch.stack(scale_w2_list).squeeze(-1)
-
     sorted_size = int(sorted_ids.numel())
     blocks = int(sorted_expert_ids.numel())
 
+    from tests.utils import pertoken_quant, shuffle_weight
+
+    # Stage2 input: inter_states from stage1 output
+    inter_fp32 = torch.randn(tokens * TOPK, INTER_DIM, device=device, dtype=torch.float32)
+    w2_fp32 = torch.randn(NUM_EXPERTS, MODEL_DIM, INTER_DIM, device=device, dtype=torch.float32)
+
+    if in_dtype == "fp8":
+        a2_q, scale_a2 = pertoken_quant(inter_fp32, quant_dtype=dtype_fp8)
+        w2_q, scale_w2 = pertoken_quant(w2_fp32, quant_dtype=dtype_fp8)
+    elif in_dtype in ("fp16", "bf16"):
+        torch_dt = torch.float16 if in_dtype == "fp16" else torch.bfloat16
+        a2_q = inter_fp32.to(torch_dt)
+        w2_q = w2_fp32.to(torch_dt)
+        scale_a2 = None
+        scale_w2 = None
+    else:
+        print(f"  [FlyDSL] Unsupported in_dtype={in_dtype}")
+        return None
+
+    # Preshuffle W2 and flatten
+    w2_shuffled = shuffle_weight(w2_q)
+    w2_kernel = w2_shuffled.view(NUM_EXPERTS * MODEL_DIM, INTER_DIM).contiguous()
+
+    if scale_a2 is None:
+        scale_a2_1d = torch.empty((0,), device=device, dtype=torch.float32)
+    else:
+        scale_a2_1d = scale_a2.view(-1).contiguous()
+    if scale_w2 is None:
+        scale_w2_1d = torch.empty((0,), device=device, dtype=torch.float32)
+    else:
+        scale_w2_1d = scale_w2.view(-1).contiguous()
+    sorted_w_1d = sorted_w.contiguous().view(-1)
+
     try:
-        launch_fn = compile_moe_gemm2(
-            M=sorted_size, N=MODEL_DIM, K=INTER_DIM,
-            E=NUM_EXPERTS, topk=TOPK,
+        exe = compile_moe_gemm2(
+            model_dim=MODEL_DIM,
+            inter_dim=INTER_DIM,
+            experts=NUM_EXPERTS,
+            topk=TOPK,
             tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-            in_dtype=in_dtype, out_dtype="bf16",
-            num_blocks=blocks,
-            mode=MoeGemm2Mode.ATOMIC,
+            doweight_stage2=True,
+            in_dtype=in_dtype,
+            out_dtype="f16",
+            accumulate=True,
         )
     except Exception as e:
         print(f"  [FlyDSL] Stage2 compile failed: {e}")
         return None
 
-    out = torch.zeros(tokens, MODEL_DIM, dtype=torch.bfloat16, device=device)
-    stream = torch.cuda.current_stream()
+    out = torch.zeros(tokens, MODEL_DIM, dtype=torch.float16, device=device)
 
     def _as_i8(t):
         return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
     def run():
         out.zero_()
-        launch_fn(
-            out.contiguous().view(-1),
-            _as_i8(inter_q).contiguous().view(-1),
-            _as_i8(w2_shuffled).contiguous().view(-1),
-            scale_a2.contiguous().view(-1),
-            scale_w2.contiguous().view(-1),
-            sorted_ids.contiguous().view(-1),
-            sorted_expert_ids.contiguous().view(-1),
-            num_valid_ids.contiguous().view(-1),
-            sorted_w.contiguous().view(-1),
-            sorted_size, blocks,
+        stream = torch.cuda.current_stream()
+        exe(
+            out, _as_i8(a2_q), _as_i8(w2_kernel),
+            scale_a2_1d, scale_w2_1d,
+            sorted_ids, sorted_expert_ids, sorted_w_1d,
+            num_valid_ids,
+            tokens, MODEL_DIM, INTER_DIM, blocks,
             stream,
         )
 
@@ -399,36 +392,37 @@ def bench_flydsl_moe_stage2(
 # ---------------------------------------------------------------------------
 def print_results(rows: List[MoeBenchRow]) -> None:
     print()
-    print("=" * 110)
-    print(f"MoE Benchmark: CK (AITER) vs FlyDSL — GPT-OSS 120B (E={NUM_EXPERTS}, topk={TOPK}, "
+    print("=" * 90)
+    print(f"MoE Benchmark — GPT-OSS 120B A4W4 (E={NUM_EXPERTS}, topk={TOPK}, "
           f"hidden={MODEL_DIM}, inter={INTER_DIM})")
-    print("=" * 110)
-    hdr = (
-        f"{'Stage':>6s}  {'Tokens':>7s}  "
-        f"{'CK(us)':>10s}  {'TFLOPS':>8s}  "
-        f"{'FlyDSL(us)':>12s}  {'TFLOPS':>8s}  "
-        f"{'Speedup':>8s}"
-    )
+    print("=" * 90)
+    hdr = f"{'Tokens':>7s}  {'Kernel':<16s}  {'Latency(us)':>12s}  {'TFLOPS':>8s}"
     print(hdr)
-    print("-" * 110)
+    print("-" * 90)
 
+    # Group by token count
+    by_tokens: dict[int, List[MoeBenchRow]] = {}
     for r in rows:
-        ck_us = f"{r.ck_us:10.1f}" if r.ck_us else f"{'N/A':>10s}"
-        ck_tf = f"{r.ck_tflops:8.2f}" if r.ck_tflops else f"{'N/A':>8s}"
-        fly_us = f"{r.flydsl_us:12.1f}" if r.flydsl_us else f"{'N/A':>12s}"
-        fly_tf = f"{r.flydsl_tflops:8.2f}" if r.flydsl_tflops else f"{'N/A':>8s}"
-        sp = f"{r.speedup:7.2f}x" if r.speedup else f"{'N/A':>8s}"
-        print(f"{'S'+str(r.stage):>6s}  {r.tokens:7d}  {ck_us}  {ck_tf}  {fly_us}  {fly_tf}  {sp}")
+        by_tokens.setdefault(r.tokens, []).append(r)
 
-    print("=" * 110)
-    valid = [r for r in rows if r.speedup is not None]
-    if valid:
-        geo = 1.0
-        for r in valid:
-            geo *= r.speedup
-        geo = geo ** (1.0 / len(valid))
-        avg = sum(r.speedup for r in valid) / len(valid)
-        print(f"Geomean speedup (FlyDSL/CK): {geo:.2f}x  |  Average: {avg:.2f}x")
+    for tokens in sorted(by_tokens.keys()):
+        group = by_tokens[tokens]
+        for i, r in enumerate(group):
+            tok_col = f"{tokens:7d}" if i == 0 else f"{'':7s}"
+            us_s = f"{r.us:12.1f}" if r.us else f"{'N/A':>12s}"
+            tf_s = f"{r.tflops:8.2f}" if r.tflops else f"{'N/A':>8s}"
+            print(f"{tok_col}  {r.label:<16s}  {us_s}  {tf_s}")
+        # Print speedup if we have both CK fused and FlyDSL S1+S2
+        ck_row = next((r for r in group if "CK" in r.label and r.us), None)
+        s1_row = next((r for r in group if "S1" in r.label and "S2" not in r.label and r.us), None)
+        s2_row = next((r for r in group if "S2" in r.label and "S1" not in r.label and r.us), None)
+        if ck_row and s1_row and s2_row:
+            fly_total = s1_row.us + s2_row.us
+            sp = ck_row.us / fly_total
+            print(f"{'':7s}  {'→ FlyDSL/CK':<16s}  {fly_total:12.1f}  {sp:7.2f}x")
+        print()
+
+    print("=" * 90)
     print()
 
 
@@ -436,13 +430,11 @@ def print_results(rows: List[MoeBenchRow]) -> None:
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="MoE benchmark: CK vs FlyDSL")
+    parser = argparse.ArgumentParser(description="MoE benchmark: CK A4W4 vs FlyDSL")
     parser.add_argument("--tokens", type=str, default="1,32,128",
                         help="Comma-separated token counts")
     parser.add_argument("--sweep", action="store_true",
                         help="Sweep all decode+prefill batch sizes")
-    parser.add_argument("--stage", type=int, default=0, choices=[0, 1, 2],
-                        help="Stage to benchmark (0=both, 1=stage1, 2=stage2)")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--flydsl-only", action="store_true",
@@ -460,31 +452,25 @@ def main():
         token_list = [int(t.strip()) for t in args.tokens.split(",")]
 
     rows: List[MoeBenchRow] = []
-    stages = [1, 2] if args.stage == 0 else [args.stage]
 
     for tokens in token_list:
-        for stage in stages:
-            print(f"Benchmarking Stage{stage}, tokens={tokens} ...")
+        print(f"Benchmarking tokens={tokens} ...")
 
-            ck_us = None
-            if not args.flydsl_only:
-                if stage == 1:
-                    ck_us = bench_ck_moe_stage1(tokens, args.warmup, args.iters)
-                else:
-                    ck_us = bench_ck_moe_stage2(tokens, args.warmup, args.iters)
+        # CK: fused_moe (stage1+stage2 combined, MXFP4 A4W4)
+        if not args.flydsl_only:
+            ck_us = bench_ck_moe_fused(tokens, args.warmup, args.iters)
+            rows.append(MoeBenchRow(label="CK fused", tokens=tokens, us=ck_us))
 
-            if stage == 1:
-                fly_us = bench_flydsl_moe_stage1(
-                    tokens, args.warmup, args.iters, in_dtype=args.in_dtype,
-                )
-            else:
-                fly_us = bench_flydsl_moe_stage2(
-                    tokens, args.warmup, args.iters, in_dtype=args.in_dtype,
-                )
+        # FlyDSL: stage1 and stage2 separately
+        s1_us = bench_flydsl_moe_stage1(
+            tokens, args.warmup, args.iters, in_dtype=args.in_dtype,
+        )
+        rows.append(MoeBenchRow(label="FlyDSL S1", tokens=tokens, us=s1_us))
 
-            rows.append(MoeBenchRow(
-                stage=stage, tokens=tokens, ck_us=ck_us, flydsl_us=fly_us,
-            ))
+        s2_us = bench_flydsl_moe_stage2(
+            tokens, args.warmup, args.iters, in_dtype=args.in_dtype,
+        )
+        rows.append(MoeBenchRow(label="FlyDSL S2", tokens=tokens, us=s2_us))
 
     print_results(rows)
 
