@@ -137,6 +137,7 @@ def bench_ck_moe_fused(
     try:
         import aiter
         from aiter.fused_moe import fused_moe
+        from aiter.ops.enum import QuantType, ActivationType
     except ImportError:
         print("  [CK] Could not import aiter.fused_moe")
         return None
@@ -157,17 +158,21 @@ def bench_ck_moe_fused(
     # Input: BF16 hidden states (A4 quantization happens inside fused_moe)
     hidden = torch.randn(tokens, MODEL_DIM, dtype=torch.bfloat16, device=device)
 
-    # Router scores -> topk
+    # Router: compute topk routing outside fused_moe
     router_logits = torch.randn(tokens, NUM_EXPERTS, dtype=torch.float32, device=device)
+    topk_vals, topk_ids = torch.topk(router_logits, k=TOPK, dim=1)
+    topk_weight = torch.softmax(topk_vals, dim=1).to(torch.float32)
+    topk_ids = topk_ids.to(torch.int32)
 
     def run():
         fused_moe(
             hidden_states=hidden,
             w1=w1, w2=w2,
-            gating_output=router_logits,
-            topk=TOPK,
+            topk_weight=topk_weight,
+            topk_ids=topk_ids,
             w1_scale=w1_scale, w2_scale=w2_scale,
-            renormalize=True,
+            quant_type=QuantType.per_1x32,
+            activation=ActivationType.Silu,
         )
 
     try:
