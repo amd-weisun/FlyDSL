@@ -51,20 +51,22 @@ from benchmark_common import bench_gpu_us_torch, maybe_enable_aiter
 # Up/Down:    M=batch*seq, N=28672, K=8192  /  N=8192, K=28672
 
 GPT_OSS_SHAPES: List[Tuple[int, int, int]] = [
-    # (M, N, K) — typical inference batch sizes
-    # Decode (small M)
+    # (M, N, K) — inference scenario: prompt=1K, output=8K
+    # Decode: M = concurrency (1 token/request/step)
     (1, 10240, 8192),
     (1, 8192, 8192),
+    (2, 10240, 8192),
+    (2, 8192, 8192),
+    (4, 10240, 8192),
+    (4, 8192, 8192),
     (8, 10240, 8192),
     (8, 8192, 8192),
-    (32, 10240, 8192),
+    (16, 8192, 8192),
     (32, 8192, 8192),
-    # Prefill (larger M)
-    (64, 10240, 8192),
     (64, 8192, 8192),
     (128, 8192, 8192),
-    (256, 8192, 8192),
-    (512, 8192, 8192),
+    # Prefill: M = prompt length (1K)
+    (1024, 10240, 8192),
     (1024, 8192, 8192),
 ]
 
