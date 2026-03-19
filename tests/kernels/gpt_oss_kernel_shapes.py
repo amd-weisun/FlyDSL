@@ -235,14 +235,15 @@ def generate_shapes(
 # Convenience: typical inference scenarios
 # ============================================================================
 
-# Decode: batch of concurrent requests, each generating 1 token
-DECODE_TOKENS = [1, 4, 8, 16, 32, 64, 128, 256]
+# Inference scenario: prompt=1K, output=8K
+# Decode: M = concurrency (1 token/request/step), decode-dominated (8x more steps)
+DECODE_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128]
 
-# Prefill: processing prompt tokens
-PREFILL_TOKENS = [128, 256, 512, 1024, 2048, 4096]
+# Prefill: M = prompt length (processed once per request)
+PREFILL_TOKENS = [1024]
 
-# Mixed: realistic serving (decode-heavy with occasional prefill)
-MIXED_TOKENS = [1, 8, 32, 64, 128, 256, 512, 1024]
+# Full sweep: decode concurrency points + prefill
+MIXED_TOKENS = DECODE_TOKENS + PREFILL_TOKENS
 
 
 def generate_sweep(
