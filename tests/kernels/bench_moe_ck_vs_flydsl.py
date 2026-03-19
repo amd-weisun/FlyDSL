@@ -144,11 +144,12 @@ def bench_ck_moe_fused(
 
     device = torch.device("cuda")
 
-    # MXFP4 packed weights: each element is 4 bits, packed 2 per byte
+    # MXFP4 (float4_e2m1fn_x2) weights — packed FP4, 2 elements per byte
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
     w1 = torch.randint(0, 256, (NUM_EXPERTS, 2 * INTER_DIM, MODEL_DIM // 2),
-                        dtype=torch.uint8, device=device)
+                        dtype=torch.uint8, device=device).view(fp4_dtype)
     w2 = torch.randint(0, 256, (NUM_EXPERTS, MODEL_DIM, INTER_DIM // 2),
-                        dtype=torch.uint8, device=device)
+                        dtype=torch.uint8, device=device).view(fp4_dtype)
     # E8M0 block scales (per 32 elements)
     w1_scale = torch.randint(124, 130, (NUM_EXPERTS, 2 * INTER_DIM, MODEL_DIM // 32),
                               dtype=torch.uint8, device=device)
@@ -178,7 +179,9 @@ def bench_ck_moe_fused(
     try:
         return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
     except Exception as e:
+        import traceback
         print(f"  [CK] fused_moe failed: {e}")
+        traceback.print_exc()
         return None
 
 
