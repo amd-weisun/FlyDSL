@@ -55,6 +55,11 @@ NUM_EXPERTS = 128
 TOPK = 4
 BLOCK_M = 32
 
+# MXFP4 requires 256-byte alignment; Mxfp4MoEMethod pads dimensions
+MXFP4_PAD_ALIGN = 256
+MODEL_DIM_PADDED = (MODEL_DIM + MXFP4_PAD_ALIGN - 1) // MXFP4_PAD_ALIGN * MXFP4_PAD_ALIGN  # 3072
+INTER_DIM_PADDED = (INTER_DIM + MXFP4_PAD_ALIGN - 1) // MXFP4_PAD_ALIGN * MXFP4_PAD_ALIGN  # 3072
+
 # Inference scenario: prompt=1K, output=8K, decode-dominated
 # M = concurrency in decode (1 token/request/step), or prompt_len in prefill
 DECODE_TOKENS = [1, 2, 4, 8, 16, 32, 64, 128]   # concurrency points
@@ -144,20 +149,24 @@ def bench_ck_moe_fused(
 
     device = torch.device("cuda")
 
+    # Use padded dimensions (matching Mxfp4MoEMethod in atom/model_ops/moe.py)
+    H = MODEL_DIM_PADDED   # 3072
+    I = INTER_DIM_PADDED   # 3072
+
     # MXFP4 (float4_e2m1fn_x2) weights — packed FP4, 2 elements per byte
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
-    w1 = torch.randint(0, 256, (NUM_EXPERTS, 2 * INTER_DIM, MODEL_DIM // 2),
+    w1 = torch.randint(0, 256, (NUM_EXPERTS, 2 * I, H // 2),
                         dtype=torch.uint8, device=device).view(fp4_dtype)
-    w2 = torch.randint(0, 256, (NUM_EXPERTS, MODEL_DIM, INTER_DIM // 2),
+    w2 = torch.randint(0, 256, (NUM_EXPERTS, H, I // 2),
                         dtype=torch.uint8, device=device).view(fp4_dtype)
     # E8M0 block scales (per 32 elements)
-    w1_scale = torch.randint(124, 130, (NUM_EXPERTS, 2 * INTER_DIM, MODEL_DIM // 32),
+    w1_scale = torch.randint(124, 130, (NUM_EXPERTS, 2 * I, H // 32),
                               dtype=torch.uint8, device=device)
-    w2_scale = torch.randint(124, 130, (NUM_EXPERTS, MODEL_DIM, INTER_DIM // 32),
+    w2_scale = torch.randint(124, 130, (NUM_EXPERTS, H, I // 32),
                               dtype=torch.uint8, device=device)
 
-    # Input: BF16 hidden states (A4 quantization happens inside fused_moe)
-    hidden = torch.randn(tokens, MODEL_DIM, dtype=torch.bfloat16, device=device)
+    # Input: BF16 hidden states padded to match weight dims
+    hidden = torch.randn(tokens, H, dtype=torch.bfloat16, device=device)
 
     # Router: compute topk routing outside fused_moe
     router_logits = torch.randn(tokens, NUM_EXPERTS, dtype=torch.float32, device=device)
