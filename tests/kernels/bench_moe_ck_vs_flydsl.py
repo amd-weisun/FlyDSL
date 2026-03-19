@@ -645,10 +645,6 @@ def main():
         print(f"Benchmarking tokens={tokens} ...")
 
         if not args.flydsl_only:
-            # CK e2e: fused_moe (sorting + quant + S1 + S2)
-            ck_us = bench_ck_moe_fused(tokens, args.warmup, args.iters)
-            rows.append(MoeBenchRow(label="CK e2e", tokens=tokens, us=ck_us))
-
             # CK stage1 kernel-only (pre-quantized MXFP4 inputs)
             ck_s1 = bench_ck_moe_stage1(tokens, args.warmup, args.iters)
             rows.append(MoeBenchRow(label="CK S1", tokens=tokens, us=ck_s1))
