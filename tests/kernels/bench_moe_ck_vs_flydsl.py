@@ -127,20 +127,99 @@ def build_routing(tokens: int, device: torch.device):
 
 
 # ---------------------------------------------------------------------------
-# CK MoE benchmark (via AITER)
+# Sorting + activation quant benchmark (overhead shared by both CK and FlyDSL)
 # ---------------------------------------------------------------------------
-def bench_ck_moe_fused(
+def bench_sorting_overhead(
     tokens: int, warmup: int, iters: int,
 ) -> Optional[float]:
-    """Benchmark CK fused_moe (stage1+stage2 combined) with MXFP4 (A4W4).
-
-    GPT-OSS uses MXFP4 for MoE: per-1x32 block scales, FP4 packed weights.
-    CK's fused_moe handles sorting + stage1 + stage2 internally.
-    """
+    """Benchmark MoE sorting + MXFP4 activation quantization overhead."""
     if not maybe_enable_aiter():
         return None
     try:
-        import aiter
+        from aiter.fused_moe import moe_sorting
+    except ImportError:
+        return None
+
+    device = torch.device("cuda")
+    topk_ids = torch.randint(0, NUM_EXPERTS, (tokens, TOPK), dtype=torch.int32, device=device)
+    topk_weights = torch.softmax(
+        torch.randn(tokens, TOPK, device=device, dtype=torch.float32), dim=1
+    )
+
+    def run():
+        moe_sorting(topk_ids, topk_weights, NUM_EXPERTS, MODEL_DIM, torch.float16, BLOCK_M)
+
+    try:
+        return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# CK MoE benchmark (via AITER)
+# ---------------------------------------------------------------------------
+def _prepare_ck_moe_inputs(tokens: int, device: torch.device):
+    """Prepare CK MoE inputs: sorting + MXFP4 activation quantization.
+
+    Returns all tensors needed to call ck_moe_stage1_fwd / ck_moe_stage2_fwd
+    separately, matching the exact flow in aiter/fused_moe.py::fused_moe_2stages.
+    """
+    import aiter
+    from aiter.fused_moe import moe_sorting
+    from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
+
+    H = MODEL_DIM_PADDED   # 3072
+    I = INTER_DIM_PADDED   # 3072
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+    fp8_e8m0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
+
+    # Weights (MXFP4)
+    w1 = torch.randint(0, 256, (NUM_EXPERTS, 2 * I, H // 2),
+                        dtype=torch.uint8, device=device).view(fp4_dtype)
+    w2 = torch.randint(0, 256, (NUM_EXPERTS, H, I // 2),
+                        dtype=torch.uint8, device=device).view(fp4_dtype)
+    w1_scale = torch.randint(124, 130, (NUM_EXPERTS, 2 * I, H // 32),
+                              dtype=torch.uint8, device=device)
+    w2_scale = torch.randint(124, 130, (NUM_EXPERTS, H, I // 32),
+                              dtype=torch.uint8, device=device)
+
+    # Hidden states (BF16)
+    hidden = torch.randn(tokens, H, dtype=torch.bfloat16, device=device)
+
+    # Routing
+    router_logits = torch.randn(tokens, NUM_EXPERTS, dtype=torch.float32, device=device)
+    topk_vals, topk_ids = torch.topk(router_logits, k=TOPK, dim=1)
+    topk_weight = torch.softmax(topk_vals, dim=1).to(torch.float32)
+    topk_ids = topk_ids.to(torch.int32)
+
+    # Sorting (same as fused_moe_2stages)
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = moe_sorting(
+        topk_ids, topk_weight, NUM_EXPERTS, H, torch.bfloat16, BLOCK_M,
+    )
+
+    # MXFP4 activation quantization (BF16 → FP4 + E8M0 scales)
+    a1, a1_scale = fused_dynamic_mxfp4_quant_moe_sort(
+        hidden, sorted_ids=sorted_ids, num_valid_ids=num_valid_ids,
+        token_num=tokens, topk=1, block_size=BLOCK_M,
+    )
+
+    return {
+        "w1": w1, "w2": w2,
+        "w1_scale": w1_scale.view(fp8_e8m0), "w2_scale": w2_scale.view(fp8_e8m0),
+        "sorted_ids": sorted_ids, "sorted_weights": sorted_weights,
+        "sorted_expert_ids": sorted_expert_ids, "num_valid_ids": num_valid_ids,
+        "a1": a1, "a1_scale": a1_scale,
+        "tokens": tokens, "H": H, "I": I,
+    }
+
+
+def bench_ck_moe_fused(
+    tokens: int, warmup: int, iters: int,
+) -> Optional[float]:
+    """Benchmark CK fused_moe (sorting + quant + S1 + S2 combined)."""
+    if not maybe_enable_aiter():
+        return None
+    try:
         from aiter.fused_moe import fused_moe
         from aiter.ops.enum import QuantType, ActivationType
     except ImportError:
@@ -148,27 +227,19 @@ def bench_ck_moe_fused(
         return None
 
     device = torch.device("cuda")
-
-    # Use padded dimensions (matching Mxfp4MoEMethod in atom/model_ops/moe.py)
-    H = MODEL_DIM_PADDED   # 3072
-    I = INTER_DIM_PADDED   # 3072
-
-    # MXFP4 (float4_e2m1fn_x2) weights — packed FP4, 2 elements per byte
+    H = MODEL_DIM_PADDED
+    I = INTER_DIM_PADDED
     fp4_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+
     w1 = torch.randint(0, 256, (NUM_EXPERTS, 2 * I, H // 2),
                         dtype=torch.uint8, device=device).view(fp4_dtype)
     w2 = torch.randint(0, 256, (NUM_EXPERTS, H, I // 2),
                         dtype=torch.uint8, device=device).view(fp4_dtype)
-    # E8M0 block scales (per 32 elements)
     w1_scale = torch.randint(124, 130, (NUM_EXPERTS, 2 * I, H // 32),
                               dtype=torch.uint8, device=device)
     w2_scale = torch.randint(124, 130, (NUM_EXPERTS, H, I // 32),
                               dtype=torch.uint8, device=device)
-
-    # Input: BF16 hidden states padded to match weight dims
     hidden = torch.randn(tokens, H, dtype=torch.bfloat16, device=device)
-
-    # Router: compute topk routing outside fused_moe
     router_logits = torch.randn(tokens, NUM_EXPERTS, dtype=torch.float32, device=device)
     topk_vals, topk_ids = torch.topk(router_logits, k=TOPK, dim=1)
     topk_weight = torch.softmax(topk_vals, dim=1).to(torch.float32)
@@ -176,13 +247,10 @@ def bench_ck_moe_fused(
 
     def run():
         fused_moe(
-            hidden_states=hidden,
-            w1=w1, w2=w2,
-            topk_weight=topk_weight,
-            topk_ids=topk_ids,
+            hidden_states=hidden, w1=w1, w2=w2,
+            topk_weight=topk_weight, topk_ids=topk_ids,
             w1_scale=w1_scale, w2_scale=w2_scale,
-            quant_type=QuantType.per_1x32,
-            activation=ActivationType.Silu,
+            quant_type=QuantType.per_1x32, activation=ActivationType.Silu,
         )
 
     try:
@@ -191,6 +259,103 @@ def bench_ck_moe_fused(
         import traceback
         print(f"  [CK] fused_moe failed: {e}")
         traceback.print_exc()
+        return None
+
+
+def bench_ck_moe_stage1(
+    tokens: int, warmup: int, iters: int,
+) -> Optional[float]:
+    """Benchmark CK MoE stage1 only (kernel-only, pre-quantized inputs)."""
+    if not maybe_enable_aiter():
+        return None
+    try:
+        from aiter.ops.moe_op import ck_moe_stage1_fwd
+        from aiter.ops.enum import QuantType, ActivationType
+    except ImportError:
+        print("  [CK] Could not import ck_moe_stage1_fwd")
+        return None
+
+    device = torch.device("cuda")
+    try:
+        inp = _prepare_ck_moe_inputs(tokens, device)
+    except Exception as e:
+        print(f"  [CK] Input preparation failed: {e}")
+        return None
+
+    H, I = inp["H"], inp["I"]
+    out = torch.empty(tokens, TOPK, I, dtype=torch.bfloat16, device=device)
+
+    def run():
+        ck_moe_stage1_fwd(
+            hidden_states=inp["a1"], w1=inp["w1"], w2=inp["w2"],
+            sorted_token_ids=inp["sorted_ids"],
+            sorted_expert_ids=inp["sorted_expert_ids"],
+            num_valid_ids=inp["num_valid_ids"],
+            out=out, topk=TOPK,
+            w1_scale=inp["w1_scale"], a1_scale=inp["a1_scale"],
+            quant_type=QuantType.per_1x32,
+            activation=ActivationType.Silu,
+        )
+
+    try:
+        return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
+    except Exception as e:
+        print(f"  [CK] Stage1 failed: {e}")
+        return None
+
+
+def bench_ck_moe_stage2(
+    tokens: int, warmup: int, iters: int,
+) -> Optional[float]:
+    """Benchmark CK MoE stage2 only (kernel-only, pre-quantized inputs)."""
+    if not maybe_enable_aiter():
+        return None
+    try:
+        from aiter.ops.moe_op import ck_moe_stage2_fwd
+        from aiter.ops.enum import QuantType, ActivationType
+        from aiter.ops.triton.quant.fused_mxfp4_quant import fused_dynamic_mxfp4_quant_moe_sort
+    except ImportError:
+        print("  [CK] Could not import ck_moe_stage2_fwd")
+        return None
+
+    device = torch.device("cuda")
+    try:
+        inp = _prepare_ck_moe_inputs(tokens, device)
+    except Exception as e:
+        print(f"  [CK] Input preparation failed: {e}")
+        return None
+
+    H, I = inp["H"], inp["I"]
+
+    # Stage2 input: simulated stage1 output (BF16 intermediate), then quantized to FP4
+    a2_bf16 = torch.randn(tokens, TOPK, I, dtype=torch.bfloat16, device=device)
+    a2_flat = a2_bf16.view(-1, I)
+    a2, a2_scale = fused_dynamic_mxfp4_quant_moe_sort(
+        a2_flat, sorted_ids=inp["sorted_ids"], num_valid_ids=inp["num_valid_ids"],
+        token_num=tokens, topk=TOPK, block_size=BLOCK_M,
+    )
+    a2 = a2.view(tokens, TOPK, -1)
+
+    out = torch.zeros(tokens, H, dtype=torch.bfloat16, device=device)
+
+    def run():
+        out.zero_()
+        ck_moe_stage2_fwd(
+            inter_states=a2, w1=inp["w1"], w2=inp["w2"],
+            sorted_token_ids=inp["sorted_ids"],
+            sorted_expert_ids=inp["sorted_expert_ids"],
+            num_valid_ids=inp["num_valid_ids"],
+            out=out, topk=TOPK,
+            w2_scale=inp["w2_scale"], a2_scale=a2_scale,
+            sorted_weights=inp["sorted_weights"],
+            quant_type=QuantType.per_1x32,
+            activation=ActivationType.Silu,
+        )
+
+    try:
+        return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
+    except Exception as e:
+        print(f"  [CK] Stage2 failed: {e}")
         return None
 
 
@@ -429,14 +594,20 @@ def print_results(rows: List[MoeBenchRow]) -> None:
             us_s = f"{r.us:12.1f}" if r.us else f"{'N/A':>12s}"
             tf_s = f"{r.tflops:8.2f}" if r.tflops else f"{'N/A':>8s}"
             print(f"{tok_col}  {r.label:<16s}  {us_s}  {tf_s}")
-        # Print speedup if we have both CK fused and FlyDSL S1+S2
-        ck_row = next((r for r in group if "CK" in r.label and r.us), None)
-        s1_row = next((r for r in group if "S1" in r.label and "S2" not in r.label and r.us), None)
-        s2_row = next((r for r in group if "S2" in r.label and "S1" not in r.label and r.us), None)
-        if ck_row and s1_row and s2_row:
-            fly_total = s1_row.us + s2_row.us
-            sp = ck_row.us / fly_total
-            print(f"{'':7s}  {'→ FlyDSL/CK':<16s}  {fly_total:12.1f}  {sp:7.2f}x")
+        # Print speedup comparisons
+        ck_s1 = next((r for r in group if r.label == "CK S1" and r.us), None)
+        ck_s2 = next((r for r in group if r.label == "CK S2" and r.us), None)
+        fly_s1 = next((r for r in group if r.label == "FlyDSL S1" and r.us), None)
+        fly_s2 = next((r for r in group if r.label == "FlyDSL S2" and r.us), None)
+
+        # S1 vs S1
+        if ck_s1 and fly_s1:
+            sp = ck_s1.us / fly_s1.us
+            print(f"{'':7s}  {'S1: FlyDSL/CK':<16s}  {'':12s}  {sp:7.2f}x")
+        # S2 vs S2
+        if ck_s2 and fly_s2:
+            sp = ck_s2.us / fly_s2.us
+            print(f"{'':7s}  {'S2: FlyDSL/CK':<16s}  {'':12s}  {sp:7.2f}x")
         print()
 
     print("=" * 90)
@@ -473,12 +644,20 @@ def main():
     for tokens in token_list:
         print(f"Benchmarking tokens={tokens} ...")
 
-        # CK: fused_moe (stage1+stage2 combined, MXFP4 A4W4)
         if not args.flydsl_only:
+            # CK e2e: fused_moe (sorting + quant + S1 + S2)
             ck_us = bench_ck_moe_fused(tokens, args.warmup, args.iters)
-            rows.append(MoeBenchRow(label="CK fused", tokens=tokens, us=ck_us))
+            rows.append(MoeBenchRow(label="CK e2e", tokens=tokens, us=ck_us))
 
-        # FlyDSL: stage1 and stage2 separately
+            # CK stage1 kernel-only (pre-quantized MXFP4 inputs)
+            ck_s1 = bench_ck_moe_stage1(tokens, args.warmup, args.iters)
+            rows.append(MoeBenchRow(label="CK S1", tokens=tokens, us=ck_s1))
+
+            # CK stage2 kernel-only
+            ck_s2 = bench_ck_moe_stage2(tokens, args.warmup, args.iters)
+            rows.append(MoeBenchRow(label="CK S2", tokens=tokens, us=ck_s2))
+
+        # FlyDSL: stage1 and stage2 separately (kernel-only)
         s1_us = bench_flydsl_moe_stage1(
             tokens, args.warmup, args.iters, in_dtype=args.in_dtype,
         )
