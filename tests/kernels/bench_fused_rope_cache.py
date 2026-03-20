@@ -45,24 +45,26 @@ MODEL_CONFIGS: Dict[str, Tuple[int, int, int]] = {
 
 BLOCK_SIZE = 16
 MAX_POS = 8192
-SWEEP_CONCURRENCY = [1, 4, 32, 128, 512]
+SWEEP_CONCURRENCY = [1, 4, 32, 128,  1024]
 
 # Active config (set per benchmark iteration)
-_CFG = {"head_dim": 64, "qh": 8, "kh": 1}
+_CFG = {"head_dim": 64, "num_q_heads": 8, "num_kv_heads": 1}
 
 
 def _create_tensors(tokens, device):
-    hd, qh, kh = _CFG["head_dim"], _CFG["qh"], _CFG["kh"]
+    hd = _CFG["head_dim"]
+    num_q_heads = _CFG["num_q_heads"]
+    num_kv_heads = _CFG["num_kv_heads"]
     nb = max(32, (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE + 1)
-    q = torch.randn(tokens, qh, hd, device=device, dtype=torch.bfloat16)
-    k = torch.randn(tokens, kh, hd, device=device, dtype=torch.bfloat16)
-    v = torch.randn(tokens, kh, hd, device=device, dtype=torch.bfloat16)
+    q = torch.randn(tokens, num_q_heads, hd, device=device, dtype=torch.bfloat16)
+    k = torch.randn(tokens, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
+    v = torch.randn(tokens, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
     cos = torch.randn(MAX_POS, hd // 2, device=device, dtype=torch.bfloat16)
     sin = torch.randn(MAX_POS, hd // 2, device=device, dtype=torch.bfloat16)
     pos = torch.arange(tokens, device=device, dtype=torch.int32)
     slots = torch.arange(tokens, device=device, dtype=torch.int32)
-    kc = torch.zeros(nb, BLOCK_SIZE, kh, hd, device=device, dtype=torch.bfloat16)
-    vc = torch.zeros(nb, BLOCK_SIZE, kh, hd, device=device, dtype=torch.bfloat16)
+    kc = torch.zeros(nb, BLOCK_SIZE, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
+    vc = torch.zeros(nb, BLOCK_SIZE, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
     qo = torch.empty_like(q)
     ko = torch.empty_like(k)
     return q, k, v, cos, sin, pos, slots, kc, vc, qo, ko
@@ -101,7 +103,7 @@ def bench_flydsl(tokens, warmup, iters):
     from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module
     device = torch.device("cuda")
     launch_fn = build_fused_rope_cache_module(
-        head_dim=_CFG["head_dim"], num_q_heads=_CFG["qh"], num_kv_heads=_CFG["kh"],
+        head_dim=_CFG["head_dim"], num_q_heads=_CFG["num_q_heads"], num_kv_heads=_CFG["num_kv_heads"],
         block_size=BLOCK_SIZE, is_neox=True, flash_layout=True, dtype_str="bf16",
     )
     q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_tensors(tokens, device)
@@ -121,26 +123,25 @@ class Row:
     model: str
     tp: int
     tokens: int
-    qh: int
-    kh: int
-    hd: int
+    num_q_heads: int
+    num_kv_heads: int
+    head_dim: int
     triton_us: Optional[float]
     flydsl_us: Optional[float]
 
 
 def print_summary(results: List[Row]):
-    print(f"\n{'='*100}")
-    print(f"{'Model':<18s} {'TP':>2s} {'M':>5s} {'progs':>7s}  "
+    print(f"\n{'='*105}")
+    print(f"{'Model':<18s} {'TP':>2s} {'Q heads':>7s} {'KV heads':>8s} {'head_dim':>8s} {'M':>5s}  "
           f"{'Triton(us)':>10s} {'FlyDSL(us)':>10s}  {'Speedup':>8s}")
-    print(f"{'='*100}")
+    print(f"{'='*105}")
     for r in results:
-        progs = r.tokens * (r.qh + r.kh)
         tri_s = f"{r.triton_us:.1f}" if r.triton_us else "N/A"
         fly_s = f"{r.flydsl_us:.1f}" if r.flydsl_us else "N/A"
         sp = f"{r.triton_us / r.flydsl_us:.2f}x" if r.triton_us and r.flydsl_us else ""
-        print(f"{r.model:<18s} {r.tp:>2d} {r.tokens:>5d} {progs:>7d}  "
+        print(f"{r.model:<18s} {r.tp:>2d} {r.num_q_heads:>7d} {r.num_kv_heads:>8d} {r.head_dim:>8d} {r.tokens:>5d}  "
               f"{tri_s:>10s} {fly_s:>10s}  {sp:>8s}")
-    print(f"{'='*100}")
+    print(f"{'='*105}")
 
 
 def main():
@@ -170,24 +171,26 @@ def main():
         hd, total_qh, total_kh = MODEL_CONFIGS[model_name]
 
         for tp in tp_list:
-            qh = total_qh // tp
-            kh = max(1, total_kh // tp)
-            if qh < 1:
+            num_q_heads = total_qh // tp
+            num_kv_heads = max(1, total_kh // tp)
+            if num_q_heads < 1:
                 continue
-            _CFG["head_dim"], _CFG["qh"], _CFG["kh"] = hd, qh, kh
+            _CFG["head_dim"] = hd
+            _CFG["num_q_heads"] = num_q_heads
+            _CFG["num_kv_heads"] = num_kv_heads
 
             print(f"\n{'='*80}")
-            print(f"{model_name} TP={tp}: QH={qh}, KH={kh}, D={hd}, progs/tok={qh+kh}")
+            print(f"{model_name} TP={tp}: num_q_heads={num_q_heads}, "
+                  f"num_kv_heads={num_kv_heads}, head_dim={hd}")
             print(f"{'='*80}")
 
             for tokens in token_list:
-                progs = tokens * (qh + kh)
-                print(f"  M={tokens:>4d} ({progs:>7d} progs) ... ", end="", flush=True)
+                print(f"  M={tokens:>4d} ... ", end="", flush=True)
 
                 tri = bench_triton(tokens, args.warmup, args.iters) if not args.flydsl_only else None
                 fly = bench_flydsl(tokens, args.warmup, args.iters)
 
-                results.append(Row(model_name, tp, tokens, qh, kh, hd, tri, fly))
+                results.append(Row(model_name, tp, tokens, num_q_heads, num_kv_heads, hd, tri, fly))
 
                 parts = []
                 if tri: parts.append(f"Tri={tri:.1f}")
