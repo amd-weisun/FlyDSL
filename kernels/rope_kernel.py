@@ -102,9 +102,7 @@ def build_rope_module(
         vec_idx_i32 = tid % vecs_per_half     # which vec8 chunk within half (0..3)
 
         # Guard: only threads_needed threads are active
-        is_active = head_idx_i32 < total_heads
-
-        if is_active:
+        if arith.cmpi(arith.CmpIPredicate.ult, head_idx_i32, fx.Int32(total_heads)):
             # --- 1. Load position for this token ---
             pos_rsrc = buffer_ops.create_buffer_resource(Positions, max_size=True)
             pos_val = buffer_ops.buffer_load(pos_rsrc, bid, vec_width=1, dtype=T.i32)
@@ -133,9 +131,7 @@ def build_rope_module(
             sin_f32 = sin_e.extf(vec_type_c) if dtype_str != "f32" else sin_e
 
             # --- 3. Determine Q or K head ---
-            is_q = head_idx_i32 < num_q_heads
-
-            if is_q:
+            if arith.cmpi(arith.CmpIPredicate.ult, head_idx_i32, fx.Int32(num_q_heads)):
                 # Q head
                 q_rsrc = buffer_ops.create_buffer_resource(Q, max_size=True)
                 qo_rsrc = buffer_ops.create_buffer_resource(Q_out, max_size=True)
