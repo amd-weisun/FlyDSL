@@ -6,9 +6,16 @@ Fuses 3 operations into two kernel launches:
 
 Input shapes:
   Q: [T, QH, D],  K: [T, KH, D],  V: [T, KH, D]
-  CosCache/SinCache: [max_pos, D//2]
+  CosCache/SinCache: [max_pos, D//2] or [max_pos, 1, 1, D//2]
   Positions: [T] int32,  SlotMapping: [T] int32
-  KeyCache/ValueCache: flash [num_blocks, block_size, KH, D]
+
+KV cache layouts:
+  flash_layout=True:
+    KeyCache:   [num_blocks, block_size, KH, D]
+    ValueCache: [num_blocks, block_size, KH, D]
+  flash_layout=False (ATOM default):
+    KeyCache:   [num_blocks, KH, D//x, block_size, x]  (x=16, x-packed)
+    ValueCache: [num_blocks, KH, D, block_size]         (dim-major)
 """
 
 import flydsl.compiler as flyc
@@ -79,6 +86,7 @@ def build_fused_rope_cache_module(
     vec_dwords = (VEC_WIDTH * elem_bytes) // 4
     vecs_per_half = half_dim // VEC_WIDTH   # 4
     vecs_per_head = head_dim // VEC_WIDTH   # 8
+    x_size = 16  # x-packing factor for non-flash key_cache
 
     BLOCK_THREADS = WARP_SIZE
 
@@ -260,21 +268,17 @@ def build_fused_rope_cache_module(
             buffer_ops.buffer_store(k_rot_i32, ko_rsrc, k_dw)
 
             # --- KV Cache write ---
-            # Load slot_mapping[pid_t] → slot index
             slot_val = buffer_ops.buffer_load(slot_rsrc, pid_t, vec_width=1, dtype=T.i32)
 
-            # slot_val >= 0 means valid slot
             if arith.cmpi(arith.CmpIPredicate.sge, slot_val, fx.Int32(0)):
-                # Decompose slot into block_idx and position within block
                 pid_t_slot = ArithValue(slot_val) // block_size
                 pid_b = ArithValue(slot_val) % block_size
 
+                # Load V for cache write (same layout as K input)
+                v_raw = buffer_ops.buffer_load(v_rsrc, k_dw, vec_width=vec_dwords, dtype=T.i32)
+
                 if flash_layout:
-                    # key_cache: [T_cache, BS, KH, D]
-                    # byte offset = pid_t_slot * BS * KH * D * elem_bytes
-                    #              + pid_b * KH * D * elem_bytes
-                    #              + pid_hk * D * elem_bytes
-                    #              + tid * VEC_WIDTH * elem_bytes
+                    # key_cache: [T_cache, BS, KH, D] — contiguous in D
                     kc_bytes = (
                         ArithValue(pid_t_slot) * (block_size * num_kv_heads * head_dim * elem_bytes)
                         + ArithValue(pid_b) * (num_kv_heads * head_dim * elem_bytes)
@@ -284,17 +288,45 @@ def build_fused_rope_cache_module(
                     kc_dw = kc_bytes >> fx.Int32(2)
                     buffer_ops.buffer_store(k_rot_i32, kc_rsrc, kc_dw)
 
-                    # value_cache: [T_cache, BS, KH, D]
-                    # Same layout as key_cache for flash
-                    v_raw = buffer_ops.buffer_load(v_rsrc, k_dw, vec_width=vec_dwords, dtype=T.i32)
-                    vc_bytes = (
-                        ArithValue(pid_t_slot) * (block_size * num_kv_heads * head_dim * elem_bytes)
-                        + ArithValue(pid_b) * (num_kv_heads * head_dim * elem_bytes)
-                        + ArithValue(pid_hk) * (head_dim * elem_bytes)
-                        + ArithValue(tid) * (VEC_WIDTH * elem_bytes)
+                    # value_cache: [T_cache, BS, KH, D] — same layout
+                    buffer_ops.buffer_store(v_raw, vc_rsrc, kc_dw)
+                else:
+                    # --- Non-flash layout (ATOM default) ---
+                    # key_cache: [T_cache, KH, D//x, BS, x]
+                    # Within each x-group (x=16), elements are contiguous.
+                    # VEC_WIDTH=8 <= x=16, so each vec8 store stays within one group.
+                    d_start = ArithValue(tid) * VEC_WIDTH  # starting dim index
+                    dim_group = d_start // x_size
+                    dim_within = d_start % x_size
+                    kc_bytes = (
+                        ArithValue(pid_t_slot) * (num_kv_heads * (head_dim // x_size) * block_size * x_size * elem_bytes)
+                        + ArithValue(pid_hk) * ((head_dim // x_size) * block_size * x_size * elem_bytes)
+                        + ArithValue(dim_group) * (block_size * x_size * elem_bytes)
+                        + ArithValue(pid_b) * (x_size * elem_bytes)
+                        + ArithValue(dim_within) * elem_bytes
                     )
-                    vc_dw = vc_bytes >> fx.Int32(2)
-                    buffer_ops.buffer_store(v_raw, vc_rsrc, vc_dw)
+                    kc_dw = kc_bytes >> fx.Int32(2)
+                    buffer_ops.buffer_store(k_rot_i32, kc_rsrc, kc_dw)
+
+                    # value_cache: [T_cache, KH, D, BS]
+                    # Stride along D = BS elements (non-contiguous for vec8).
+                    # Each bf16 element goes to a different strided address.
+                    # Unroll and store one element at a time using dword-aligned writes.
+                    v_e = vector.bitcast(vec_type_e, v_raw) if vec_dwords != VEC_WIDTH else v_raw.bitcast(vec_type_e)
+                    for vi in range_constexpr(VEC_WIDTH):
+                        v_scalar = vector.extract(v_e, static_position=[vi])
+                        d_idx = ArithValue(tid) * VEC_WIDTH + vi
+                        vc_bytes = (
+                            ArithValue(pid_t_slot) * (num_kv_heads * head_dim * block_size * elem_bytes)
+                            + ArithValue(pid_hk) * (head_dim * block_size * elem_bytes)
+                            + ArithValue(d_idx) * (block_size * elem_bytes)
+                            + ArithValue(pid_b) * elem_bytes
+                        )
+                        # Pack scalar bf16 into a 1-element vector for buffer_store
+                        v_vec1 = vector.from_elements(T.vec(1, elem_type), [v_scalar])
+                        v_i16 = vector.bitcast(T.vec(1, T.i16), v_vec1)
+                        vc_hword = vc_bytes >> fx.Int32(1)  # offset in i16 units
+                        buffer_ops.buffer_store(v_i16, vc_rsrc, vc_hword)
 
     @flyc.jit
     def launch_fused_rope_cache(
