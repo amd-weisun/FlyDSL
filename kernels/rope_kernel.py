@@ -115,17 +115,18 @@ def build_rope_module(
         # vec_idx = tid % vecs_per_half
         vec_idx_i32 = tid % vecs_per_half
 
-        cos_row_soff = ArithValue(pos_val) * (half_dim * elem_bytes)
-        cos_col_bytes = ArithValue(vec_idx_i32) * (VEC_WIDTH * elem_bytes)
-        cos_col_dw = cos_col_bytes >> fx.Int32(2)
+        # NOTE: pos_val comes from buffer_load → lives in VGPR.
+        # AMD buffer instructions require soffset to be in SGPR.
+        # So we merge the position-dependent row offset into the main
+        # voffset argument instead of using soffset_bytes.
+        cos_full_bytes = ArithValue(pos_val) * (half_dim * elem_bytes) + ArithValue(vec_idx_i32) * (VEC_WIDTH * elem_bytes)
+        cos_full_dw = cos_full_bytes >> fx.Int32(2)
 
         cos_raw = buffer_ops.buffer_load(
-            cos_rsrc, cos_col_dw, vec_width=vec_dwords, dtype=T.i32,
-            soffset_bytes=cos_row_soff,
+            cos_rsrc, cos_full_dw, vec_width=vec_dwords, dtype=T.i32,
         )
         sin_raw = buffer_ops.buffer_load(
-            sin_rsrc, cos_col_dw, vec_width=vec_dwords, dtype=T.i32,
-            soffset_bytes=cos_row_soff,
+            sin_rsrc, cos_full_dw, vec_width=vec_dwords, dtype=T.i32,
         )
         cos_e = vector.bitcast(vec_type_e, cos_raw) if vec_dwords != VEC_WIDTH else cos_raw.bitcast(vec_type_e)
         sin_e = vector.bitcast(vec_type_e, sin_raw) if vec_dwords != VEC_WIDTH else sin_raw.bitcast(vec_type_e)
@@ -150,70 +151,51 @@ def build_rope_module(
             return val_e.bitcast(i32_vec_ty)
 
         # --- Process Q heads (compile-time unrolled) ---
-        # Only threads with tid < vecs_per_half are active per head iteration.
-        # Each head is processed by vecs_per_half threads.
-        q_row_soff = ArithValue(bid) * (num_q_heads * head_dim * elem_bytes)
+        # Merge all offsets into voffset (no soffset_bytes) to avoid SGPR issues.
+        bid_i32 = arith.index_cast(T.i32, bid)
+        q_row_bytes = ArithValue(bid_i32) * (num_q_heads * head_dim * elem_bytes)
 
         for head_i in range_constexpr(num_q_heads):
-            # Guard: only first vecs_per_half threads do work
             if arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_half)):
-                head_off_bytes = head_i * head_dim * elem_bytes
                 vec_off_bytes = ArithValue(vec_idx_i32) * (VEC_WIDTH * elem_bytes)
+                # head_off is compile-time constant (head_i is Python int from range_constexpr)
+                head_off_first = head_i * head_dim * elem_bytes
+                head_off_second = head_off_first + half_dim * elem_bytes
 
-                # Load first_half: Q[bid, head_i, 0:half_dim]
-                first_byte = ArithValue(fx.Int32(head_off_bytes)) + vec_off_bytes
-                first_dw = first_byte >> fx.Int32(2)
-                first_raw = buffer_ops.buffer_load(
-                    q_rsrc, first_dw, vec_width=vec_dwords, dtype=T.i32,
-                    soffset_bytes=q_row_soff,
-                )
+                first_dw = (q_row_bytes + head_off_first + vec_off_bytes) >> fx.Int32(2)
+                first_raw = buffer_ops.buffer_load(q_rsrc, first_dw, vec_width=vec_dwords, dtype=T.i32)
                 first_e = vector.bitcast(vec_type_e, first_raw) if vec_dwords != VEC_WIDTH else first_raw.bitcast(vec_type_e)
                 first_f32 = first_e.extf(vec_type_c) if dtype_str != "f32" else first_e
 
-                # Load second_half: Q[bid, head_i, half_dim:head_dim]
-                second_byte = ArithValue(fx.Int32(head_off_bytes + half_dim * elem_bytes)) + vec_off_bytes
-                second_dw = second_byte >> fx.Int32(2)
-                second_raw = buffer_ops.buffer_load(
-                    q_rsrc, second_dw, vec_width=vec_dwords, dtype=T.i32,
-                    soffset_bytes=q_row_soff,
-                )
+                second_dw = (q_row_bytes + head_off_second + vec_off_bytes) >> fx.Int32(2)
+                second_raw = buffer_ops.buffer_load(q_rsrc, second_dw, vec_width=vec_dwords, dtype=T.i32)
                 second_e = vector.bitcast(vec_type_e, second_raw) if vec_dwords != VEC_WIDTH else second_raw.bitcast(vec_type_e)
                 second_f32 = second_e.extf(vec_type_c) if dtype_str != "f32" else second_e
 
-                # Rotate
                 out_first_f32 = ArithValue(first_f32) * ArithValue(cos_f32) - ArithValue(second_f32) * ArithValue(sin_f32)
                 out_second_f32 = ArithValue(second_f32) * ArithValue(cos_f32) + ArithValue(first_f32) * ArithValue(sin_f32)
 
-                # Store
                 out_first_e = _truncf_out(out_first_f32)
                 out_second_e = _truncf_out(out_second_f32)
-
-                buffer_ops.buffer_store(_to_store_i32(out_first_e), qo_rsrc, first_dw, soffset_bytes=q_row_soff)
-                buffer_ops.buffer_store(_to_store_i32(out_second_e), qo_rsrc, second_dw, soffset_bytes=q_row_soff)
+                buffer_ops.buffer_store(_to_store_i32(out_first_e), qo_rsrc, first_dw)
+                buffer_ops.buffer_store(_to_store_i32(out_second_e), qo_rsrc, second_dw)
 
         # --- Process K heads (compile-time unrolled) ---
-        k_row_soff = ArithValue(bid) * (num_kv_heads * head_dim * elem_bytes)
+        k_row_bytes = ArithValue(bid_i32) * (num_kv_heads * head_dim * elem_bytes)
 
         for kh_i in range_constexpr(num_kv_heads):
             if arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_half)):
-                head_off_bytes = kh_i * head_dim * elem_bytes
                 vec_off_bytes = ArithValue(vec_idx_i32) * (VEC_WIDTH * elem_bytes)
+                head_off_first = kh_i * head_dim * elem_bytes
+                head_off_second = head_off_first + half_dim * elem_bytes
 
-                first_byte = ArithValue(fx.Int32(head_off_bytes)) + vec_off_bytes
-                first_dw = first_byte >> fx.Int32(2)
-                first_raw = buffer_ops.buffer_load(
-                    k_rsrc, first_dw, vec_width=vec_dwords, dtype=T.i32,
-                    soffset_bytes=k_row_soff,
-                )
+                first_dw = (k_row_bytes + head_off_first + vec_off_bytes) >> fx.Int32(2)
+                first_raw = buffer_ops.buffer_load(k_rsrc, first_dw, vec_width=vec_dwords, dtype=T.i32)
                 first_e = vector.bitcast(vec_type_e, first_raw) if vec_dwords != VEC_WIDTH else first_raw.bitcast(vec_type_e)
                 first_f32 = first_e.extf(vec_type_c) if dtype_str != "f32" else first_e
 
-                second_byte = ArithValue(fx.Int32(head_off_bytes + half_dim * elem_bytes)) + vec_off_bytes
-                second_dw = second_byte >> fx.Int32(2)
-                second_raw = buffer_ops.buffer_load(
-                    k_rsrc, second_dw, vec_width=vec_dwords, dtype=T.i32,
-                    soffset_bytes=k_row_soff,
-                )
+                second_dw = (k_row_bytes + head_off_second + vec_off_bytes) >> fx.Int32(2)
+                second_raw = buffer_ops.buffer_load(k_rsrc, second_dw, vec_width=vec_dwords, dtype=T.i32)
                 second_e = vector.bitcast(vec_type_e, second_raw) if vec_dwords != VEC_WIDTH else second_raw.bitcast(vec_type_e)
                 second_f32 = second_e.extf(vec_type_c) if dtype_str != "f32" else second_e
 
@@ -222,9 +204,8 @@ def build_rope_module(
 
                 out_first_e = _truncf_out(out_first_f32)
                 out_second_e = _truncf_out(out_second_f32)
-
-                buffer_ops.buffer_store(_to_store_i32(out_first_e), ko_rsrc, first_dw, soffset_bytes=k_row_soff)
-                buffer_ops.buffer_store(_to_store_i32(out_second_e), ko_rsrc, second_dw, soffset_bytes=k_row_soff)
+                buffer_ops.buffer_store(_to_store_i32(out_first_e), ko_rsrc, first_dw)
+                buffer_ops.buffer_store(_to_store_i32(out_second_e), ko_rsrc, second_dw)
 
     def _f32_to_bf16_manual(val, vec_bf16_ty):
         """Manual f32->bf16 round-to-nearest-even (pre-gfx950 fallback)."""
