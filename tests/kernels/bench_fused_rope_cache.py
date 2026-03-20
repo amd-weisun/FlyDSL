@@ -152,6 +152,94 @@ def bench_flydsl(tokens, warmup, iters):
         return None
 
 
+def verify_correctness(tokens: int) -> bool:
+    """Verify FlyDSL and Triton produce identical Q/K rotation outputs.
+
+    Uses the same input data for both kernels. Compares Q_out and K_out
+    (rotated outputs), which must match regardless of KV cache layout.
+    Returns True if outputs match within tolerance.
+    """
+    if not maybe_enable_aiter():
+        print("  [verify] AITER not available, skipping")
+        return True
+    try:
+        from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_rope_reshape_and_cache
+    except ImportError:
+        try:
+            from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
+        except ImportError:
+            print("  [verify] Could not import fused_qk_rope_reshape_and_cache")
+            return True
+
+    from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module
+
+    device = torch.device("cuda")
+    hd = _CFG["head_dim"]
+    num_q_heads = _CFG["num_q_heads"]
+    num_kv_heads = _CFG["num_kv_heads"]
+    nb = max(32, (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE + 1)
+    x_size = 16
+
+    # Shared input data (same random seed)
+    torch.manual_seed(42)
+    q = torch.randn(tokens, num_q_heads, hd, device=device, dtype=torch.bfloat16)
+    k = torch.randn(tokens, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
+    v = torch.randn(tokens, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
+    positions = torch.arange(tokens, device=device, dtype=torch.int64)
+    slots = torch.arange(tokens, device=device, dtype=torch.int64)
+
+    # cos/sin: Triton expects 4D, FlyDSL expects 2D — create both from same data
+    cos_2d = torch.randn(MAX_POS, hd // 2, device=device, dtype=torch.bfloat16)
+    sin_2d = torch.randn(MAX_POS, hd // 2, device=device, dtype=torch.bfloat16)
+    cos_4d = cos_2d.unsqueeze(1).unsqueeze(1)  # [max_pos, 1, 1, D//2]
+    sin_4d = sin_2d.unsqueeze(1).unsqueeze(1)
+
+    # --- Run Triton (non-flash layout) ---
+    kc_tri = torch.zeros(nb, num_kv_heads, hd // x_size, BLOCK_SIZE, x_size,
+                          device=device, dtype=torch.bfloat16)
+    vc_tri = torch.zeros(nb, num_kv_heads, hd, BLOCK_SIZE,
+                          device=device, dtype=torch.bfloat16)
+    qo_tri = torch.empty_like(q)
+    ko_tri = torch.empty_like(k)
+    ks = torch.tensor([1.0], device=device, dtype=torch.float32)
+    vs = torch.tensor([1.0], device=device, dtype=torch.float32)
+
+    fused_qk_rope_reshape_and_cache(
+        q.clone(), k.clone(), v.clone(), kc_tri, vc_tri, slots, positions,
+        cos_4d, sin_4d, ks, vs, is_neox=True, flash_layout=False,
+        apply_scale=False, q_out=qo_tri, k_out=ko_tri, output_zeros=False,
+    )
+    torch.cuda.synchronize()
+
+    # --- Run FlyDSL (flash layout) ---
+    kc_fly = torch.zeros(nb, BLOCK_SIZE, num_kv_heads, hd,
+                          device=device, dtype=torch.bfloat16)
+    vc_fly = torch.zeros(nb, BLOCK_SIZE, num_kv_heads, hd,
+                          device=device, dtype=torch.bfloat16)
+    qo_fly = torch.empty_like(q)
+    ko_fly = torch.empty_like(k)
+
+    launch_fn = build_fused_rope_cache_module(
+        head_dim=hd, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
+        block_size=BLOCK_SIZE, is_neox=True, flash_layout=True, dtype_str="bf16",
+    )
+    launch_fn(q.clone(), k.clone(), v.clone(),
+              positions.to(torch.int32), cos_2d, sin_2d,
+              slots.to(torch.int32), kc_fly, vc_fly, qo_fly, ko_fly,
+              tokens, stream=torch.cuda.current_stream())
+    torch.cuda.synchronize()
+
+    # --- Compare Q_out and K_out (rotation must match regardless of layout) ---
+    q_err = (qo_tri.float() - qo_fly.float()).abs().max().item()
+    k_err = (ko_tri.float() - ko_fly.float()).abs().max().item()
+
+    ok = q_err < 1e-3 and k_err < 1e-3
+    status = "PASS" if ok else "FAIL"
+    print(f"  [verify] {status}: Q_err={q_err:.2e}, K_err={k_err:.2e} "
+          f"(M={tokens}, QH={num_q_heads}, KH={num_kv_heads}, D={hd})")
+    return ok
+
+
 @dataclass
 class Row:
     model: str
@@ -185,6 +273,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--flydsl-only", action="store_true")
+    parser.add_argument("--verify", action="store_true",
+                        help="Verify FlyDSL vs Triton correctness before benchmarking")
     parser.add_argument("--tp", type=str, default="8",
                         help="1,2,4,8 or 'all'")
     parser.add_argument("--model", type=str, default="GPT-OSS-120B",
@@ -217,6 +307,13 @@ def main():
             print(f"{model_name} TP={tp}: num_q_heads={num_q_heads}, "
                   f"num_kv_heads={num_kv_heads}, head_dim={hd}")
             print(f"{'='*80}")
+
+            # Verify correctness before benchmarking
+            if args.verify and not args.flydsl_only:
+                verify_ok = verify_correctness(min(32, token_list[0]))
+                if not verify_ok:
+                    print(f"  CORRECTNESS VERIFICATION FAILED — skipping benchmark")
+                    continue
 
             for tokens in token_list:
                 print(f"  M={tokens:>4d} ... ", end="", flush=True)
