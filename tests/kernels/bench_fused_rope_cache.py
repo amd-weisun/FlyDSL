@@ -93,15 +93,15 @@ def bench_triton(tokens, warmup, iters):
         except ImportError:
             return None
     device = torch.device("cuda")
-    # Use flash layout to match FlyDSL (apples-to-apples comparison)
-    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_tensors(tokens, device, use_flash_layout=True)
+    # Non-flash layout = ATOM production default
+    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_tensors(tokens, device, use_flash_layout=False)
     ks = torch.tensor([1.0], device=device, dtype=torch.float32)
     vs = torch.tensor([1.0], device=device, dtype=torch.float32)
 
     def run():
         fused_qk_rope_reshape_and_cache(
             q, k, v, kc, vc, slots, pos, cos, sin,
-            ks, vs, is_neox=True, flash_layout=True,
+            ks, vs, is_neox=True, flash_layout=False,
             apply_scale=False, q_out=qo, k_out=ko, output_zeros=False,
         )
     try:
@@ -115,15 +115,14 @@ def bench_flydsl(tokens, warmup, iters):
     from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module
     device = torch.device("cuda")
 
-    # Same flash layout as Triton for apples-to-apples comparison
-    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_tensors(tokens, device, use_flash_layout=True)
-    # FlyDSL kernel uses int32 positions/slots
+    # Non-flash layout = ATOM production default (same as Triton)
+    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_tensors(tokens, device, use_flash_layout=False)
     pos_i32 = pos.to(torch.int32)
     slots_i32 = slots.to(torch.int32)
 
     launch_fn = build_fused_rope_cache_module(
         head_dim=_CFG["head_dim"], num_q_heads=_CFG["num_q_heads"], num_kv_heads=_CFG["num_kv_heads"],
-        block_size=BLOCK_SIZE, is_neox=True, flash_layout=True, dtype_str="bf16",
+        block_size=BLOCK_SIZE, is_neox=True, flash_layout=False, dtype_str="bf16",
     )
     stream = torch.cuda.current_stream()
 
@@ -238,9 +237,10 @@ class Row:
 def print_summary(results: List[Row]):
     print(f"\n{'='*105}")
     print("Fused RoPE + KV Cache Benchmark")
-    print(f"  Layout: flash (key_cache [T,BS,KH,D], value_cache [T,BS,KH,D])")
+    print(f"  Layout: non-flash (ATOM production default)")
+    print(f"    key_cache: [num_blocks, KH, D//16, BS, 16]  (x-packed)")
+    print(f"    value_cache: [num_blocks, KH, D, BS]         (dim-major)")
     print(f"  Both Triton and FlyDSL use same layout, same input data")
-    print(f"  Note: ATOM production uses non-flash layout; FlyDSL non-flash support pending")
     print(f"{'='*105}")
     print(f"{'Model':<18s} {'TP':>2s} {'Q heads':>7s} {'KV heads':>8s} {'head_dim':>8s} {'M':>5s}  "
           f"{'Triton(us)':>10s} {'FlyDSL(us)':>10s}  {'Speedup':>8s}")
