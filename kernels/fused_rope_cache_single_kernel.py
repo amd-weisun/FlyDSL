@@ -37,7 +37,7 @@ def dtype_to_elem_type(dtype_str: str):
 
 def build_fused_rope_cache_single_module(
     head_dim: int = 64,
-    rotary_dim: int = 64,
+    rotary_dim: int = -1,
     num_q_heads: int = 8,
     num_kv_heads: int = 1,
     block_size: int = 16,
@@ -46,6 +46,8 @@ def build_fused_rope_cache_single_module(
     dtype_str: str = "bf16",
 ):
     """Build single-kernel fused RoPE + KV cache (matches Triton's design)."""
+    if rotary_dim == -1:
+        rotary_dim = head_dim
     if not is_neox:
         raise NotImplementedError("Only NeoX-style RoPE is supported")
     if rotary_dim != head_dim:
