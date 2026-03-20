@@ -140,29 +140,43 @@ def build_fused_rope_cache_single_module(
             cos_f32 = cos_e.extf(vec_type_c) if dtype_str != "f32" else cos_e
             sin_f32 = sin_e.extf(vec_type_c) if dtype_str != "f32" else sin_e
 
-            # --- Load input (Q or K selected by byte offset) ---
+            # --- Load input ---
+            # Use SEPARATE offsets for Q and K loads to avoid OOB.
+            # Q programs: q_in_bytes valid for Q buffer, k_in_bytes clamped to 0 for K buffer
+            # K programs: k_in_bytes valid for K buffer, q_in_bytes clamped to 0 for Q buffer
             vec_off = ArithValue(tid) * (VEC_WIDTH * elem_bytes)
-            q_in_bytes = ArithValue(pid_t) * q_token_stride + ArithValue(pid_h) * q_head_stride + vec_off
-            k_in_bytes = ArithValue(pid_t) * k_token_stride + ArithValue(pid_h) * k_head_stride + vec_off
-            in_bytes = arith.select(is_q, q_in_bytes, k_in_bytes)
-            in_dw = in_bytes >> fx.Int32(2)
 
-            # Load from Q (for Q programs) or K (for K programs)
-            q_raw = buffer_ops.buffer_load(q_rsrc, in_dw, vec_width=vec_dwords, dtype=T.i32)
-            k_raw = buffer_ops.buffer_load(k_rsrc, in_dw, vec_width=vec_dwords, dtype=T.i32)
+            # Q offset (clamped for K programs: use q_pid_t which could OOB, so clamp pid_t)
+            q_pid_t_safe = arith.select(is_q, q_pid_t, fx.Int32(0))
+            q_pid_h_safe = arith.select(is_q, q_pid_h, fx.Int32(0))
+            q_in_bytes = ArithValue(q_pid_t_safe) * q_token_stride + ArithValue(q_pid_h_safe) * q_head_stride + vec_off
+            q_dw = q_in_bytes >> fx.Int32(2)
+
+            # K offset (clamped for Q programs: k_pid_safe already clamped to 0)
+            k_in_bytes = ArithValue(k_pid_t) * k_token_stride + ArithValue(k_pid_h) * k_head_stride + vec_off
+            k_dw = k_in_bytes >> fx.Int32(2)
+
+            # Load from both buffers with safe offsets, then select
+            q_raw = buffer_ops.buffer_load(q_rsrc, q_dw, vec_width=vec_dwords, dtype=T.i32)
+            k_raw = buffer_ops.buffer_load(k_rsrc, k_dw, vec_width=vec_dwords, dtype=T.i32)
             in_raw = arith.select(is_q, q_raw, k_raw)
             in_e = vector.bitcast(vec_type_e, in_raw) if vec_dwords != VEC_WIDTH else in_raw.bitcast(vec_type_e)
             in_f32 = in_e.extf(vec_type_c) if dtype_str != "f32" else in_e
 
+            # Select the correct byte offset for stores and pair loading
+            in_bytes = arith.select(is_q, q_in_bytes, k_in_bytes)
+
             # --- Load paired half (branchless) ---
             is_first_half = arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_half))
-            pair_off_first = in_bytes + (half_dim * elem_bytes)
-            pair_off_second = in_bytes - (half_dim * elem_bytes)
-            pair_bytes = arith.select(is_first_half, pair_off_first, pair_off_second)
-            pair_dw = pair_bytes >> fx.Int32(2)
+            pair_off_first = half_dim * elem_bytes
+            pair_off_second = -(half_dim * elem_bytes)
+            pair_delta = arith.select(is_first_half, fx.Int32(pair_off_first), fx.Int32(pair_off_second))
 
-            q_pair_raw = buffer_ops.buffer_load(q_rsrc, pair_dw, vec_width=vec_dwords, dtype=T.i32)
-            k_pair_raw = buffer_ops.buffer_load(k_rsrc, pair_dw, vec_width=vec_dwords, dtype=T.i32)
+            q_pair_dw = (q_in_bytes + ArithValue(pair_delta)) >> fx.Int32(2)
+            k_pair_dw = (k_in_bytes + ArithValue(pair_delta)) >> fx.Int32(2)
+
+            q_pair_raw = buffer_ops.buffer_load(q_rsrc, q_pair_dw, vec_width=vec_dwords, dtype=T.i32)
+            k_pair_raw = buffer_ops.buffer_load(k_rsrc, k_pair_dw, vec_width=vec_dwords, dtype=T.i32)
             pair_raw = arith.select(is_q, q_pair_raw, k_pair_raw)
             pair_e = vector.bitcast(vec_type_e, pair_raw) if vec_dwords != VEC_WIDTH else pair_raw.bitcast(vec_type_e)
             pair_f32 = pair_e.extf(vec_type_c) if dtype_str != "f32" else pair_e
