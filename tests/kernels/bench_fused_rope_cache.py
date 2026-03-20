@@ -52,19 +52,36 @@ _CFG = {"head_dim": 64, "num_q_heads": 8, "num_kv_heads": 1}
 
 
 def _create_tensors(tokens, device):
+    """Create tensors matching ATOM's actual shapes and dtypes.
+
+    Key ATOM conventions (from atom/model_ops/attention_mha.py):
+      - cos/sin: [max_pos, 1, 1, D//2] (4D, from RotaryEmbedding)
+      - positions: int64 (from backends.py)
+      - slot_mapping: int64 (from backends.py)
+      - flash_layout=False for standard MHA: key_cache [T_cache, KH, D//x, BS, x]
+      - flash_layout=True for plugin mode: key_cache [T_cache, BS, KH, D]
+    """
     hd = _CFG["head_dim"]
     num_q_heads = _CFG["num_q_heads"]
     num_kv_heads = _CFG["num_kv_heads"]
     nb = max(32, (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE + 1)
+    x_size = 16  # packing factor for non-flash key_cache layout
     q = torch.randn(tokens, num_q_heads, hd, device=device, dtype=torch.bfloat16)
     k = torch.randn(tokens, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
     v = torch.randn(tokens, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
-    cos = torch.randn(MAX_POS, hd // 2, device=device, dtype=torch.bfloat16)
-    sin = torch.randn(MAX_POS, hd // 2, device=device, dtype=torch.bfloat16)
-    pos = torch.arange(tokens, device=device, dtype=torch.int32)
-    slots = torch.arange(tokens, device=device, dtype=torch.int32)
-    kc = torch.zeros(nb, BLOCK_SIZE, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
-    vc = torch.zeros(nb, BLOCK_SIZE, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
+    # cos/sin: 4D to match RotaryEmbedding output
+    cos = torch.randn(MAX_POS, 1, 1, hd // 2, device=device, dtype=torch.bfloat16)
+    sin = torch.randn(MAX_POS, 1, 1, hd // 2, device=device, dtype=torch.bfloat16)
+    # positions and slot_mapping: int64 to match ATOM
+    pos = torch.arange(tokens, device=device, dtype=torch.int64)
+    slots = torch.arange(tokens, device=device, dtype=torch.int64)
+    # Non-flash layout (ATOM standard MHA default):
+    #   key_cache: [T_cache, KH, D//x, BS, x]
+    #   value_cache: [T_cache, KH, D, BS]
+    kc = torch.zeros(nb, num_kv_heads, hd // x_size, BLOCK_SIZE, x_size,
+                      device=device, dtype=torch.bfloat16)
+    vc = torch.zeros(nb, num_kv_heads, hd, BLOCK_SIZE,
+                      device=device, dtype=torch.bfloat16)
     qo = torch.empty_like(q)
     ko = torch.empty_like(k)
     return q, k, v, cos, sin, pos, slots, kc, vc, qo, ko
@@ -82,14 +99,13 @@ def bench_triton(tokens, warmup, iters):
             return None
     device = torch.device("cuda")
     q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_tensors(tokens, device)
-    pos_i64 = pos.to(torch.int64)
     ks = torch.tensor([1.0], device=device, dtype=torch.float32)
     vs = torch.tensor([1.0], device=device, dtype=torch.float32)
 
     def run():
         fused_qk_rope_reshape_and_cache(
-            q, k, v, kc, vc, slots, pos_i64, cos, sin,
-            ks, vs, is_neox=True, flash_layout=True,
+            q, k, v, kc, vc, slots, pos, cos, sin,
+            ks, vs, is_neox=True, flash_layout=False,
             apply_scale=False, q_out=qo, k_out=ko, output_zeros=False,
         )
     try:
@@ -102,11 +118,29 @@ def bench_triton(tokens, warmup, iters):
 def bench_flydsl(tokens, warmup, iters):
     from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module
     device = torch.device("cuda")
+    hd = _CFG["head_dim"]
+    num_q_heads = _CFG["num_q_heads"]
+    num_kv_heads = _CFG["num_kv_heads"]
+
+    # FlyDSL kernel currently only supports flash_layout=True.
+    # Create flash-layout tensors for FlyDSL (separate from Triton's non-flash tensors).
+    nb = max(32, (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE + 1)
+    q = torch.randn(tokens, num_q_heads, hd, device=device, dtype=torch.bfloat16)
+    k = torch.randn(tokens, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
+    v = torch.randn(tokens, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
+    cos = torch.randn(MAX_POS, hd // 2, device=device, dtype=torch.bfloat16)
+    sin = torch.randn(MAX_POS, hd // 2, device=device, dtype=torch.bfloat16)
+    pos = torch.arange(tokens, device=device, dtype=torch.int32)
+    slots = torch.arange(tokens, device=device, dtype=torch.int32)
+    kc = torch.zeros(nb, BLOCK_SIZE, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
+    vc = torch.zeros(nb, BLOCK_SIZE, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
+    qo = torch.empty_like(q)
+    ko = torch.empty_like(k)
+
     launch_fn = build_fused_rope_cache_module(
-        head_dim=_CFG["head_dim"], num_q_heads=_CFG["num_q_heads"], num_kv_heads=_CFG["num_kv_heads"],
+        head_dim=hd, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
         block_size=BLOCK_SIZE, is_neox=True, flash_layout=True, dtype_str="bf16",
     )
-    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_tensors(tokens, device)
     stream = torch.cuda.current_stream()
 
     def run():
