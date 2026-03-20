@@ -31,14 +31,18 @@ import torch
 
 from benchmark_common import bench_gpu_us_torch, maybe_enable_aiter
 
-# GPT-OSS 120B config (TP=8)
+# GPT-OSS 120B model config
 HEAD_DIM = 64
-NUM_Q_HEADS = 8
-NUM_KV_HEADS = 1
+TOTAL_Q_HEADS = 64
+TOTAL_KV_HEADS = 8
 BLOCK_SIZE = 16
 MAX_POS = 8192
 
-SWEEP_CONCURRENCY = [1, 2, 4, 8, 16, 32, 64, 128]
+# Derived per-GPU heads (set by --tp flag)
+NUM_Q_HEADS = 8   # default TP=8
+NUM_KV_HEADS = 1  # default TP=8
+
+SWEEP_CONCURRENCY = [1, 2, 4, 8, 16, 32, 64, 128, 1024]
 
 
 @dataclass
@@ -189,24 +193,40 @@ def main():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--flydsl-only", action="store_true")
+    parser.add_argument("--tp", type=str, default="8",
+                        help="Tensor parallelism: 1,2,4,8 or 'all'")
     args = parser.parse_args()
 
     torch.set_default_device("cuda")
 
     token_list = SWEEP_CONCURRENCY if args.sweep else [int(t) for t in args.concurrency.split(",")]
 
-    rows: List[BenchRow] = []
-    for tokens in token_list:
-        print(f"Benchmarking concurrency={tokens} ...")
+    if args.tp == "all":
+        tp_list = [1, 2, 4, 8]
+    else:
+        tp_list = [int(t) for t in args.tp.split(",")]
 
-        if not args.flydsl_only:
-            aiter_us = bench_aiter(tokens, args.warmup, args.iters)
-            rows.append(BenchRow(label="Triton", tokens=tokens, us=aiter_us))
+    for tp in tp_list:
+        global NUM_Q_HEADS, NUM_KV_HEADS
+        NUM_Q_HEADS = TOTAL_Q_HEADS // tp
+        NUM_KV_HEADS = TOTAL_KV_HEADS // tp
 
-        fly_us = bench_flydsl(tokens, args.warmup, args.iters)
-        rows.append(BenchRow(label="FlyDSL", tokens=tokens, us=fly_us))
+        print(f"\n{'='*90}")
+        print(f"TP={tp} → QH={NUM_Q_HEADS}, KH={NUM_KV_HEADS}")
+        print(f"{'='*90}")
 
-    print_results(rows)
+        rows: List[BenchRow] = []
+        for tokens in token_list:
+            print(f"Benchmarking concurrency={tokens} ...")
+
+            if not args.flydsl_only:
+                aiter_us = bench_aiter(tokens, args.warmup, args.iters)
+                rows.append(BenchRow(label="Triton", tokens=tokens, us=aiter_us))
+
+            fly_us = bench_flydsl(tokens, args.warmup, args.iters)
+            rows.append(BenchRow(label="FlyDSL", tokens=tokens, us=fly_us))
+
+        print_results(rows)
 
 
 if __name__ == "__main__":
