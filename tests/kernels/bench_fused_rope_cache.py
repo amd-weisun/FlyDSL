@@ -92,7 +92,7 @@ def _create_test_tensors(tokens, device):
 
 
 def bench_flydsl(tokens: int, warmup: int, iters: int) -> Optional[float]:
-    """Benchmark FlyDSL fused RoPE + KV cache kernel."""
+    """Benchmark FlyDSL fused RoPE + KV cache kernel (two launches)."""
     try:
         from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module
     except ImportError:
@@ -115,6 +115,37 @@ def bench_flydsl(tokens: int, warmup: int, iters: int) -> Optional[float]:
         return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
     except Exception as e:
         print(f"  [FlyDSL] Failed: {e}")
+        return None
+
+
+def bench_flydsl_single(tokens: int, warmup: int, iters: int) -> Optional[float]:
+    """Benchmark FlyDSL fused RoPE + KV cache kernel (SINGLE launch, like Triton)."""
+    try:
+        from kernels.fused_rope_cache_single_kernel import build_fused_rope_cache_single_module
+    except ImportError:
+        print("  [FlyDSL-1K] Could not import fused_rope_cache_single_kernel")
+        return None
+
+    device = torch.device("cuda")
+    launch_fn = build_fused_rope_cache_single_module(
+        head_dim=HEAD_DIM, num_q_heads=NUM_Q_HEADS, num_kv_heads=NUM_KV_HEADS,
+        block_size=BLOCK_SIZE, is_neox=True, flash_layout=True, dtype_str="bf16",
+    )
+
+    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_test_tensors(tokens, device)
+    stream = torch.cuda.current_stream()
+    n_q_progs = tokens * NUM_Q_HEADS
+    n_total = n_q_progs + tokens * NUM_KV_HEADS
+    nqp_tensor = torch.tensor([n_q_progs], device=device, dtype=torch.int32)
+
+    def run():
+        launch_fn(q, k, v, pos, cos, sin, slots, kc, vc, qo, ko,
+                  nqp_tensor, n_total, stream=stream)
+
+    try:
+        return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
+    except Exception as e:
+        print(f"  [FlyDSL-1K] Failed: {e}")
         return None
 
 
@@ -176,10 +207,14 @@ def print_results(rows: List[BenchRow]) -> None:
             print(f"{tok_col}  {r.label:<16s}  {us_s}  {bw_s}")
 
         aiter_row = next((r for r in group if r.label == "Triton" and r.us), None)
-        fly_row = next((r for r in group if r.label == "FlyDSL" and r.us), None)
-        if aiter_row and fly_row:
-            sp = aiter_row.us / fly_row.us
-            print(f"{'':7s}  {'FlyDSL/Triton':<16s}  {'':12s}  {sp:9.2f}x")
+        fly2_row = next((r for r in group if r.label == "FlyDSL-2K" and r.us), None)
+        fly1_row = next((r for r in group if r.label == "FlyDSL-1K" and r.us), None)
+        if aiter_row and fly2_row:
+            sp = aiter_row.us / fly2_row.us
+            print(f"{'':7s}  {'2K/Triton':<16s}  {'':12s}  {sp:9.2f}x")
+        if aiter_row and fly1_row:
+            sp = aiter_row.us / fly1_row.us
+            print(f"{'':7s}  {'1K/Triton':<16s}  {'':12s}  {sp:9.2f}x")
         print()
 
     print("=" * 90)
@@ -224,7 +259,10 @@ def main():
                 rows.append(BenchRow(label="Triton", tokens=tokens, us=aiter_us))
 
             fly_us = bench_flydsl(tokens, args.warmup, args.iters)
-            rows.append(BenchRow(label="FlyDSL", tokens=tokens, us=fly_us))
+            rows.append(BenchRow(label="FlyDSL-2K", tokens=tokens, us=fly_us))
+
+            fly1_us = bench_flydsl_single(tokens, args.warmup, args.iters)
+            rows.append(BenchRow(label="FlyDSL-1K", tokens=tokens, us=fly1_us))
 
         print_results(rows)
 
