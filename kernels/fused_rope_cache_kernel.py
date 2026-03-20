@@ -20,6 +20,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 
 from flydsl.expr import arith, vector, gpu, range_constexpr
+from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T, Int32
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
@@ -95,7 +96,7 @@ def build_fused_rope_cache_module(
         SinCache: fx.Tensor,     # [max_pos, half_dim]
         Q_out: fx.Tensor,        # [T, QH, D]
     ):
-        from flydsl.expr.arith import ArithValue
+        # ArithValue imported at module level
 
         pid = fx.block_idx.x    # program id: 0..T*QH-1
         tid = fx.thread_idx.x   # 0..63
@@ -186,7 +187,7 @@ def build_fused_rope_cache_module(
         ValueCache: fx.Tensor,   # flash: [T_cache, BS, KH, D]
         K_out: fx.Tensor,        # [T, KH, D]
     ):
-        from flydsl.expr.arith import ArithValue
+        # ArithValue imported at module level
 
         pid = fx.block_idx.x    # program id: 0..T*KH-1
         tid = fx.thread_idx.x   # 0..63
