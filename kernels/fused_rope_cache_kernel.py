@@ -298,35 +298,35 @@ def build_fused_rope_cache_module(
                     d_start = ArithValue(tid) * VEC_WIDTH  # starting dim index
                     dim_group = d_start // x_size
                     dim_within = d_start % x_size
-                    kc_bytes = (
-                        ArithValue(pid_t_slot) * (num_kv_heads * (head_dim // x_size) * block_size * x_size * elem_bytes)
-                        + ArithValue(pid_hk) * ((head_dim // x_size) * block_size * x_size * elem_bytes)
-                        + ArithValue(dim_group) * (block_size * x_size * elem_bytes)
-                        + ArithValue(pid_b) * (x_size * elem_bytes)
-                        + ArithValue(dim_within) * elem_bytes
+                    # Element offset (not bytes) — buffer_store auto-scales
+                    kc_elem_off = (
+                        ArithValue(pid_t_slot) * (num_kv_heads * (head_dim // x_size) * block_size * x_size)
+                        + ArithValue(pid_hk) * ((head_dim // x_size) * block_size * x_size)
+                        + ArithValue(dim_group) * (block_size * x_size)
+                        + ArithValue(pid_b) * x_size
+                        + ArithValue(dim_within)
                     )
-                    kc_dw = kc_bytes >> fx.Int32(2)
-                    buffer_ops.buffer_store(k_rot_i32, kc_rsrc, kc_dw)
+                    # Store vec8 of bf16 — buffer_store handles element size
+                    buffer_ops.buffer_store(k_rot_e, kc_rsrc, kc_elem_off)
 
                     # value_cache: [T_cache, KH, D, BS]
                     # Stride along D = BS elements (non-contiguous for vec8).
-                    # Each bf16 element goes to a different strided address.
-                    # Unroll and store one element at a time using dword-aligned writes.
+                    # Each bf16 element stored individually (compile-time unrolled).
                     v_e = vector.bitcast(vec_type_e, v_raw) if vec_dwords != VEC_WIDTH else v_raw.bitcast(vec_type_e)
                     for vi in range_constexpr(VEC_WIDTH):
                         v_scalar = vector.extract(v_e, static_position=[vi])
                         d_idx = ArithValue(tid) * VEC_WIDTH + vi
-                        vc_bytes = (
-                            ArithValue(pid_t_slot) * (num_kv_heads * head_dim * block_size * elem_bytes)
-                            + ArithValue(pid_hk) * (head_dim * block_size * elem_bytes)
-                            + ArithValue(d_idx) * (block_size * elem_bytes)
-                            + ArithValue(pid_b) * elem_bytes
+                        # Element offset in value_cache (not bytes)
+                        # value_cache[pid_t_slot, pid_hk, d_idx, pid_b]
+                        # Flat element offset = pid_t_slot * (KH*D*BS) + pid_hk * (D*BS) + d_idx * BS + pid_b
+                        vc_elem_off = (
+                            ArithValue(pid_t_slot) * (num_kv_heads * head_dim * block_size)
+                            + ArithValue(pid_hk) * (head_dim * block_size)
+                            + ArithValue(d_idx) * block_size
+                            + ArithValue(pid_b)
                         )
-                        # Pack scalar bf16 into a 1-element vector for buffer_store
-                        v_vec1 = vector.from_elements(T.vec(1, elem_type), [v_scalar])
-                        v_i16 = vector.bitcast(T.vec(1, T.i16), v_vec1)
-                        vc_hword = vc_bytes >> fx.Int32(1)  # offset in i16 units
-                        buffer_ops.buffer_store(v_i16, vc_rsrc, vc_hword)
+                        # buffer_store auto-scales offset by element size (2 bytes for bf16)
+                        buffer_ops.buffer_store(v_scalar, vc_rsrc, vc_elem_off)
 
     @flyc.jit
     def launch_fused_rope_cache(
