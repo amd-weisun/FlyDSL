@@ -240,10 +240,9 @@ def build_rope_module(
         num_tokens: fx.Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
-        idx_m = arith.index_cast(T.index, num_tokens)
         launcher = rope_kernel(Q, K, CosCache, SinCache, Positions, Q_out, K_out)
         launcher.launch(
-            grid=(idx_m, 1, 1),
+            grid=(num_tokens, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
