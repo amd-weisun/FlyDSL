@@ -2,14 +2,21 @@
 """Fused RoPE + KV Cache benchmark: FlyDSL vs AITER Triton.
 
 This is the kernel that takes 4.1% GPU time in GPT-OSS 120B (3.50 ms).
-Apples-to-apples comparison: both do RoPE on Q/K + KV cache write in one call.
+Compares Triton (single launch, 40+ args) vs FlyDSL-2K (two launches)
+vs FlyDSL-1K (single launch with runtime Q/K dispatch).
 
 Usage (from FlyDSL/ directory):
-    # FlyDSL vs AITER
+    # GPT-OSS 120B default (TP=8)
     AITER_REPO=../aiter PYTHONPATH=./ python tests/kernels/bench_fused_rope_cache.py --sweep
 
+    # All TP values
+    AITER_REPO=../aiter PYTHONPATH=./ python tests/kernels/bench_fused_rope_cache.py --sweep --tp all
+
+    # Multiple models (stress test larger configs)
+    AITER_REPO=../aiter PYTHONPATH=./ python tests/kernels/bench_fused_rope_cache.py --sweep --model all
+
     # FlyDSL only
-    PYTHONPATH=./ python tests/kernels/bench_fused_rope_cache.py --flydsl-only --sweep
+    PYTHONPATH=./ python tests/kernels/bench_fused_rope_cache.py --flydsl-only --sweep --model all
 """
 from __future__ import annotations
 
@@ -17,7 +24,7 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 _THIS = os.path.abspath(__file__)
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(_THIS)))
@@ -31,126 +38,47 @@ import torch
 
 from benchmark_common import bench_gpu_us_torch, maybe_enable_aiter
 
-# GPT-OSS 120B model config
-HEAD_DIM = 64
-TOTAL_Q_HEADS = 64
-TOTAL_KV_HEADS = 8
+# ---------------------------------------------------------------------------
+# Model configs: (head_dim, total_q_heads, total_kv_heads)
+# ---------------------------------------------------------------------------
+MODEL_CONFIGS: Dict[str, Tuple[int, int, int]] = {
+    "GPT-OSS-120B":   (64,  64,   8),
+    "Qwen3-235B-MoE": (64,  64,   4),
+    "Llama-3.1-8B":   (128, 32,   8),
+    "Llama-3.1-70B":  (128, 64,   8),
+    "Qwen3-72B":      (128, 64,   8),
+    "Llama-3.1-405B": (128, 128,  8),
+}
+
 BLOCK_SIZE = 16
 MAX_POS = 8192
 
-# Derived per-GPU heads (set by --tp flag)
-NUM_Q_HEADS = 8   # default TP=8
-NUM_KV_HEADS = 1  # default TP=8
+SWEEP_CONCURRENCY = [1, 4, 32, 128, 1024]
 
-SWEEP_CONCURRENCY = [1, 2, 4, 8, 16, 32, 64, 128, 1024]
-
-
-@dataclass
-class BenchRow:
-    label: str
-    tokens: int
-    us: Optional[float]
-
-    @property
-    def bytes_total(self) -> int:
-        eb = 2  # bf16
-        # Read: Q + K + V + cos + sin + positions + slot_mapping
-        read = self.tokens * (NUM_Q_HEADS + NUM_KV_HEADS) * HEAD_DIM * eb  # Q + K
-        read += self.tokens * NUM_KV_HEADS * HEAD_DIM * eb  # V
-        read += self.tokens * (HEAD_DIM // 2) * 2 * eb  # cos + sin
-        read += self.tokens * 4 * 2  # positions + slot_mapping (i32)
-        # Write: Q_out + K_out + key_cache + value_cache
-        write = self.tokens * (NUM_Q_HEADS + NUM_KV_HEADS) * HEAD_DIM * eb  # Q_out + K_out
-        write += self.tokens * NUM_KV_HEADS * HEAD_DIM * eb * 2  # key_cache + value_cache
-        return read + write
-
-    @property
-    def bw_gbps(self) -> Optional[float]:
-        if self.us is None:
-            return None
-        return self.bytes_total / 1e9 / (self.us / 1e6)
+# Active config (set per benchmark iteration)
+_CFG = {"head_dim": 64, "qh": 8, "kh": 1}
 
 
-def _create_test_tensors(tokens, device):
-    """Create test tensors matching GPT-OSS shapes."""
+def _create_tensors(tokens, device):
+    hd = _CFG["head_dim"]
+    qh = _CFG["qh"]
+    kh = _CFG["kh"]
     num_blocks = max(32, (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE + 1)
-    q = torch.randn(tokens, NUM_Q_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
-    k = torch.randn(tokens, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
-    v = torch.randn(tokens, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
-    cos_cache = torch.randn(MAX_POS, HEAD_DIM // 2, device=device, dtype=torch.bfloat16)
-    sin_cache = torch.randn(MAX_POS, HEAD_DIM // 2, device=device, dtype=torch.bfloat16)
-    positions = torch.arange(tokens, device=device, dtype=torch.int32)
-    slot_mapping = torch.arange(tokens, device=device, dtype=torch.int32)
-    # Flash layout: [num_blocks, block_size, KH, D]
-    key_cache = torch.zeros(num_blocks, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM,
-                             device=device, dtype=torch.bfloat16)
-    value_cache = torch.zeros(num_blocks, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM,
-                               device=device, dtype=torch.bfloat16)
-    q_out = torch.empty_like(q)
-    k_out = torch.empty_like(k)
-    return q, k, v, cos_cache, sin_cache, positions, slot_mapping, key_cache, value_cache, q_out, k_out
+    q = torch.randn(tokens, qh, hd, device=device, dtype=torch.bfloat16)
+    k = torch.randn(tokens, kh, hd, device=device, dtype=torch.bfloat16)
+    v = torch.randn(tokens, kh, hd, device=device, dtype=torch.bfloat16)
+    cos = torch.randn(MAX_POS, hd // 2, device=device, dtype=torch.bfloat16)
+    sin = torch.randn(MAX_POS, hd // 2, device=device, dtype=torch.bfloat16)
+    pos = torch.arange(tokens, device=device, dtype=torch.int32)
+    slots = torch.arange(tokens, device=device, dtype=torch.int32)
+    kc = torch.zeros(num_blocks, BLOCK_SIZE, kh, hd, device=device, dtype=torch.bfloat16)
+    vc = torch.zeros(num_blocks, BLOCK_SIZE, kh, hd, device=device, dtype=torch.bfloat16)
+    qo = torch.empty_like(q)
+    ko = torch.empty_like(k)
+    return q, k, v, cos, sin, pos, slots, kc, vc, qo, ko
 
 
-def bench_flydsl(tokens: int, warmup: int, iters: int) -> Optional[float]:
-    """Benchmark FlyDSL fused RoPE + KV cache kernel (two launches)."""
-    try:
-        from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module
-    except ImportError:
-        print("  [FlyDSL] Could not import fused_rope_cache_kernel")
-        return None
-
-    device = torch.device("cuda")
-    launch_fn = build_fused_rope_cache_module(
-        head_dim=HEAD_DIM, num_q_heads=NUM_Q_HEADS, num_kv_heads=NUM_KV_HEADS,
-        block_size=BLOCK_SIZE, is_neox=True, flash_layout=True, dtype_str="bf16",
-    )
-
-    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_test_tensors(tokens, device)
-    stream = torch.cuda.current_stream()
-
-    def run():
-        launch_fn(q, k, v, pos, cos, sin, slots, kc, vc, qo, ko, tokens, stream=stream)
-
-    try:
-        return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
-    except Exception as e:
-        print(f"  [FlyDSL] Failed: {e}")
-        return None
-
-
-def bench_flydsl_single(tokens: int, warmup: int, iters: int) -> Optional[float]:
-    """Benchmark FlyDSL fused RoPE + KV cache kernel (SINGLE launch, like Triton)."""
-    try:
-        from kernels.fused_rope_cache_single_kernel import build_fused_rope_cache_single_module
-    except ImportError:
-        print("  [FlyDSL-1K] Could not import fused_rope_cache_single_kernel")
-        return None
-
-    device = torch.device("cuda")
-    launch_fn = build_fused_rope_cache_single_module(
-        head_dim=HEAD_DIM, num_q_heads=NUM_Q_HEADS, num_kv_heads=NUM_KV_HEADS,
-        block_size=BLOCK_SIZE, is_neox=True, flash_layout=True, dtype_str="bf16",
-    )
-
-    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_test_tensors(tokens, device)
-    stream = torch.cuda.current_stream()
-    n_q_progs = tokens * NUM_Q_HEADS
-    n_total = n_q_progs + tokens * NUM_KV_HEADS
-    nqp_tensor = torch.tensor([n_q_progs], device=device, dtype=torch.int32)
-
-    def run():
-        launch_fn(q, k, v, pos, cos, sin, slots, kc, vc, qo, ko,
-                  nqp_tensor, n_total, stream=stream)
-
-    try:
-        return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
-    except Exception as e:
-        print(f"  [FlyDSL-1K] Failed: {e}")
-        return None
-
-
-def bench_aiter(tokens: int, warmup: int, iters: int) -> Optional[float]:
-    """Benchmark AITER Triton fused_qk_rope_reshape_and_cache."""
+def bench_triton(tokens, warmup, iters):
     if not maybe_enable_aiter():
         return None
     try:
@@ -159,12 +87,10 @@ def bench_aiter(tokens: int, warmup: int, iters: int) -> Optional[float]:
         try:
             from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
         except ImportError:
-            print("  [AITER] Could not import fused_qk_rope_reshape_and_cache")
             return None
 
     device = torch.device("cuda")
-    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_test_tensors(tokens, device)
-    # AITER expects int64 positions
+    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_tensors(tokens, device)
     pos_i64 = pos.to(torch.int64)
     k_scale = torch.tensor([1.0], device=device, dtype=torch.float32)
     v_scale = torch.tensor([1.0], device=device, dtype=torch.float32)
@@ -172,64 +98,107 @@ def bench_aiter(tokens: int, warmup: int, iters: int) -> Optional[float]:
     def run():
         fused_qk_rope_reshape_and_cache(
             q, k, v, kc, vc, slots, pos_i64, cos, sin,
-            k_scale, v_scale,
-            is_neox=True, flash_layout=True,
+            k_scale, v_scale, is_neox=True, flash_layout=True,
             apply_scale=False, q_out=qo, k_out=ko, output_zeros=False,
         )
-
     try:
         return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
     except Exception as e:
-        print(f"  [AITER] Failed: {e}")
+        print(f"  [Triton] {e}")
         return None
 
 
-def print_results(rows: List[BenchRow]) -> None:
-    print()
-    print("=" * 90)
-    print(f"Fused RoPE+KVCache — GPT-OSS 120B (D={HEAD_DIM}, QH={NUM_Q_HEADS}, "
-          f"KH={NUM_KV_HEADS}, BS={BLOCK_SIZE})")
-    print("=" * 90)
-    hdr = f"{'M(conc)':>7s}  {'Kernel':<16s}  {'Latency(us)':>12s}  {'BW(GB/s)':>10s}"
-    print(hdr)
-    print("-" * 90)
+def bench_fly2k(tokens, warmup, iters):
+    from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module
+    device = torch.device("cuda")
+    launch_fn = build_fused_rope_cache_module(
+        head_dim=_CFG["head_dim"], num_q_heads=_CFG["qh"], num_kv_heads=_CFG["kh"],
+        block_size=BLOCK_SIZE, is_neox=True, flash_layout=True, dtype_str="bf16",
+    )
+    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_tensors(tokens, device)
+    stream = torch.cuda.current_stream()
 
-    by_tokens: dict[int, List[BenchRow]] = {}
-    for r in rows:
-        by_tokens.setdefault(r.tokens, []).append(r)
+    def run():
+        launch_fn(q, k, v, pos, cos, sin, slots, kc, vc, qo, ko, tokens, stream=stream)
+    try:
+        return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
+    except Exception as e:
+        print(f"  [2K] {e}")
+        return None
 
-    for tokens in sorted(by_tokens.keys()):
-        group = by_tokens[tokens]
-        for i, r in enumerate(group):
-            tok_col = f"{tokens:7d}" if i == 0 else f"{'':7s}"
-            us_s = f"{r.us:12.1f}" if r.us else f"{'N/A':>12s}"
-            bw_s = f"{r.bw_gbps:10.2f}" if r.bw_gbps else f"{'N/A':>10s}"
-            print(f"{tok_col}  {r.label:<16s}  {us_s}  {bw_s}")
 
-        aiter_row = next((r for r in group if r.label == "Triton" and r.us), None)
-        fly2_row = next((r for r in group if r.label == "FlyDSL-2K" and r.us), None)
-        fly1_row = next((r for r in group if r.label == "FlyDSL-1K" and r.us), None)
-        if aiter_row and fly2_row:
-            sp = aiter_row.us / fly2_row.us
-            print(f"{'':7s}  {'2K/Triton':<16s}  {'':12s}  {sp:9.2f}x")
-        if aiter_row and fly1_row:
-            sp = aiter_row.us / fly1_row.us
-            print(f"{'':7s}  {'1K/Triton':<16s}  {'':12s}  {sp:9.2f}x")
-        print()
+def bench_fly1k(tokens, warmup, iters):
+    from kernels.fused_rope_cache_single_kernel import build_fused_rope_cache_single_module
+    device = torch.device("cuda")
+    launch_fn = build_fused_rope_cache_single_module(
+        head_dim=_CFG["head_dim"], num_q_heads=_CFG["qh"], num_kv_heads=_CFG["kh"],
+        block_size=BLOCK_SIZE, is_neox=True, flash_layout=True, dtype_str="bf16",
+    )
+    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_tensors(tokens, device)
+    stream = torch.cuda.current_stream()
+    n_q = tokens * _CFG["qh"]
+    n_total = n_q + tokens * _CFG["kh"]
+    nqp = torch.tensor([n_q], device=device, dtype=torch.int32)
 
-    print("=" * 90)
+    def run():
+        launch_fn(q, k, v, pos, cos, sin, slots, kc, vc, qo, ko, nqp, n_total, stream=stream)
+    try:
+        return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
+    except Exception as e:
+        print(f"  [1K] {e}")
+        return None
+
+
+@dataclass
+class Row:
+    model: str
+    tp: int
+    tokens: int
+    qh: int
+    kh: int
+    hd: int
+    triton_us: Optional[float]
+    fly2k_us: Optional[float]
+    fly1k_us: Optional[float]
+
+
+def print_summary(results: List[Row]):
+    print(f"\n{'='*115}")
+    print(f"{'Model':<18s} {'TP':>2s} {'M':>5s} {'progs':>7s}  "
+          f"{'Triton(us)':>10s} {'2K(us)':>8s} {'1K(us)':>8s}  "
+          f"{'2K/Tri':>7s} {'1K/Tri':>7s} {'1K/2K':>6s}")
+    print(f"{'='*115}")
+
+    for r in results:
+        progs = r.tokens * (r.qh + r.kh)
+        tri_s = f"{r.triton_us:.1f}" if r.triton_us else "N/A"
+        f2_s = f"{r.fly2k_us:.1f}" if r.fly2k_us else "N/A"
+        f1_s = f"{r.fly1k_us:.1f}" if r.fly1k_us else "N/A"
+
+        sp_2k = f"{r.triton_us / r.fly2k_us:.2f}x" if r.triton_us and r.fly2k_us else ""
+        sp_1k = f"{r.triton_us / r.fly1k_us:.2f}x" if r.triton_us and r.fly1k_us else ""
+        sp_1v2 = f"{r.fly2k_us / r.fly1k_us:.2f}x" if r.fly2k_us and r.fly1k_us else ""
+
+        print(f"{r.model:<18s} {r.tp:>2d} {r.tokens:>5d} {progs:>7d}  "
+              f"{tri_s:>10s} {f2_s:>8s} {f1_s:>8s}  "
+              f"{sp_2k:>7s} {sp_1k:>7s} {sp_1v2:>6s}")
+
+    print(f"{'='*115}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Fused RoPE+KVCache: FlyDSL vs Triton")
     parser.add_argument("--concurrency", type=str, default="1,4,32,128",
                         help="Comma-separated M values")
-    parser.add_argument("--sweep", action="store_true")
+    parser.add_argument("--sweep", action="store_true",
+                        help="Sweep concurrency: 1,4,32,128,1024")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--flydsl-only", action="store_true")
     parser.add_argument("--tp", type=str, default="8",
                         help="Tensor parallelism: 1,2,4,8 or 'all'")
+    parser.add_argument("--model", type=str, default="GPT-OSS-120B",
+                        help=f"Model config: {', '.join(MODEL_CONFIGS.keys())} or 'all'")
     args = parser.parse_args()
 
     torch.set_default_device("cuda")
@@ -241,30 +210,51 @@ def main():
     else:
         tp_list = [int(t) for t in args.tp.split(",")]
 
-    for tp in tp_list:
-        global NUM_Q_HEADS, NUM_KV_HEADS
-        NUM_Q_HEADS = TOTAL_Q_HEADS // tp
-        NUM_KV_HEADS = TOTAL_KV_HEADS // tp
+    if args.model == "all":
+        model_list = list(MODEL_CONFIGS.keys())
+    else:
+        model_list = [m.strip() for m in args.model.split(",")]
 
-        print(f"\n{'='*90}")
-        print(f"TP={tp} → QH={NUM_Q_HEADS}, KH={NUM_KV_HEADS}")
-        print(f"{'='*90}")
+    results: List[Row] = []
 
-        rows: List[BenchRow] = []
-        for tokens in token_list:
-            print(f"Benchmarking concurrency={tokens} ...")
+    for model_name in model_list:
+        if model_name not in MODEL_CONFIGS:
+            print(f"Unknown model '{model_name}'. Options: {list(MODEL_CONFIGS.keys())}")
+            continue
+        hd, total_qh, total_kh = MODEL_CONFIGS[model_name]
 
-            if not args.flydsl_only:
-                aiter_us = bench_aiter(tokens, args.warmup, args.iters)
-                rows.append(BenchRow(label="Triton", tokens=tokens, us=aiter_us))
+        for tp in tp_list:
+            qh = total_qh // tp
+            kh = max(1, total_kh // tp)
+            if qh < 1:
+                continue
 
-            fly_us = bench_flydsl(tokens, args.warmup, args.iters)
-            rows.append(BenchRow(label="FlyDSL-2K", tokens=tokens, us=fly_us))
+            _CFG["head_dim"] = hd
+            _CFG["qh"] = qh
+            _CFG["kh"] = kh
+            progs_per_tok = qh + kh
 
-            fly1_us = bench_flydsl_single(tokens, args.warmup, args.iters)
-            rows.append(BenchRow(label="FlyDSL-1K", tokens=tokens, us=fly1_us))
+            print(f"\n{'='*90}")
+            print(f"{model_name} TP={tp}: QH={qh}, KH={kh}, D={hd}, progs/tok={progs_per_tok}")
+            print(f"{'='*90}")
 
-        print_results(rows)
+            for tokens in token_list:
+                total_progs = tokens * progs_per_tok
+                print(f"  M={tokens:>4d} ({total_progs:>7d} progs) ... ", end="", flush=True)
+
+                tri = bench_triton(tokens, args.warmup, args.iters) if not args.flydsl_only else None
+                f2 = bench_fly2k(tokens, args.warmup, args.iters)
+                f1 = bench_fly1k(tokens, args.warmup, args.iters)
+
+                results.append(Row(model_name, tp, tokens, qh, kh, hd, tri, f2, f1))
+
+                parts = []
+                if tri: parts.append(f"Tri={tri:.1f}")
+                if f2: parts.append(f"2K={f2:.1f}")
+                if f1: parts.append(f"1K={f1:.1f}")
+                print("  ".join(parts))
+
+    print_summary(results)
 
 
 if __name__ == "__main__":
