@@ -82,7 +82,7 @@ def _create_tensors(tokens, device, use_flash_layout=True):
     return q, k, v, cos, sin, pos, slots, kc, vc, qo, ko
 
 
-def bench_triton(tokens, warmup, iters):
+def bench_triton(tokens, warmup, iters, flash_layout=False):
     if not maybe_enable_aiter():
         return None
     try:
@@ -93,15 +93,14 @@ def bench_triton(tokens, warmup, iters):
         except ImportError:
             return None
     device = torch.device("cuda")
-    # Non-flash layout = ATOM production default
-    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_tensors(tokens, device, use_flash_layout=False)
+    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_tensors(tokens, device, use_flash_layout=flash_layout)
     ks = torch.tensor([1.0], device=device, dtype=torch.float32)
     vs = torch.tensor([1.0], device=device, dtype=torch.float32)
 
     def run():
         fused_qk_rope_reshape_and_cache(
             q, k, v, kc, vc, slots, pos, cos, sin,
-            ks, vs, is_neox=True, flash_layout=False,
+            ks, vs, is_neox=True, flash_layout=flash_layout,
             apply_scale=False, q_out=qo, k_out=ko, output_zeros=False,
         )
     try:
@@ -111,18 +110,17 @@ def bench_triton(tokens, warmup, iters):
         return None
 
 
-def bench_flydsl(tokens, warmup, iters):
+def bench_flydsl(tokens, warmup, iters, flash_layout=False):
     from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module
     device = torch.device("cuda")
 
-    # Non-flash layout = ATOM production default (same as Triton)
-    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_tensors(tokens, device, use_flash_layout=False)
+    q, k, v, cos, sin, pos, slots, kc, vc, qo, ko = _create_tensors(tokens, device, use_flash_layout=flash_layout)
     pos_i32 = pos.to(torch.int32)
     slots_i32 = slots.to(torch.int32)
 
     launch_fn = build_fused_rope_cache_module(
         head_dim=_CFG["head_dim"], num_q_heads=_CFG["num_q_heads"], num_kv_heads=_CFG["num_kv_heads"],
-        block_size=BLOCK_SIZE, is_neox=True, flash_layout=False, dtype_str="bf16",
+        block_size=BLOCK_SIZE, is_neox=True, flash_layout=flash_layout, dtype_str="bf16",
     )
     stream = torch.cuda.current_stream()
 
@@ -135,91 +133,49 @@ def bench_flydsl(tokens, warmup, iters):
         return None
 
 
-def verify_correctness(tokens: int) -> bool:
-    """Verify FlyDSL and Triton produce identical Q/K rotation outputs.
-
-    Uses the same input data for both kernels. Compares Q_out and K_out
-    (rotated outputs), which must match regardless of KV cache layout.
-    Returns True if outputs match within tolerance.
-    """
-    if not maybe_enable_aiter():
-        print("  [verify] AITER not available, skipping")
-        return True
-    try:
-        from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_rope_reshape_and_cache
-    except ImportError:
-        try:
-            from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
-        except ImportError:
-            print("  [verify] Could not import fused_qk_rope_reshape_and_cache")
-            return True
-
-    from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module
-
+def verify_flydsl(launch_fn, tokens, flash_layout):
+    """Quick correctness check against PyTorch reference. Returns (ok, error_str)."""
     device = torch.device("cuda")
     hd = _CFG["head_dim"]
     num_q_heads = _CFG["num_q_heads"]
     num_kv_heads = _CFG["num_kv_heads"]
-    nb = max(32, (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE + 1)
-    x_size = 16
+    half_dim = hd // 2
 
-    # Shared input data (same random seed)
     torch.manual_seed(42)
     q = torch.randn(tokens, num_q_heads, hd, device=device, dtype=torch.bfloat16)
     k = torch.randn(tokens, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
     v = torch.randn(tokens, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
-    positions = torch.arange(tokens, device=device, dtype=torch.int64)
-    slots = torch.arange(tokens, device=device, dtype=torch.int64)
+    cos = torch.randn(MAX_POS, half_dim, device=device, dtype=torch.bfloat16)
+    sin = torch.randn(MAX_POS, half_dim, device=device, dtype=torch.bfloat16)
+    pos = torch.randint(0, MAX_POS, (tokens,), device=device, dtype=torch.int32)
+    slots = torch.arange(tokens, device=device, dtype=torch.int32)
+    nb = max(32, (tokens + BLOCK_SIZE - 1) // BLOCK_SIZE + 1)
 
-    # Same tensors for both — flash layout, same cos/sin
-    cos = torch.randn(MAX_POS, hd // 2, device=device, dtype=torch.bfloat16)
-    sin = torch.randn(MAX_POS, hd // 2, device=device, dtype=torch.bfloat16)
+    if flash_layout:
+        kc = torch.zeros(nb, BLOCK_SIZE, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
+        vc = torch.zeros(nb, BLOCK_SIZE, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
+    else:
+        kc = torch.zeros(nb, num_kv_heads, hd // 16, BLOCK_SIZE, 16, device=device, dtype=torch.bfloat16)
+        vc = torch.zeros(nb, num_kv_heads, hd, BLOCK_SIZE, device=device, dtype=torch.bfloat16)
+    qo = torch.empty_like(q)
+    ko = torch.empty_like(k)
 
-    # Flash layout KV cache (same for both)
-    kc_tri = torch.zeros(nb, BLOCK_SIZE, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
-    vc_tri = torch.zeros(nb, BLOCK_SIZE, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
-    kc_fly = torch.zeros(nb, BLOCK_SIZE, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
-    vc_fly = torch.zeros(nb, BLOCK_SIZE, num_kv_heads, hd, device=device, dtype=torch.bfloat16)
-    qo_tri = torch.empty_like(q)
-    ko_tri = torch.empty_like(k)
-    qo_fly = torch.empty_like(q)
-    ko_fly = torch.empty_like(k)
-    ks = torch.tensor([1.0], device=device, dtype=torch.float32)
-    vs = torch.tensor([1.0], device=device, dtype=torch.float32)
+    # PyTorch reference (Q/K rotation only — layout-independent)
+    c = cos[pos.long()].unsqueeze(1).float()
+    s = sin[pos.long()].unsqueeze(1).float()
+    q1, q2 = q.float()[..., :half_dim], q.float()[..., half_dim:]
+    q_ref = torch.cat([q1 * c - q2 * s, q2 * c + q1 * s], dim=-1).to(torch.bfloat16)
+    k1, k2 = k.float()[..., :half_dim], k.float()[..., half_dim:]
+    k_ref = torch.cat([k1 * c - k2 * s, k2 * c + k1 * s], dim=-1).to(torch.bfloat16)
 
-    # --- Run Triton (flash layout) ---
-    fused_qk_rope_reshape_and_cache(
-        q.clone(), k.clone(), v.clone(), kc_tri, vc_tri, slots, positions,
-        cos, sin, ks, vs, is_neox=True, flash_layout=True,
-        apply_scale=False, q_out=qo_tri, k_out=ko_tri, output_zeros=False,
-    )
+    launch_fn(q, k, v, pos, cos, sin, slots, kc, vc, qo, ko, tokens,
+              stream=torch.cuda.current_stream())
     torch.cuda.synchronize()
 
-    # --- Run FlyDSL (flash layout) ---
-    launch_fn = build_fused_rope_cache_module(
-        head_dim=hd, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
-        block_size=BLOCK_SIZE, is_neox=True, flash_layout=True, dtype_str="bf16",
-    )
-    launch_fn(q.clone(), k.clone(), v.clone(),
-              positions.to(torch.int32), cos, sin,
-              slots.to(torch.int32), kc_fly, vc_fly, qo_fly, ko_fly,
-              tokens, stream=torch.cuda.current_stream())
-    torch.cuda.synchronize()
-
-    # --- Compare all outputs (same layout now) ---
-    q_err = (qo_tri.float() - qo_fly.float()).abs().max().item()
-    k_err = (ko_tri.float() - ko_fly.float()).abs().max().item()
-    kc_err = (kc_tri.float() - kc_fly.float()).abs().max().item()
-    vc_err = (vc_tri.float() - vc_fly.float()).abs().max().item()
-
-    # bf16 tolerance: both compute in f32 but different rounding paths
-    atol = 0.1
-    ok = q_err < atol and k_err < atol and kc_err < atol and vc_err < atol
-    status = "PASS" if ok else "FAIL"
-    print(f"  [verify] {status}: Q={q_err:.2e} K={k_err:.2e} "
-          f"KC={kc_err:.2e} VC={vc_err:.2e} "
-          f"(M={tokens}, QH={num_q_heads}, KH={num_kv_heads}, D={hd})")
-    return ok
+    q_err = (qo.float() - q_ref.float()).abs().max().item()
+    k_err = (ko.float() - k_ref.float()).abs().max().item()
+    ok = q_err < 0.1 and k_err < 0.1
+    return ok, f"Q={q_err:.2e} K={k_err:.2e}"
 
 
 @dataclass
@@ -230,28 +186,28 @@ class Row:
     num_q_heads: int
     num_kv_heads: int
     head_dim: int
+    layout: str  # "flash" or "non-flash"
     triton_us: Optional[float]
     flydsl_us: Optional[float]
 
 
 def print_summary(results: List[Row]):
-    print(f"\n{'='*105}")
+    print(f"\n{'='*115}")
     print("Fused RoPE + KV Cache Benchmark")
-    print(f"  Layout: non-flash (ATOM production default)")
-    print(f"    key_cache: [num_blocks, KH, D//16, BS, 16]  (x-packed)")
-    print(f"    value_cache: [num_blocks, KH, D, BS]         (dim-major)")
-    print(f"  Both Triton and FlyDSL use same layout, same input data")
-    print(f"{'='*105}")
-    print(f"{'Model':<18s} {'TP':>2s} {'Q heads':>7s} {'KV heads':>8s} {'head_dim':>8s} {'M':>5s}  "
+    print(f"  flash:     key_cache [T,BS,KH,D],            value_cache [T,BS,KH,D]")
+    print(f"  non-flash: key_cache [T,KH,D//16,BS,16],     value_cache [T,KH,D,BS]  (ATOM default)")
+    print(f"  Both Triton and FlyDSL use same layout per row")
+    print(f"{'='*115}")
+    print(f"{'Model':<18s} {'TP':>2s} {'Q heads':>7s} {'KV heads':>8s} {'D':>3s} {'M':>5s} {'Layout':>9s}  "
           f"{'Triton(us)':>10s} {'FlyDSL(us)':>10s}  {'Speedup':>8s}")
-    print(f"{'-'*105}")
+    print(f"{'-'*115}")
     for r in results:
         tri_s = f"{r.triton_us:.1f}" if r.triton_us else "N/A"
         fly_s = f"{r.flydsl_us:.1f}" if r.flydsl_us else "N/A"
         sp = f"{r.triton_us / r.flydsl_us:.2f}x" if r.triton_us and r.flydsl_us else ""
-        print(f"{r.model:<18s} {r.tp:>2d} {r.num_q_heads:>7d} {r.num_kv_heads:>8d} {r.head_dim:>8d} {r.tokens:>5d}  "
+        print(f"{r.model:<18s} {r.tp:>2d} {r.num_q_heads:>7d} {r.num_kv_heads:>8d} {r.head_dim:>3d} {r.tokens:>5d} {r.layout:>9s}  "
               f"{tri_s:>10s} {fly_s:>10s}  {sp:>8s}")
-    print(f"{'='*105}")
+    print(f"{'='*115}")
 
 
 def main():
@@ -261,8 +217,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--flydsl-only", action="store_true")
-    parser.add_argument("--verify", action="store_true",
-                        help="Verify FlyDSL vs Triton correctness before benchmarking")
+    parser.add_argument("--no-verify", action="store_true",
+                        help="Skip correctness verification")
     parser.add_argument("--tp", type=str, default="8",
                         help="1,2,4,8 or 'all'")
     parser.add_argument("--model", type=str, default="GPT-OSS-120B",
@@ -273,24 +229,6 @@ def main():
     token_list = SWEEP_CONCURRENCY if args.sweep else [int(t) for t in args.concurrency.split(",")]
     tp_list = [1, 2, 4, 8] if args.tp == "all" else [int(t) for t in args.tp.split(",")]
     model_list = list(MODEL_CONFIGS.keys()) if args.model == "all" else [m.strip() for m in args.model.split(",")]
-
-    # --verify: standalone correctness check (no benchmarking)
-    if args.verify:
-        print("Correctness verification mode (no benchmarking)")
-        for model_name in model_list:
-            if model_name not in MODEL_CONFIGS:
-                continue
-            hd, total_qh, total_kh = MODEL_CONFIGS[model_name]
-            for tp in tp_list:
-                num_q_heads = total_qh // tp
-                num_kv_heads = max(1, total_kh // tp)
-                if num_q_heads < 1:
-                    continue
-                _CFG["head_dim"] = hd
-                _CFG["num_q_heads"] = num_q_heads
-                _CFG["num_kv_heads"] = num_kv_heads
-                verify_correctness(32)
-        return
 
     results: List[Row] = []
 
@@ -314,19 +252,34 @@ def main():
                   f"num_kv_heads={num_kv_heads}, head_dim={hd}")
             print(f"{'='*80}")
 
+            # Verify correctness once per layout (reuses bench_flydsl's compiled kernel)
+            if not args.no_verify:
+                from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module
+                for layout_name, flash in [("non-flash", False), ("flash", True)]:
+                    fn = build_fused_rope_cache_module(
+                        head_dim=hd, num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
+                        block_size=BLOCK_SIZE, is_neox=True, flash_layout=flash, dtype_str="bf16",
+                    )
+                    ok, err_str = verify_flydsl(fn, min(32, token_list[0]), flash_layout=flash)
+                    status = "PASS" if ok else "FAIL"
+                    print(f"  [verify {layout_name}] {status}: {err_str}")
+                    if not ok:
+                        print(f"  CORRECTNESS FAILED for {layout_name} — skipping")
+
             for tokens in token_list:
-                print(f"  M={tokens:>4d} ... ", end="", flush=True)
+                for layout_name, flash in [("non-flash", False), ("flash", True)]:
+                    print(f"  M={tokens:>4d} {layout_name:>9s} ... ", end="", flush=True)
 
-                tri = bench_triton(tokens, args.warmup, args.iters) if not args.flydsl_only else None
-                fly = bench_flydsl(tokens, args.warmup, args.iters)
+                    tri = bench_triton(tokens, args.warmup, args.iters, flash_layout=flash) if not args.flydsl_only else None
+                    fly = bench_flydsl(tokens, args.warmup, args.iters, flash_layout=flash)
 
-                results.append(Row(model_name, tp, tokens, num_q_heads, num_kv_heads, hd, tri, fly))
+                    results.append(Row(model_name, tp, tokens, num_q_heads, num_kv_heads, hd, layout_name, tri, fly))
 
-                parts = []
-                if tri: parts.append(f"Tri={tri:.1f}")
-                if fly: parts.append(f"FlyDSL={fly:.1f}")
-                if tri and fly: parts.append(f"({tri/fly:.2f}x)")
-                print("  ".join(parts))
+                    parts = []
+                    if tri: parts.append(f"Tri={tri:.1f}")
+                    if fly: parts.append(f"FlyDSL={fly:.1f}")
+                    if tri and fly: parts.append(f"({tri/fly:.2f}x)")
+                    print("  ".join(parts))
 
     print_summary(results)
 
