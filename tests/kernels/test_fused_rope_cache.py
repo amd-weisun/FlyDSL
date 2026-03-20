@@ -35,50 +35,65 @@ MAX_POS = 8192
 
 
 def fused_rope_cache_ref(q, k, v, cos_cache, sin_cache, positions, slot_mapping,
-                          key_cache, value_cache, block_size):
+                          key_cache, value_cache, block_size, flash_layout=True):
     """PyTorch reference for fused RoPE + KV cache."""
     half_dim = cos_cache.shape[-1]
     cos = cos_cache[positions.long()].unsqueeze(1).float()
     sin = sin_cache[positions.long()].unsqueeze(1).float()
 
-    # RoPE Q
     q_f32 = q.float()
     q1, q2 = q_f32[..., :half_dim], q_f32[..., half_dim:]
     q_out = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1).to(q.dtype)
 
-    # RoPE K
     k_f32 = k.float()
     k1, k2 = k_f32[..., :half_dim], k_f32[..., half_dim:]
     k_out = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1).to(k.dtype)
 
-    # KV cache write (flash layout: [num_blocks, block_size, KH, D])
     key_cache_out = key_cache.clone()
     value_cache_out = value_cache.clone()
     for i in range(slot_mapping.shape[0]):
         slot = slot_mapping[i].item()
         if slot >= 0:
-            block_idx = slot // block_size
-            block_pos = slot % block_size
-            key_cache_out[block_idx, block_pos] = k_out[i]
-            value_cache_out[block_idx, block_pos] = v[i]
+            bi = slot // block_size
+            bp = slot % block_size
+            if flash_layout:
+                # [num_blocks, block_size, KH, D]
+                key_cache_out[bi, bp] = k_out[i]
+                value_cache_out[bi, bp] = v[i]
+            else:
+                # key_cache: [num_blocks, KH, D//x, block_size, x]
+                x = 16
+                for d in range(k_out.shape[-1]):
+                    dg, dw = d // x, d % x
+                    key_cache_out[bi, k_out.shape[1] * 0 // 1, dg, bp, dw] = k_out[i, 0, d]
+                    # For multi-head: iterate over heads
+                for h in range(k_out.shape[1]):
+                    for d in range(k_out.shape[-1]):
+                        dg, dw = d // x, d % x
+                        key_cache_out[bi, h, dg, bp, dw] = k_out[i, h, d]
+                # value_cache: [num_blocks, KH, D, block_size]
+                for h in range(v.shape[1]):
+                    for d in range(v.shape[-1]):
+                        value_cache_out[bi, h, d, bp] = v[i, h, d]
 
     return q_out, k_out, key_cache_out, value_cache_out
 
 
-def run_fused_test(num_tokens, block_size=BLOCK_SIZE, max_pos=MAX_POS):
+def run_fused_test(num_tokens, block_size=BLOCK_SIZE, max_pos=MAX_POS, flash_layout=True):
     """Run fused RoPE + KV cache kernel test."""
     device = torch.device("cuda")
     torch_dtype = torch.bfloat16
     num_blocks = 32  # enough blocks for test
 
+    layout_name = "flash" if flash_layout else "non-flash"
     print(f"[fused_rope_cache] M={num_tokens}, BS={block_size}, "
-          f"QH={NUM_Q_HEADS}, KH={NUM_KV_HEADS}, D={HEAD_DIM}")
+          f"QH={NUM_Q_HEADS}, KH={NUM_KV_HEADS}, D={HEAD_DIM}, layout={layout_name}")
 
     launch_fn = build_fused_rope_cache_module(
         head_dim=HEAD_DIM, rotary_dim=ROTARY_DIM,
         num_q_heads=NUM_Q_HEADS, num_kv_heads=NUM_KV_HEADS,
         block_size=block_size, is_neox=True,
-        flash_layout=True, dtype_str="bf16",
+        flash_layout=flash_layout, dtype_str="bf16",
     )
 
     torch.manual_seed(42)
@@ -88,13 +103,19 @@ def run_fused_test(num_tokens, block_size=BLOCK_SIZE, max_pos=MAX_POS):
     cos_cache = torch.randn(max_pos, ROTARY_DIM // 2, device=device, dtype=torch_dtype)
     sin_cache = torch.randn(max_pos, ROTARY_DIM // 2, device=device, dtype=torch_dtype)
     positions = torch.randint(0, max_pos, (num_tokens,), device=device, dtype=torch.int32)
-    # Slot mapping: assign sequential slots
     slot_mapping = torch.arange(num_tokens, device=device, dtype=torch.int32)
 
-    key_cache = torch.zeros(num_blocks, block_size, NUM_KV_HEADS, HEAD_DIM,
-                             device=device, dtype=torch_dtype)
-    value_cache = torch.zeros(num_blocks, block_size, NUM_KV_HEADS, HEAD_DIM,
-                               device=device, dtype=torch_dtype)
+    x_size = 16
+    if flash_layout:
+        key_cache = torch.zeros(num_blocks, block_size, NUM_KV_HEADS, HEAD_DIM,
+                                 device=device, dtype=torch_dtype)
+        value_cache = torch.zeros(num_blocks, block_size, NUM_KV_HEADS, HEAD_DIM,
+                                   device=device, dtype=torch_dtype)
+    else:
+        key_cache = torch.zeros(num_blocks, NUM_KV_HEADS, HEAD_DIM // x_size, block_size, x_size,
+                                 device=device, dtype=torch_dtype)
+        value_cache = torch.zeros(num_blocks, NUM_KV_HEADS, HEAD_DIM, block_size,
+                                   device=device, dtype=torch_dtype)
 
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
@@ -102,7 +123,7 @@ def run_fused_test(num_tokens, block_size=BLOCK_SIZE, max_pos=MAX_POS):
     # Reference
     q_ref, k_ref, kc_ref, vc_ref = fused_rope_cache_ref(
         q, k, v, cos_cache, sin_cache, positions, slot_mapping,
-        key_cache.clone(), value_cache.clone(), block_size,
+        key_cache.clone(), value_cache.clone(), block_size, flash_layout=flash_layout,
     )
 
     # Launch FlyDSL kernel
@@ -116,14 +137,9 @@ def run_fused_test(num_tokens, block_size=BLOCK_SIZE, max_pos=MAX_POS):
     q_err = (q_out.float() - q_ref.float()).abs().max().item()
     k_err = (k_out.float() - k_ref.float()).abs().max().item()
 
-    # Check KV cache for written slots
-    kc_err = 0.0
-    vc_err = 0.0
-    for i in range(num_tokens):
-        slot = slot_mapping[i].item()
-        bi, bp = slot // block_size, slot % block_size
-        kc_err = max(kc_err, (key_cache[bi, bp].float() - kc_ref[bi, bp].float()).abs().max().item())
-        vc_err = max(vc_err, (value_cache[bi, bp].float() - vc_ref[bi, bp].float()).abs().max().item())
+    # Compare full KV cache tensors (same layout for ref and kernel)
+    kc_err = (key_cache.float() - kc_ref.float()).abs().max().item()
+    vc_err = (value_cache.float() - vc_ref.float()).abs().max().item()
 
     print(f"  q_err={q_err:.6f}, k_err={k_err:.6f}, kc_err={kc_err:.6f}, vc_err={vc_err:.6f}")
 
@@ -132,14 +148,22 @@ def run_fused_test(num_tokens, block_size=BLOCK_SIZE, max_pos=MAX_POS):
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 16, 32, 128])
-def test_fused_rope_cache(num_tokens):
-    ok, q_err, k_err, kc_err, vc_err = run_fused_test(num_tokens)
+def test_fused_rope_cache_flash(num_tokens):
+    ok, q_err, k_err, kc_err, vc_err = run_fused_test(num_tokens, flash_layout=True)
+    assert ok, f"FAILED: q={q_err:.2e} k={k_err:.2e} kc={kc_err:.2e} vc={vc_err:.2e}"
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4, 16, 32, 128])
+def test_fused_rope_cache_nonflash(num_tokens):
+    ok, q_err, k_err, kc_err, vc_err = run_fused_test(num_tokens, flash_layout=False)
     assert ok, f"FAILED: q={q_err:.2e} k={k_err:.2e} kc={kc_err:.2e} vc={vc_err:.2e}"
 
 
 if __name__ == "__main__":
-    for m in [1, 4, 16, 32, 128]:
-        ok, q_err, k_err, kc_err, vc_err = run_fused_test(m)
-        status = "PASS" if ok else "FAIL"
-        print(f"  [{status}] M={m}")
+    for layout_name, flash in [("flash", True), ("non-flash", False)]:
+        print(f"\n--- {layout_name} layout ---")
+        for m in [1, 4, 16, 32, 128]:
+            ok, q_err, k_err, kc_err, vc_err = run_fused_test(m, flash_layout=flash)
+            status = "PASS" if ok else "FAIL"
+            print(f"  [{status}] M={m} q={q_err:.2e} k={k_err:.2e} kc={kc_err:.2e} vc={vc_err:.2e}")
     print("Done.")
