@@ -140,25 +140,26 @@ def build_fused_rope_cache_module(
             q_e = vector.bitcast(vec_type_e, q_raw) if vec_dwords != VEC_WIDTH else q_raw.bitcast(vec_type_e)
             q_f32 = q_e.extf(vec_type_c) if dtype_str != "f32" else q_e
 
-            # Load paired half for rotation
-            if arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_half)):
-                # First half — pair is second half (offset +half_dim)
-                pair_bytes = q_bytes + (half_dim * elem_bytes)
-            else:
-                # Second half — pair is first half (offset -half_dim)
-                pair_bytes = q_bytes - (half_dim * elem_bytes)
+            # Load paired half for rotation (use select to avoid scf.if scoping)
+            # First half (tid < vecs_per_half): pair at +half_dim
+            # Second half (tid >= vecs_per_half): pair at -half_dim
+            is_first_half = arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_half))
+            pair_off_first = q_bytes + (half_dim * elem_bytes)
+            pair_off_second = q_bytes - (half_dim * elem_bytes)
+            pair_bytes = arith.select(is_first_half, pair_off_first, pair_off_second)
             pair_dw = pair_bytes >> fx.Int32(2)
             pair_raw = buffer_ops.buffer_load(q_rsrc, pair_dw, vec_width=vec_dwords, dtype=T.i32)
             pair_e = vector.bitcast(vec_type_e, pair_raw) if vec_dwords != VEC_WIDTH else pair_raw.bitcast(vec_type_e)
             pair_f32 = pair_e.extf(vec_type_c) if dtype_str != "f32" else pair_e
 
-            # NeoX rotation
-            if arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_half)):
-                # first_half: out = q*cos - pair*sin
-                rot_f32 = ArithValue(q_f32) * ArithValue(cos_f32) - ArithValue(pair_f32) * ArithValue(sin_f32)
-            else:
-                # second_half: out = q*cos + pair*sin
-                rot_f32 = ArithValue(q_f32) * ArithValue(cos_f32) + ArithValue(pair_f32) * ArithValue(sin_f32)
+            # NeoX rotation (branchless with select)
+            # first_half:  out = q*cos - pair*sin
+            # second_half: out = q*cos + pair*sin
+            q_cos = ArithValue(q_f32) * ArithValue(cos_f32)
+            pair_sin = ArithValue(pair_f32) * ArithValue(sin_f32)
+            neg_pair_sin = arith.negf(pair_sin)
+            sin_term = arith.select(is_first_half, neg_pair_sin, pair_sin)
+            rot_f32 = ArithValue(q_cos) + ArithValue(sin_term)
 
             # Store
             if dtype_str == "bf16" and USE_HW_CVT_PK_BF16_F32:
@@ -233,21 +234,22 @@ def build_fused_rope_cache_module(
             k_e = vector.bitcast(vec_type_e, k_raw) if vec_dwords != VEC_WIDTH else k_raw.bitcast(vec_type_e)
             k_f32 = k_e.extf(vec_type_c) if dtype_str != "f32" else k_e
 
-            # Load K paired half
-            if arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_half)):
-                pair_bytes = k_bytes + (half_dim * elem_bytes)
-            else:
-                pair_bytes = k_bytes - (half_dim * elem_bytes)
+            # Load K paired half (branchless)
+            is_first_half = arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_half))
+            pair_off_first = k_bytes + (half_dim * elem_bytes)
+            pair_off_second = k_bytes - (half_dim * elem_bytes)
+            pair_bytes = arith.select(is_first_half, pair_off_first, pair_off_second)
             pair_dw = pair_bytes >> fx.Int32(2)
             pair_raw = buffer_ops.buffer_load(k_rsrc, pair_dw, vec_width=vec_dwords, dtype=T.i32)
             pair_e = vector.bitcast(vec_type_e, pair_raw) if vec_dwords != VEC_WIDTH else pair_raw.bitcast(vec_type_e)
             pair_f32 = pair_e.extf(vec_type_c) if dtype_str != "f32" else pair_e
 
-            # K RoPE rotation
-            if arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_half)):
-                k_rot_f32 = ArithValue(k_f32) * ArithValue(cos_f32) - ArithValue(pair_f32) * ArithValue(sin_f32)
-            else:
-                k_rot_f32 = ArithValue(k_f32) * ArithValue(cos_f32) + ArithValue(pair_f32) * ArithValue(sin_f32)
+            # K RoPE rotation (branchless)
+            k_cos = ArithValue(k_f32) * ArithValue(cos_f32)
+            pair_sin = ArithValue(pair_f32) * ArithValue(sin_f32)
+            neg_pair_sin = arith.negf(pair_sin)
+            sin_term = arith.select(is_first_half, neg_pair_sin, pair_sin)
+            k_rot_f32 = ArithValue(k_cos) + ArithValue(sin_term)
 
             if dtype_str == "bf16" and USE_HW_CVT_PK_BF16_F32:
                 k_rot_e = k_rot_f32.truncf(vec_type_e)
