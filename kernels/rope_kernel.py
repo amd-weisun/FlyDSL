@@ -1,13 +1,15 @@
-"""RoPE (Rotary Position Embedding) kernel builder using the @flyc.kernel API.
+"""Standalone RoPE (Rotary Position Embedding) kernel using the @flyc.kernel API.
 
 NeoX-style rotation:
-  first_half  = x[..., :D//2]
-  second_half = x[..., D//2:]
-  out[..., :D//2]  = first_half * cos[pos] - second_half * sin[pos]
-  out[..., D//2:]  = second_half * cos[pos] + first_half * sin[pos]
+  out[..., :D//2]  = x[..., :D//2] * cos - x[..., D//2:] * sin
+  out[..., D//2:]  = x[..., D//2:] * cos + x[..., :D//2] * sin
 
-Processes Q (multi-head) and K (fewer heads) sequentially with shared cos/sin lookup.
-Supports inplace (Q_out=Q, K_out=K) since each element is written by exactly one thread.
+Input shapes:
+  Q: [M, QH, D],  K: [M, KH, D]
+  CosCache/SinCache: [max_pos, D//2]
+  Positions: [M] int32
+
+Supports inplace (Q_out=Q, K_out=K).
 """
 
 import flydsl.compiler as flyc
