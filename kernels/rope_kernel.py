@@ -152,8 +152,7 @@ def build_rope_module(
 
         # --- Process Q heads (compile-time unrolled) ---
         # Merge all offsets into voffset (no soffset_bytes) to avoid SGPR issues.
-        bid_i32 = arith.index_cast(T.i32, bid)
-        q_row_bytes = ArithValue(bid_i32) * (num_q_heads * head_dim * elem_bytes)
+        q_row_bytes = ArithValue(bid) * (num_q_heads * head_dim * elem_bytes)
 
         for head_i in range_constexpr(num_q_heads):
             if arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_half)):
@@ -181,7 +180,7 @@ def build_rope_module(
                 buffer_ops.buffer_store(_to_store_i32(out_second_e), qo_rsrc, second_dw)
 
         # --- Process K heads (compile-time unrolled) ---
-        k_row_bytes = ArithValue(bid_i32) * (num_kv_heads * head_dim * elem_bytes)
+        k_row_bytes = ArithValue(bid) * (num_kv_heads * head_dim * elem_bytes)
 
         for kh_i in range_constexpr(num_kv_heads):
             if arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_half)):
