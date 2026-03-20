@@ -274,6 +274,24 @@ def main():
     tp_list = [1, 2, 4, 8] if args.tp == "all" else [int(t) for t in args.tp.split(",")]
     model_list = list(MODEL_CONFIGS.keys()) if args.model == "all" else [m.strip() for m in args.model.split(",")]
 
+    # --verify: standalone correctness check (no benchmarking)
+    if args.verify:
+        print("Correctness verification mode (no benchmarking)")
+        for model_name in model_list:
+            if model_name not in MODEL_CONFIGS:
+                continue
+            hd, total_qh, total_kh = MODEL_CONFIGS[model_name]
+            for tp in tp_list:
+                num_q_heads = total_qh // tp
+                num_kv_heads = max(1, total_kh // tp)
+                if num_q_heads < 1:
+                    continue
+                _CFG["head_dim"] = hd
+                _CFG["num_q_heads"] = num_q_heads
+                _CFG["num_kv_heads"] = num_kv_heads
+                verify_correctness(32)
+        return
+
     results: List[Row] = []
 
     for model_name in model_list:
@@ -295,13 +313,6 @@ def main():
             print(f"{model_name} TP={tp}: num_q_heads={num_q_heads}, "
                   f"num_kv_heads={num_kv_heads}, head_dim={hd}")
             print(f"{'='*80}")
-
-            # Verify correctness before benchmarking
-            if args.verify and not args.flydsl_only:
-                verify_ok = verify_correctness(min(32, token_list[0]))
-                if not verify_ok:
-                    print(f"  CORRECTNESS VERIFICATION FAILED — skipping benchmark")
-                    continue
 
             for tokens in token_list:
                 print(f"  M={tokens:>4d} ... ", end="", flush=True)
