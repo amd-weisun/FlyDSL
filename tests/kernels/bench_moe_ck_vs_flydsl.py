@@ -411,6 +411,166 @@ def bench_ck_moe_stage2(
 
 
 # ---------------------------------------------------------------------------
+# FlyDSL MoE standalone benchmark helpers (fallback when mixed_moe_gemm is unavailable)
+# ---------------------------------------------------------------------------
+def _bench_flydsl_moe_stage1_standalone(
+    tokens: int, warmup: int, iters: int,
+    in_dtype: str = "fp8",
+    tile_m: int = 32, tile_n: int = 128, tile_k: int = 128,
+) -> Optional[float]:
+    """Benchmark FlyDSL MoE stage1 using the standalone compile_moe_gemm1 kernel."""
+    from tests.utils import pertoken_quant, shuffle_weight
+    from kernels.moe_gemm_2stage import compile_moe_gemm1
+
+    device = torch.device("cuda")
+    H = MODEL_DIM_PADDED
+    I = INTER_DIM_PADDED
+
+    routing = build_routing(tokens, device)
+    if routing is None:
+        return None
+    sorted_ids, sorted_w, sorted_expert_ids, num_valid_ids = routing
+    blocks = int(sorted_expert_ids.numel())
+
+    is_f16_or_bf16 = in_dtype in ("fp16", "bf16")
+    x_fp32 = torch.randn(tokens, H, device=device, dtype=torch.float32)
+    w1_fp32 = torch.randn(NUM_EXPERTS, 2 * I, H, device=device, dtype=torch.float32)
+
+    if in_dtype == "fp8":
+        x_q, scale_x = pertoken_quant(x_fp32, quant_dtype=torch.float8_e4m3fn)
+        w1_q, scale_w1 = pertoken_quant(w1_fp32, quant_dtype=torch.float8_e4m3fn)
+    elif in_dtype == "fp16":
+        x_q = x_fp32.to(torch.float16)
+        w1_q = w1_fp32.to(torch.float16)
+        scale_x, scale_w1 = None, None
+    elif in_dtype == "bf16":
+        x_q = x_fp32.to(torch.bfloat16)
+        w1_q = w1_fp32.to(torch.bfloat16)
+        scale_x, scale_w1 = None, None
+    else:
+        print(f"  [FlyDSL standalone] Unsupported in_dtype={in_dtype}")
+        return None
+
+    w1_shuffled = shuffle_weight(w1_q)
+    w1_flat = w1_shuffled.view(NUM_EXPERTS * (2 * I), H)
+    scale_w1_flat = None if scale_w1 is None else scale_w1.view(NUM_EXPERTS * (2 * I), 1)
+    x_q = x_q.contiguous().view(tokens, H)
+
+    scale_x_1d = torch.empty((0,), device=device, dtype=torch.float32) if scale_x is None else scale_x.view(-1).contiguous()
+    scale_w1_1d = torch.empty((0,), device=device, dtype=torch.float32) if scale_w1_flat is None else scale_w1_flat.view(-1).contiguous()
+    sorted_w_1d = sorted_w.contiguous().view(-1)
+
+    out = torch.empty(tokens, TOPK, I, dtype=torch.float16, device=device)
+
+    try:
+        exe = compile_moe_gemm1(
+            model_dim=H, inter_dim=I,
+            experts=NUM_EXPERTS, topk=TOPK,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            doweight_stage1=True,
+            in_dtype=in_dtype,
+            use_cshuffle_epilog=False,
+        )
+    except Exception as e:
+        print(f"  [FlyDSL standalone] Stage1 compile failed: {e}")
+        return None
+
+    def run():
+        stream = torch.cuda.current_stream()
+        exe(
+            out, x_q, w1_flat,
+            scale_x_1d, scale_w1_1d,
+            sorted_ids, sorted_expert_ids, sorted_w_1d,
+            num_valid_ids,
+            tokens, I, H, blocks,
+            stream,
+        )
+
+    try:
+        return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
+    except Exception as e:
+        print(f"  [FlyDSL standalone] Stage1 failed: {e}")
+        return None
+
+
+def _bench_flydsl_moe_stage2_standalone(
+    tokens: int, warmup: int, iters: int,
+    in_dtype: str = "fp8",
+    tile_m: int = 32, tile_n: int = 128, tile_k: int = 128,
+) -> Optional[float]:
+    """Benchmark FlyDSL MoE stage2 using the standalone compile_moe_gemm2 kernel."""
+    from tests.utils import pertoken_quant, shuffle_weight
+    from kernels.moe_gemm_2stage import compile_moe_gemm2
+
+    device = torch.device("cuda")
+    H = MODEL_DIM_PADDED
+    I = INTER_DIM_PADDED
+
+    routing = build_routing(tokens, device)
+    if routing is None:
+        return None
+    sorted_ids, sorted_w, sorted_expert_ids, num_valid_ids = routing
+    blocks = int(sorted_expert_ids.numel())
+
+    w2_fp32 = torch.randn(NUM_EXPERTS, H, I, device=device, dtype=torch.float32)
+
+    if in_dtype == "fp8":
+        a2_fp32 = torch.randn(tokens, TOPK, I, device=device, dtype=torch.float32)
+        a2_q, a2_scale = pertoken_quant(a2_fp32, quant_dtype=torch.float8_e4m3fn)
+        w2_q, scale_w2 = pertoken_quant(w2_fp32, quant_dtype=torch.float8_e4m3fn)
+    elif in_dtype == "fp16":
+        a2_q = torch.randn(tokens, TOPK, I, device=device, dtype=torch.float16)
+        w2_q = w2_fp32.to(torch.float16)
+        a2_scale, scale_w2 = None, None
+    elif in_dtype == "bf16":
+        a2_q = torch.randn(tokens, TOPK, I, device=device, dtype=torch.bfloat16)
+        w2_q = w2_fp32.to(torch.bfloat16)
+        a2_scale, scale_w2 = None, None
+    else:
+        print(f"  [FlyDSL standalone] Unsupported in_dtype={in_dtype}")
+        return None
+
+    w2_shuffled = shuffle_weight(w2_q)
+    w2_flat = w2_shuffled.view(NUM_EXPERTS * H, I)
+    scale_w2_flat = None if scale_w2 is None else scale_w2.view(NUM_EXPERTS * H, 1)
+
+    a2_scale_1d = torch.empty((0,), device=device, dtype=torch.float32) if a2_scale is None else a2_scale.view(-1).contiguous()
+    scale_w2_1d = torch.empty((0,), device=device, dtype=torch.float32) if scale_w2_flat is None else scale_w2_flat.view(-1).contiguous()
+    sorted_w_1d = sorted_w.contiguous().view(-1)
+
+    out = torch.zeros(tokens, H, dtype=torch.float16, device=device)
+
+    try:
+        exe = compile_moe_gemm2(
+            model_dim=H, inter_dim=I,
+            experts=NUM_EXPERTS, topk=TOPK,
+            tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            doweight_stage2=True,
+            in_dtype=in_dtype,
+        )
+    except Exception as e:
+        print(f"  [FlyDSL standalone] Stage2 compile failed: {e}")
+        return None
+
+    def run():
+        stream = torch.cuda.current_stream()
+        exe(
+            out, a2_q, w2_flat,
+            a2_scale_1d, scale_w2_1d,
+            sorted_ids, sorted_expert_ids, sorted_w_1d,
+            num_valid_ids,
+            tokens, H, I, blocks,
+            stream,
+        )
+
+    try:
+        return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
+    except Exception as e:
+        print(f"  [FlyDSL standalone] Stage2 failed: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # FlyDSL MoE benchmark
 # ---------------------------------------------------------------------------
 def bench_flydsl_moe_stage1(
