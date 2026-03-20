@@ -1,19 +1,14 @@
 """Fused RoPE + KV Cache kernel builder using the @flyc.kernel API.
 
-Fuses 4 operations (matching aiter's _fused_qk_rope_reshape_and_cache_kernel):
-  1. RoPE on Q → q_out                     (kernel 1: q_rope_kernel)
-  2. RoPE on K → k_out + key_cache write   (kernel 2: k_rope_cache_kernel)
-  3. V → value_cache write                 (kernel 2: k_rope_cache_kernel)
+Fuses 3 operations into two kernel launches:
+  Kernel 1 (Q RoPE):     Q → rotate → Q_out
+  Kernel 2 (K+V cache):  K → rotate → K_out + key_cache;  V → value_cache
 
-Uses two kernel launches for simplicity (can be fused into one later).
-Each thread handles one vec8 chunk (8 bf16 elements) of one head.
-
-GPT-OSS 120B config (TP=8):
-  Q: [T, 8, 64] bf16, K: [T, 1, 64] bf16, V: [T, 1, 64] bf16
-  key_cache:   flash: [num_blocks, block_size, KH, D]
-               paged: [num_blocks, KH, D//x, block_size, x]
-  value_cache: flash: [num_blocks, block_size, KH, D]
-               paged: [num_blocks, KH, D, block_size]
+Input shapes:
+  Q: [T, QH, D],  K: [T, KH, D],  V: [T, KH, D]
+  CosCache/SinCache: [max_pos, D//2]
+  Positions: [T] int32,  SlotMapping: [T] int32
+  KeyCache/ValueCache: flash [num_blocks, block_size, KH, D]
 """
 
 import flydsl.compiler as flyc
