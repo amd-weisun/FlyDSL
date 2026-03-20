@@ -4,18 +4,24 @@
 MoE kernels are the #1 GPU time consumer in GPT-OSS 120B (35% of GPU time).
 This benchmark compares CK (via AITER) vs FlyDSL for both MoE stages.
 
+Profiling trace confirms GPT-OSS uses A16W4 (BF16 activations × MXFP4 weights):
+  - CK kernel: ck_tile::MoeFlatmmKernel<F16xMXF4FlatmmPipeline...>
+  - Tile shape: 16×128×256
+  - Both stages use BF16 activations (no re-quant between stages for Swiglu+FP4)
+  - Padded dimensions: 3072×3072 (from 2880, 256-aligned for MXFP4)
+
 Usage (from FlyDSL/ directory):
-    # Default GPT-OSS shapes (TP=8)
+    # Default: A16W4 (matches production trace)
     AITER_REPO=../aiter PYTHONPATH=./ python tests/kernels/bench_moe_ck_vs_flydsl.py
 
-    # Sweep decode + prefill batch sizes
+    # Sweep all concurrency points
     AITER_REPO=../aiter PYTHONPATH=./ python tests/kernels/bench_moe_ck_vs_flydsl.py --sweep
+
+    # Compare all precision variants
+    AITER_REPO=../aiter PYTHONPATH=./ python tests/kernels/bench_moe_ck_vs_flydsl.py --precision all
 
     # FlyDSL only (no AITER required)
     PYTHONPATH=./ python tests/kernels/bench_moe_ck_vs_flydsl.py --flydsl-only
-
-    # Custom shape
-    PYTHONPATH=./ python tests/kernels/bench_moe_ck_vs_flydsl.py --tokens 128 --stage 1
 
 Requirements:
     - gfx942/gfx950 GPU
@@ -45,6 +51,14 @@ if os.path.isdir(_EMBEDDED_FLYDSL) and _EMBEDDED_FLYDSL not in sys.path:
 import torch
 
 from benchmark_common import bench_gpu_us_torch, maybe_enable_aiter
+
+# Reuse battle-tested helpers from the existing MoE test harness.
+# We do NOT modify test_moe_gemm.py — only import from it.
+from tests.kernels.test_moe_gemm import (
+    build_routing_buffers,
+    run_moe_stage1,
+    run_moe_stage2,
+)
 
 # ---------------------------------------------------------------------------
 # GPT-OSS 120B MoE config
@@ -99,31 +113,68 @@ class MoeBenchRow:
 
 
 # ---------------------------------------------------------------------------
-# Routing buffer setup (shared between CK and FlyDSL)
+# Routing buffer setup (delegates to test_moe_gemm.py)
 # ---------------------------------------------------------------------------
-def build_routing(tokens: int, device: torch.device):
-    """Build MoE routing buffers using pure-torch fallback."""
+def build_routing(tokens: int, device: torch.device, model_dim: int = None):
+    """Build MoE routing buffers (reuses test_moe_gemm.py::build_routing_buffers)."""
+    if model_dim is None:
+        model_dim = MODEL_DIM_PADDED
     topk_ids = torch.randint(0, NUM_EXPERTS, (tokens, TOPK), dtype=torch.int32, device=device)
     topk_weights = torch.softmax(
         torch.randn(tokens, TOPK, device=device, dtype=torch.float32), dim=1
     )
-
-    # Try AITER moe_sorting first, fallback to torch implementation
     try:
-        from tests.kernels.test_moe_gemm import build_routing_buffers
-        sorted_ids, sorted_w, sorted_expert_ids, num_valid_ids, sorted_size, blocks = (
-            build_routing_buffers(
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-                experts=NUM_EXPERTS,
-                model_dim=MODEL_DIM,
-                tile_m=BLOCK_M,
-            )
+        routing = build_routing_buffers(
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            experts=NUM_EXPERTS,
+            model_dim=model_dim,
+            tile_m=BLOCK_M,
         )
+        sorted_ids, sorted_w, sorted_expert_ids, num_valid_ids, sorted_size, blocks = routing
         return sorted_ids, sorted_w, sorted_expert_ids, num_valid_ids
     except Exception as e:
         print(f"  [routing] build_routing_buffers failed: {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# FP8 benchmark via existing test_moe_gemm.py (reuse, not reinvent)
+# ---------------------------------------------------------------------------
+def bench_fp8_via_test_harness(
+    tokens: int, stage: int, iters: int, warmup: int,
+) -> Tuple[Optional[float], Optional[float]]:
+    """Run FlyDSL + CK comparison for FP8 using existing test_moe_gemm.py.
+
+    Returns (flydsl_us, ck_us) or (None, None) on failure.
+    Uses run_moe_stage1/run_moe_stage2 which already handles:
+    - pertoken_quant, shuffle_weight, preshuffle
+    - FlyDSL kernel compile + benchmark
+    - CK (ck_moe_stage1_fwd/ck_moe_stage2_fwd) comparison
+    - Correctness verification (FlyDSL vs torch ref, FlyDSL vs CK)
+    """
+    H = MODEL_DIM_PADDED
+    I = INTER_DIM_PADDED
+    runner = run_moe_stage1 if stage == 1 else run_moe_stage2
+    try:
+        result = runner(
+            tokens=tokens,
+            model_dim=H, inter_dim=I,
+            experts=NUM_EXPERTS, topk=TOPK,
+            tile_m=BLOCK_M, tile_n=128, tile_k=128,
+            doweight_stage1=True,
+            in_dtype="fp8",
+            num_iters=iters, num_warmup=warmup,
+            compare_aiter_ck=True,
+            return_outputs=True,
+        )
+        if result is not None:
+            _, us = result
+            return us, None  # CK timing is printed by the harness but not returned
+        return None, None
+    except Exception as e:
+        print(f"  [FP8 harness] Stage{stage} failed: {e}")
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -364,99 +415,111 @@ def bench_ck_moe_stage2(
 # ---------------------------------------------------------------------------
 def bench_flydsl_moe_stage1(
     tokens: int, warmup: int, iters: int,
-    tile_m: int = 32, tile_n: int = 128, tile_k: int = 128,
-    in_dtype: str = "fp8",
+    a_dtype: str = "fp16", b_dtype: str = "fp4",
+    tile_m: int = 32, tile_n: int = 128, tile_k: int = 256,
 ) -> Optional[float]:
-    """Benchmark FlyDSL MoE stage1 (gate+up GEMM).
+    """Benchmark FlyDSL MoE stage1 (gate+up GEMM) using mixed-precision kernel.
 
-    Follows the same setup as tests/kernels/test_moe_gemm.py::run_moe_stage1.
+    Uses compile_mixed_moe_gemm1 from AITER's FlyDSL kernels, which supports
+    mixed A×W precision (A16W4, A8W4, A4W4).
     """
     try:
-        from kernels.moe_gemm_2stage import compile_moe_gemm1
+        from aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm1
     except ImportError:
-        print("  [FlyDSL] Could not import compile_moe_gemm1")
-        return None
+        # Fallback: try the FlyDSL standalone kernel for homogeneous dtypes
+        try:
+            from kernels.moe_gemm_2stage import compile_moe_gemm1 as _compile
+            # Map to homogeneous in_dtype for the standalone kernel
+            if a_dtype == b_dtype or b_dtype in ("fp4",):
+                in_dtype = {"fp16": "fp16", "fp8": "fp8", "fp4": "fp8", "bf16": "bf16"}.get(a_dtype, "fp8")
+            else:
+                print(f"  [FlyDSL] mixed_moe_gemm not available and standalone doesn't support a={a_dtype}/w={b_dtype}")
+                return None
+            return _bench_flydsl_moe_stage1_standalone(
+                tokens, warmup, iters, in_dtype=in_dtype,
+                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            )
+        except ImportError:
+            print("  [FlyDSL] Could not import compile_mixed_moe_gemm1")
+            return None
 
     device = torch.device("cuda")
-
-    try:
-        from flydsl.runtime.device import get_rocm_arch
-        arch = str(get_rocm_arch())
-        dtype_fp8 = torch.float8_e4m3fn if "gfx95" in arch else torch.float8_e4m3fnuz
-    except Exception:
-        dtype_fp8 = torch.float8_e4m3fn
+    H = MODEL_DIM_PADDED
+    I = INTER_DIM_PADDED
 
     routing = build_routing(tokens, device)
     if routing is None:
         return None
     sorted_ids, sorted_w, sorted_expert_ids, num_valid_ids = routing
-    sorted_size = int(sorted_ids.numel())
     blocks = int(sorted_expert_ids.numel())
 
-    from tests.utils import pertoken_quant, shuffle_weight
+    # Create weight tensors in MXFP4 format (packed fp4x2)
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+    fp8_e8m0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
-    # Quantize and preshuffle (matching test_moe_gemm.py setup)
-    x_fp32 = torch.randn(tokens, MODEL_DIM, device=device, dtype=torch.float32)
-    w1_fp32 = torch.randn(NUM_EXPERTS, 2 * INTER_DIM, MODEL_DIM, device=device, dtype=torch.float32)
+    w1 = torch.randint(0, 256, (NUM_EXPERTS, 2 * I, H // 2),
+                        dtype=torch.uint8, device=device).view(fp4_dtype)
+    w1_scale = torch.randint(124, 130, (NUM_EXPERTS, 2 * I, H // 32),
+                              dtype=torch.uint8, device=device).view(fp8_e8m0)
 
-    if in_dtype == "fp8":
-        x_q, scale_x = pertoken_quant(x_fp32, quant_dtype=dtype_fp8)
-        w1_q, scale_w1 = pertoken_quant(w1_fp32, quant_dtype=dtype_fp8)
-    elif in_dtype in ("fp16", "bf16"):
-        torch_dt = torch.float16 if in_dtype == "fp16" else torch.bfloat16
-        x_q = x_fp32.to(torch_dt)
-        w1_q = w1_fp32.to(torch_dt)
-        scale_x = None
-        scale_w1 = None
+    # Create activation tensors based on a_dtype
+    if a_dtype == "fp16":
+        x = torch.randn(tokens, H, dtype=torch.bfloat16, device=device)
+        a1_scale = None
+    elif a_dtype == "fp8":
+        fp8_dtype = torch.float8_e4m3fn
+        x = torch.randn(tokens, H, dtype=torch.float32, device=device).to(fp8_dtype)
+        a1_scale = torch.ones(tokens, H // 32, dtype=fp8_e8m0, device=device)
+    elif a_dtype == "fp4":
+        x = torch.randint(0, 256, (tokens, H // 2),
+                           dtype=torch.uint8, device=device).view(fp4_dtype)
+        a1_scale = torch.randint(124, 130, (tokens, H // 32),
+                                  dtype=torch.uint8, device=device).view(fp8_e8m0)
     else:
-        print(f"  [FlyDSL] Unsupported in_dtype={in_dtype}")
+        print(f"  [FlyDSL] Unsupported a_dtype={a_dtype}")
         return None
 
-    # Preshuffle weights and flatten expert dim
-    w1_shuffled = shuffle_weight(w1_q)
-    w_kernel = w1_shuffled.view(NUM_EXPERTS * (2 * INTER_DIM), MODEL_DIM).contiguous()
-
-    # Flatten scales to 1D
-    if scale_x is None:
-        scale_x_1d = torch.empty((0,), device=device, dtype=torch.float32)
-    else:
-        scale_x_1d = scale_x.view(-1).contiguous()
-    if scale_w1 is None:
-        scale_w1_1d = torch.empty((0,), device=device, dtype=torch.float32)
-    else:
-        scale_w1_1d = scale_w1.view(-1).contiguous()
-    sorted_w_1d = sorted_w.contiguous().view(-1)
-
     try:
-        exe = compile_moe_gemm1(
-            model_dim=MODEL_DIM,
-            inter_dim=INTER_DIM,
-            experts=NUM_EXPERTS,
-            topk=TOPK,
+        exe = compile_mixed_moe_gemm1(
+            model_dim=H, inter_dim=I,
+            experts=NUM_EXPERTS, topk=TOPK,
             tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
-            doweight_stage1=False,
-            in_dtype=in_dtype,
-            out_dtype="f16",
+            doweight_stage1=True,
+            a_dtype=a_dtype, b_dtype=b_dtype,
+            out_dtype="bf16", act="swiglu",
         )
     except Exception as e:
         print(f"  [FlyDSL] Stage1 compile failed: {e}")
         return None
 
-    out = torch.empty(tokens, TOPK, INTER_DIM, dtype=torch.float16, device=device)
+    out = torch.empty(tokens, TOPK, I, dtype=torch.bfloat16, device=device)
+    sorted_w_1d = sorted_w.contiguous().view(-1)
 
     def _as_i8(t):
-        return t.view(torch.int8) if "float8" in str(t.dtype) else t
+        if hasattr(t, 'dtype') and "float8" in str(t.dtype):
+            return t.view(torch.int8)
+        if hasattr(t, 'dtype') and "float4" in str(t.dtype):
+            return t.view(torch.uint8)
+        return t
 
     def run():
         stream = torch.cuda.current_stream()
-        exe(
-            out, _as_i8(x_q), _as_i8(w_kernel),
-            scale_x_1d, scale_w1_1d,
+        args = [
+            out, _as_i8(x), _as_i8(w1),
+        ]
+        # Scale args depend on precision
+        if a1_scale is not None:
+            args.append(_as_i8(a1_scale).view(-1))
+        else:
+            args.append(torch.empty((0,), device=device, dtype=torch.float32))
+        args.append(_as_i8(w1_scale).view(-1))
+        args.extend([
             sorted_ids, sorted_expert_ids, sorted_w_1d,
             num_valid_ids,
-            tokens, INTER_DIM, MODEL_DIM, blocks,
+            tokens, I, H, blocks,
             stream,
-        )
+        ])
+        exe(*args)
 
     try:
         return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
@@ -467,100 +530,105 @@ def bench_flydsl_moe_stage1(
 
 def bench_flydsl_moe_stage2(
     tokens: int, warmup: int, iters: int,
-    tile_m: int = 32, tile_n: int = 128, tile_k: int = 128,
-    in_dtype: str = "fp8",
+    a_dtype: str = "fp16", b_dtype: str = "fp4",
+    tile_m: int = 32, tile_n: int = 128, tile_k: int = 256,
 ) -> Optional[float]:
-    """Benchmark FlyDSL MoE stage2 (down GEMM).
+    """Benchmark FlyDSL MoE stage2 (down GEMM) using mixed-precision kernel.
 
-    Follows the same setup as tests/kernels/test_moe_gemm.py::run_moe_stage2.
+    Uses compile_mixed_moe_gemm2 from AITER's FlyDSL kernels.
     """
     try:
-        from kernels.moe_gemm_2stage import compile_moe_gemm2
+        from aiter.ops.flydsl.kernels.mixed_moe_gemm_2stage import compile_mixed_moe_gemm2
     except ImportError:
-        print("  [FlyDSL] Could not import compile_moe_gemm2")
-        return None
+        try:
+            from kernels.moe_gemm_2stage import compile_moe_gemm2 as _compile
+            in_dtype = {"fp16": "fp16", "fp8": "fp8", "fp4": "fp8", "bf16": "bf16"}.get(a_dtype, "fp8")
+            return _bench_flydsl_moe_stage2_standalone(
+                tokens, warmup, iters, in_dtype=in_dtype,
+                tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
+            )
+        except ImportError:
+            print("  [FlyDSL] Could not import compile_mixed_moe_gemm2")
+            return None
 
     device = torch.device("cuda")
-
-    try:
-        from flydsl.runtime.device import get_rocm_arch
-        arch = str(get_rocm_arch())
-        dtype_fp8 = torch.float8_e4m3fn if "gfx95" in arch else torch.float8_e4m3fnuz
-    except Exception:
-        dtype_fp8 = torch.float8_e4m3fn
+    H = MODEL_DIM_PADDED
+    I = INTER_DIM_PADDED
 
     routing = build_routing(tokens, device)
     if routing is None:
         return None
     sorted_ids, sorted_w, sorted_expert_ids, num_valid_ids = routing
-    sorted_size = int(sorted_ids.numel())
     blocks = int(sorted_expert_ids.numel())
 
-    from tests.utils import pertoken_quant, shuffle_weight
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+    fp8_e8m0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
-    # Stage2 input: inter_states from stage1 output
-    inter_fp32 = torch.randn(tokens * TOPK, INTER_DIM, device=device, dtype=torch.float32)
-    w2_fp32 = torch.randn(NUM_EXPERTS, MODEL_DIM, INTER_DIM, device=device, dtype=torch.float32)
+    w2 = torch.randint(0, 256, (NUM_EXPERTS, H, I // 2),
+                        dtype=torch.uint8, device=device).view(fp4_dtype)
+    w2_scale = torch.randint(124, 130, (NUM_EXPERTS, H, I // 32),
+                              dtype=torch.uint8, device=device).view(fp8_e8m0)
 
-    if in_dtype == "fp8":
-        a2_q, scale_a2 = pertoken_quant(inter_fp32, quant_dtype=dtype_fp8)
-        w2_q, scale_w2 = pertoken_quant(w2_fp32, quant_dtype=dtype_fp8)
-    elif in_dtype in ("fp16", "bf16"):
-        torch_dt = torch.float16 if in_dtype == "fp16" else torch.bfloat16
-        a2_q = inter_fp32.to(torch_dt)
-        w2_q = w2_fp32.to(torch_dt)
-        scale_a2 = None
-        scale_w2 = None
+    # Stage2 activation: BF16 intermediate from stage1 (for A16W4)
+    if a_dtype == "fp16":
+        a2 = torch.randn(tokens, TOPK, I, dtype=torch.bfloat16, device=device)
+        a2_scale = None
+    elif a_dtype == "fp8":
+        fp8_dtype = torch.float8_e4m3fn
+        a2 = torch.randn(tokens * TOPK, I, dtype=torch.float32, device=device).to(fp8_dtype)
+        a2 = a2.view(tokens, TOPK, I)
+        a2_scale = torch.ones(tokens * TOPK, I // 32, dtype=fp8_e8m0, device=device)
+    elif a_dtype == "fp4":
+        a2 = torch.randint(0, 256, (tokens * TOPK, I // 2),
+                            dtype=torch.uint8, device=device).view(fp4_dtype)
+        a2 = a2.view(tokens, TOPK, -1)
+        a2_scale = torch.randint(124, 130, (tokens * TOPK, I // 32),
+                                  dtype=torch.uint8, device=device).view(fp8_e8m0)
     else:
-        print(f"  [FlyDSL] Unsupported in_dtype={in_dtype}")
+        print(f"  [FlyDSL] Unsupported a_dtype={a_dtype}")
         return None
 
-    # Preshuffle W2 and flatten
-    w2_shuffled = shuffle_weight(w2_q)
-    w2_kernel = w2_shuffled.view(NUM_EXPERTS * MODEL_DIM, INTER_DIM).contiguous()
-
-    if scale_a2 is None:
-        scale_a2_1d = torch.empty((0,), device=device, dtype=torch.float32)
-    else:
-        scale_a2_1d = scale_a2.view(-1).contiguous()
-    if scale_w2 is None:
-        scale_w2_1d = torch.empty((0,), device=device, dtype=torch.float32)
-    else:
-        scale_w2_1d = scale_w2.view(-1).contiguous()
-    sorted_w_1d = sorted_w.contiguous().view(-1)
-
     try:
-        exe = compile_moe_gemm2(
-            model_dim=MODEL_DIM,
-            inter_dim=INTER_DIM,
-            experts=NUM_EXPERTS,
-            topk=TOPK,
+        exe = compile_mixed_moe_gemm2(
+            model_dim=H, inter_dim=I,
+            experts=NUM_EXPERTS, topk=TOPK,
             tile_m=tile_m, tile_n=tile_n, tile_k=tile_k,
             doweight_stage2=True,
-            in_dtype=in_dtype,
-            out_dtype="f16",
-            accumulate=True,
+            a_dtype=a_dtype, b_dtype=b_dtype,
+            out_dtype="bf16",
         )
     except Exception as e:
         print(f"  [FlyDSL] Stage2 compile failed: {e}")
         return None
 
-    out = torch.zeros(tokens, MODEL_DIM, dtype=torch.float16, device=device)
+    out = torch.zeros(tokens, H, dtype=torch.bfloat16, device=device)
+    sorted_w_1d = sorted_w.contiguous().view(-1)
 
     def _as_i8(t):
-        return t.view(torch.int8) if "float8" in str(t.dtype) else t
+        if hasattr(t, 'dtype') and "float8" in str(t.dtype):
+            return t.view(torch.int8)
+        if hasattr(t, 'dtype') and "float4" in str(t.dtype):
+            return t.view(torch.uint8)
+        return t
 
     def run():
         out.zero_()
         stream = torch.cuda.current_stream()
-        exe(
-            out, _as_i8(a2_q), _as_i8(w2_kernel),
-            scale_a2_1d, scale_w2_1d,
+        args = [
+            out, _as_i8(a2), _as_i8(w2),
+        ]
+        if a2_scale is not None:
+            args.append(_as_i8(a2_scale).view(-1))
+        else:
+            args.append(torch.empty((0,), device=device, dtype=torch.float32))
+        args.append(_as_i8(w2_scale).view(-1))
+        args.extend([
             sorted_ids, sorted_expert_ids, sorted_w_1d,
             num_valid_ids,
-            tokens, MODEL_DIM, INTER_DIM, blocks,
+            tokens, H, I, blocks,
             stream,
-        )
+        ])
+        exe(*args)
 
     try:
         return bench_gpu_us_torch(run, warmup=warmup, iters=iters)
@@ -572,11 +640,11 @@ def bench_flydsl_moe_stage2(
 # ---------------------------------------------------------------------------
 # Print results
 # ---------------------------------------------------------------------------
-def print_results(rows: List[MoeBenchRow]) -> None:
+def print_results(rows: List[MoeBenchRow], precision: str = "A16W4") -> None:
     print()
     print("=" * 90)
-    print(f"MoE Benchmark — GPT-OSS 120B A4W4 (E={NUM_EXPERTS}, topk={TOPK}, "
-          f"hidden={MODEL_DIM}, inter={INTER_DIM})")
+    print(f"MoE Benchmark — GPT-OSS 120B {precision} (E={NUM_EXPERTS}, topk={TOPK}, "
+          f"hidden={MODEL_DIM}→{MODEL_DIM_PADDED}, inter={INTER_DIM}→{INTER_DIM_PADDED})")
     print("=" * 90)
     hdr = f"{'M(conc)':>7s}  {'Kernel':<16s}  {'Latency(us)':>12s}  {'TFLOPS':>8s}"
     print(hdr)
@@ -617,19 +685,26 @@ def print_results(rows: List[MoeBenchRow]) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+PRECISION_CONFIGS = {
+    "A16W4": ("fp16", "fp4"),   # BF16 act × MXFP4 weight (confirmed from trace)
+    "A8W4":  ("fp8",  "fp4"),   # FP8 act × MXFP4 weight
+    "A4W4":  ("fp4",  "fp4"),   # FP4 act × MXFP4 weight
+    "FP8":   ("fp8",  "fp8"),   # FP8 homogeneous (uses existing test_moe_gemm.py harness)
+}
+
+
 def main():
-    parser = argparse.ArgumentParser(description="MoE benchmark: CK A4W4 vs FlyDSL")
-    parser.add_argument("--concurrency", type=str, default="1,32,128",
-                        help="Comma-separated M values (decode concurrency or prefill tokens)")
+    parser = argparse.ArgumentParser(description="MoE benchmark: CK vs FlyDSL (A16W4/A8W4/A4W4)")
+    parser.add_argument("--concurrency", type=str, default="4,32,128",
+                        help="Comma-separated M values (decode concurrency)")
     parser.add_argument("--sweep", action="store_true",
                         help="Sweep all concurrency points (1..1024)")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--flydsl-only", action="store_true",
                         help="Skip CK baseline (no AITER needed)")
-    parser.add_argument("--in-dtype", type=str, default="fp8",
-                        choices=["fp8", "fp16", "bf16"],
-                        help="Input dtype for FlyDSL kernels")
+    parser.add_argument("--precision", type=str, default="A16W4",
+                        help="Precision config: A16W4 (default, matches trace), A8W4, A4W4, or 'all'")
     args = parser.parse_args()
 
     torch.set_default_device("cuda")
@@ -639,32 +714,53 @@ def main():
     else:
         token_list = [int(t.strip()) for t in args.concurrency.split(",")]
 
-    rows: List[MoeBenchRow] = []
+    if args.precision == "all":
+        precisions = list(PRECISION_CONFIGS.keys())
+    else:
+        precisions = [p.strip() for p in args.precision.split(",")]
 
-    for tokens in token_list:
-        print(f"Benchmarking tokens={tokens} ...")
+    for prec in precisions:
+        if prec not in PRECISION_CONFIGS:
+            print(f"Unknown precision '{prec}'. Choose from: {list(PRECISION_CONFIGS.keys())}")
+            return
+        a_dtype, b_dtype = PRECISION_CONFIGS[prec]
+        rows: List[MoeBenchRow] = []
 
-        if not args.flydsl_only:
-            # CK stage1 kernel-only (pre-quantized MXFP4 inputs)
-            ck_s1 = bench_ck_moe_stage1(tokens, args.warmup, args.iters)
-            rows.append(MoeBenchRow(label="CK S1", tokens=tokens, us=ck_s1))
+        print(f"\n{'='*90}")
+        print(f"Precision: {prec} (A={a_dtype}, W={b_dtype})")
+        print(f"{'='*90}")
 
-            # CK stage2 kernel-only
-            ck_s2 = bench_ck_moe_stage2(tokens, args.warmup, args.iters)
-            rows.append(MoeBenchRow(label="CK S2", tokens=tokens, us=ck_s2))
+        for tokens in token_list:
+            print(f"Benchmarking concurrency={tokens} ...")
 
-        # FlyDSL: stage1 and stage2 separately (kernel-only)
-        s1_us = bench_flydsl_moe_stage1(
-            tokens, args.warmup, args.iters, in_dtype=args.in_dtype,
-        )
-        rows.append(MoeBenchRow(label="FlyDSL S1", tokens=tokens, us=s1_us))
+            if prec == "FP8":
+                # Delegate to existing test_moe_gemm.py harness (includes CK comparison)
+                s1_us, _ = bench_fp8_via_test_harness(tokens, stage=1, iters=args.iters, warmup=args.warmup)
+                rows.append(MoeBenchRow(label="FlyDSL S1", tokens=tokens, us=s1_us))
+                s2_us, _ = bench_fp8_via_test_harness(tokens, stage=2, iters=args.iters, warmup=args.warmup)
+                rows.append(MoeBenchRow(label="FlyDSL S2", tokens=tokens, us=s2_us))
+            else:
+                # Mixed-precision path (A16W4 / A8W4 / A4W4)
+                if not args.flydsl_only:
+                    ck_s1 = bench_ck_moe_stage1(tokens, args.warmup, args.iters)
+                    rows.append(MoeBenchRow(label="CK S1", tokens=tokens, us=ck_s1))
 
-        s2_us = bench_flydsl_moe_stage2(
-            tokens, args.warmup, args.iters, in_dtype=args.in_dtype,
-        )
-        rows.append(MoeBenchRow(label="FlyDSL S2", tokens=tokens, us=s2_us))
+                    ck_s2 = bench_ck_moe_stage2(tokens, args.warmup, args.iters)
+                    rows.append(MoeBenchRow(label="CK S2", tokens=tokens, us=ck_s2))
 
-    print_results(rows)
+                s1_us = bench_flydsl_moe_stage1(
+                    tokens, args.warmup, args.iters,
+                    a_dtype=a_dtype, b_dtype=b_dtype,
+                )
+                rows.append(MoeBenchRow(label="FlyDSL S1", tokens=tokens, us=s1_us))
+
+                s2_us = bench_flydsl_moe_stage2(
+                    tokens, args.warmup, args.iters,
+                    a_dtype=a_dtype, b_dtype=b_dtype,
+                )
+                rows.append(MoeBenchRow(label="FlyDSL S2", tokens=tokens, us=s2_us))
+
+        print_results(rows, prec)
 
 
 if __name__ == "__main__":
