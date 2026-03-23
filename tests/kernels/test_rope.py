@@ -218,31 +218,34 @@ def run_rope_test(
                 aiter_us = bench_gpu_us_torch(run_aiter, warmup=10, iters=100)
                 torch.cuda.synchronize()
 
-                # Cross-validate: re-run FlyDSL with AITER's cos/sin cache for fair comparison
-                # (AITER computes its own cos/sin from rope_base; our test uses random cos/sin)
+                # Cross-validate: AITER rotates in-place, so q_aiter/k_aiter are now
+                # rotated 110× (10 warmup + 100 iters). Re-run both on fresh copies once.
                 if hasattr(rotary_emb, 'cos_cache') and rotary_emb.cos_cache is not None:
                     aiter_cos = rotary_emb.cos_cache[:max_pos].to(device)
                     aiter_sin = rotary_emb.sin_cache[:max_pos].to(device)
-                    # Ensure shape is [max_pos, half_dim]
                     if aiter_cos.dim() > 2:
                         aiter_cos = aiter_cos.squeeze()
                     if aiter_sin.dim() > 2:
                         aiter_sin = aiter_sin.squeeze()
 
-                    q_cross = q.clone()
-                    k_cross = k.clone()
-                    q_cross_out = torch.empty_like(q)
-                    k_cross_out = torch.empty_like(k)
-                    launch_fn(q_cross, k_cross, aiter_cos, aiter_sin, positions,
-                              q_cross_out, k_cross_out, num_tokens, stream=stream)
+                    # Single AITER run on fresh input
+                    q_aiter_once = q.clone()
+                    k_aiter_once = k.clone()
+                    rotary_emb(pos_i64, q_aiter_once, k_aiter_once)
                     torch.cuda.synchronize()
 
-                    q_cross_err = (q_aiter.float() - q_cross_out.float()).abs().max().item()
-                    k_cross_err = (k_aiter.float() - k_cross_out.float()).abs().max().item()
+                    # Single FlyDSL run with AITER's cos/sin
+                    q_fly_cross = torch.empty_like(q)
+                    k_fly_cross = torch.empty_like(k)
+                    launch_fn(q.clone(), k.clone(), aiter_cos, aiter_sin, positions,
+                              q_fly_cross, k_fly_cross, num_tokens, stream=stream)
+                    torch.cuda.synchronize()
+
+                    q_cross_err = (q_aiter_once.float() - q_fly_cross.float()).abs().max().item()
+                    k_cross_err = (k_aiter_once.float() - k_fly_cross.float()).abs().max().item()
                 else:
-                    # No cos/sin cache available — compare directly (may not match)
-                    q_cross_err = (q_aiter.float() - q_out.float()).abs().max().item()
-                    k_cross_err = (k_aiter.float() - k_out.float()).abs().max().item()
+                    q_cross_err = float('inf')
+                    k_cross_err = float('inf')
 
                 cross_ok = q_cross_err < 0.1 and k_cross_err < 0.1
                 cross_status = "MATCH" if cross_ok else "MISMATCH"
