@@ -203,20 +203,20 @@ def run_fused_test(num_tokens, head_dim=HEAD_DIM, num_q_heads=NUM_Q_HEADS,
             sin_4d = sin_cache.unsqueeze(1).unsqueeze(1)
             pos_i64 = positions.to(torch.int64)
             slots_i64 = slot_mapping.to(torch.int64)
-            if flash_layout:
-                kc_aiter = torch.zeros_like(key_cache)
-                vc_aiter = torch.zeros_like(value_cache)
-            else:
-                kc_aiter = torch.zeros_like(key_cache)
-                vc_aiter = torch.zeros_like(value_cache)
+            kc_aiter = torch.zeros_like(key_cache)
+            vc_aiter = torch.zeros_like(value_cache)
             qo_aiter = torch.empty_like(q)
             ko_aiter = torch.empty_like(k)
+            # Pre-clone inputs so clone overhead is NOT in timed region
+            q_aiter = q.clone()
+            k_aiter = k.clone()
+            v_aiter = v.clone()
             ks = torch.tensor([1.0], device=device, dtype=torch.float32)
             vs = torch.tensor([1.0], device=device, dtype=torch.float32)
 
             def launch_aiter():
                 fused_qk_rope_reshape_and_cache(
-                    q.clone(), k.clone(), v.clone(), kc_aiter, vc_aiter,
+                    q_aiter, k_aiter, v_aiter, kc_aiter, vc_aiter,
                     slots_i64, pos_i64, cos_4d, sin_4d, ks, vs,
                     is_neox=True, flash_layout=flash_layout,
                     apply_scale=False, q_out=qo_aiter, k_out=ko_aiter,
