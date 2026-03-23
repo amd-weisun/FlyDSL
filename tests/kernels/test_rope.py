@@ -16,6 +16,9 @@ Usage:
 
     # CLI — all models:
     PYTHONPATH=./ python tests/kernels/test_rope.py --all-models
+
+    # With AITER performance comparison:
+    AITER_REPO=../aiter PYTHONPATH=./ pytest tests/kernels/test_rope.py -v -s
 """
 
 import os
@@ -180,8 +183,50 @@ def run_rope_test(
     total_bytes = bytes_read + bytes_written
     bw_gbps = total_bytes / 1e9 / (us / 1e6) if us > 0 else 0
 
-    print(f"[flyc] RoPE: {us:.1f} us, BW: {bw_gbps:.2f} GB/s "
+    print(f"  [flyc] RoPE: {us:.1f} us, BW: {bw_gbps:.2f} GB/s "
           f"(M={num_tokens}, heads={total_heads})")
+
+    # Optional AITER comparison
+    if HAS_BENCH and maybe_enable_aiter() and us > 0:
+        try:
+            from aiter.rotary_embedding import get_rope
+        except ImportError:
+            get_rope = None
+
+        if get_rope is not None:
+            try:
+                rope_base = 10000.0
+                rotary_emb = get_rope(
+                    head_dim, rotary_dim, max_pos, rope_base,
+                    True,  # is_neox
+                    torch_dtype,
+                )
+                # Move cos/sin caches to device
+                if hasattr(rotary_emb, 'cos_cache') and rotary_emb.cos_cache is not None:
+                    rotary_emb.cos_cache = rotary_emb.cos_cache.to(device)
+                    rotary_emb.sin_cache = rotary_emb.sin_cache.to(device)
+
+                # Pre-allocate for AITER
+                q_aiter = q.clone()
+                k_aiter = k.clone()
+                pos_i64 = positions.to(torch.int64)
+
+                def run_aiter():
+                    rotary_emb(pos_i64, q_aiter, k_aiter)
+
+                aiter_us = bench_gpu_us_torch(run_aiter, warmup=10, iters=100)
+
+                # Cross-validate
+                torch.cuda.synchronize()
+                q_cross_err = (q_aiter.float() - q_out.float()).abs().max().item()
+                k_cross_err = (k_aiter.float() - k_out.float()).abs().max().item()
+                cross_ok = q_cross_err < 0.1 and k_cross_err < 0.1
+                cross_status = "MATCH" if cross_ok else "MISMATCH"
+                speedup = aiter_us / us if us > 0 else 0
+                print(f"  [aiter] RoPE: {aiter_us:.1f} us → FlyDSL/AITER: {speedup:.2f}x "
+                      f"(cross-check: {cross_status}, Q={q_cross_err:.2e}, K={k_cross_err:.2e})")
+            except Exception as e:
+                print(f"  [aiter] RoPE comparison skipped: {str(e)[:80]}")
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 16, 32, 64, 128, 256, 1024])
