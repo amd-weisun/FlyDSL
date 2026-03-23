@@ -17,8 +17,8 @@ Usage:
     # CLI — all models:
     PYTHONPATH=./ python tests/kernels/test_rope.py --all-models
 
-    # CLI — with AITER comparison:
-    AITER_REPO=../aiter PYTHONPATH=./ python tests/kernels/test_rope.py --all-models
+    # CLI — all models:
+    PYTHONPATH=./ python tests/kernels/test_rope.py --all-models
 """
 
 import os
@@ -41,10 +41,14 @@ from tests.test_common import run_perftest, verify_output
 logging.basicConfig(level=logging.INFO)
 
 try:
-    from benchmark_common import bench_gpu_us_torch, maybe_enable_aiter
+    from tests.kernels.benchmark_common import bench_gpu_us_torch, maybe_enable_aiter
     HAS_BENCH = True
 except ImportError:
-    HAS_BENCH = False
+    try:
+        from benchmark_common import bench_gpu_us_torch, maybe_enable_aiter
+        HAS_BENCH = True
+    except ImportError:
+        HAS_BENCH = False
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA/ROCm not available. Skipping GPU tests.", allow_module_level=True)
@@ -144,17 +148,13 @@ def run_rope_test(
     # Reference
     q_ref, k_ref = rope_neox_ref(q, k, cos_cache, sin_cache, positions)
 
-    # Launch FlyDSL kernel
-    def launch(qo, ko, qi, ki, cc, sc, pos):
-        launch_fn(qi, ki, cc, sc, pos, qo, ko, num_tokens, stream=torch.cuda.current_stream())
-
-    _, us = run_perftest(
-        launch, q_out, k_out, q, k, cos_cache, sin_cache, positions,
-        num_iters=num_iters, num_warmup=num_warmup,
-    )
+    # Launch FlyDSL kernel — correctness run
+    stream = torch.cuda.current_stream()
+    launch_fn(q, k, cos_cache, sin_cache, positions, q_out, k_out,
+              num_tokens, stream=stream)
     torch.cuda.synchronize()
 
-    # Verify
+    # Verify correctness
     rtol = 0.05 if dtype_str == "f32" else 0.1
     atol = 0.05 if dtype_str == "f32" else 0.1
 
@@ -164,16 +164,24 @@ def run_rope_test(
     assert q_ok, "Q RoPE verification failed"
     assert k_ok, "K RoPE verification failed"
 
+    # Perf measurement using bench_gpu_us_torch (CUDA events, same timer as AITER comparison)
+    if HAS_BENCH:
+        def run_flydsl():
+            launch_fn(q, k, cos_cache, sin_cache, positions, q_out, k_out,
+                      num_tokens, stream=stream)
+        us = bench_gpu_us_torch(run_flydsl, warmup=10, iters=100)
+    else:
+        us = 0.0
+
     # Performance stats
+    elem_bytes = {"f32": 4, "f16": 2, "bf16": 2}[dtype_str]
     total_heads = num_q_heads + num_kv_heads
-    # Read: Q + K + cos + sin + positions
-    # Write: Q_out + K_out
-    bytes_read = num_tokens * (num_q_heads + num_kv_heads) * head_dim * 2  # bf16
-    bytes_read += num_tokens * rotary_dim // 2 * 2 * 2  # cos + sin bf16
+    bytes_read = num_tokens * total_heads * head_dim * elem_bytes  # Q + K
+    bytes_read += num_tokens * rotary_dim // 2 * elem_bytes * 2  # cos + sin
     bytes_read += num_tokens * 4  # positions i32
-    bytes_written = num_tokens * (num_q_heads + num_kv_heads) * head_dim * 2
+    bytes_written = num_tokens * total_heads * head_dim * elem_bytes  # Q_out + K_out
     total_bytes = bytes_read + bytes_written
-    bw_gbps = total_bytes / 1e9 / (us / 1e6)
+    bw_gbps = total_bytes / 1e9 / (us / 1e6) if us > 0 else 0
 
     print(f"[flyc] RoPE: {us:.1f} us, BW: {bw_gbps:.2f} GB/s "
           f"(M={num_tokens}, heads={total_heads})")
@@ -259,9 +267,6 @@ examples:
 
   # All models × TPs:
   PYTHONPATH=./ python tests/kernels/test_rope.py --all-models
-
-  # With AITER comparison:
-  AITER_REPO=../aiter PYTHONPATH=./ python tests/kernels/test_rope.py --all-models
 """,
     )
     parser.add_argument("--num-tokens", type=int, default=32)
