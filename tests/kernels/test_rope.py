@@ -9,7 +9,7 @@ Usage:
     PYTHONPATH=./ pytest tests/kernels/test_rope.py -v -s
 
     # All models × TPs (multi-model sweep):
-    PYTHONPATH=./ pytest tests/kernels/test_rope.py -v -s -m multi_model
+    PYTHONPATH=./ pytest tests/kernels/test_rope.py -v -s -k multi_model
 
     # CLI — single config:
     PYTHONPATH=./ python tests/kernels/test_rope.py --num-tokens 32
@@ -241,7 +241,6 @@ for _model, (_hd, _total_qh, _total_kh) in MODEL_CONFIGS.items():
 
 @pytest.mark.parametrize("model,head_dim,num_q_heads,num_kv_heads", _MULTI_MODEL_CASES)
 @pytest.mark.parametrize("num_tokens", [1, 32, 128])
-@pytest.mark.multi_model
 def test_rope_multi_model(model, head_dim, num_q_heads, num_kv_heads, num_tokens):
     run_rope_test(num_tokens, head_dim=head_dim, rotary_dim=head_dim,
                   num_q_heads=num_q_heads, num_kv_heads=num_kv_heads)

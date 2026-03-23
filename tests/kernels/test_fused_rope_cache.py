@@ -255,7 +255,6 @@ for _model, (_hd, _total_qh, _total_kh) in MODEL_CONFIGS.items():
 @pytest.mark.parametrize("model,head_dim,num_q_heads,num_kv_heads", _MULTI_MODEL_CASES)
 @pytest.mark.parametrize("num_tokens", [1, 32, 128])
 @pytest.mark.parametrize("flash_layout", [True, False], ids=["flash", "nonflash"])
-@pytest.mark.multi_model
 def test_fused_rope_cache_multi_model(model, head_dim, num_q_heads, num_kv_heads,
                                        num_tokens, flash_layout):
     ok, q_err, k_err, kc_err, vc_err = run_fused_test(
