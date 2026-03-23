@@ -3,6 +3,22 @@
 
 Kernel implementation lives in `kernels/rope_kernel.py`.
 This file is the correctness + perf harness.
+
+Usage:
+    # Fast CI (GPT-OSS 120B TP=8, 12 tests):
+    PYTHONPATH=./ pytest tests/kernels/test_rope.py -v -s
+
+    # All models × TPs (multi-model sweep):
+    PYTHONPATH=./ pytest tests/kernels/test_rope.py -v -s -m multi_model
+
+    # CLI — single config:
+    PYTHONPATH=./ python tests/kernels/test_rope.py --num-tokens 32
+
+    # CLI — all models:
+    PYTHONPATH=./ python tests/kernels/test_rope.py --all-models
+
+    # CLI — with AITER comparison:
+    AITER_REPO=../aiter PYTHONPATH=./ python tests/kernels/test_rope.py --all-models
 """
 
 import os
@@ -24,18 +40,34 @@ from tests.test_common import run_perftest, verify_output
 
 logging.basicConfig(level=logging.INFO)
 
+try:
+    from benchmark_common import bench_gpu_us_torch, maybe_enable_aiter
+    HAS_BENCH = True
+except ImportError:
+    HAS_BENCH = False
+
 if not torch.cuda.is_available():
     pytest.skip("CUDA/ROCm not available. Skipping GPU tests.", allow_module_level=True)
 
-# GPT-OSS 120B config (TP=8)
+MAX_POS = 8192
+DEFAULT_BENCH_ITERS = 20
+DEFAULT_BENCH_WARMUP = 3
+
+# Model configs: (head_dim, total_q_heads, total_kv_heads)
+MODEL_CONFIGS = {
+    "GPT-OSS-120B":   (64, 64, 8),
+    "Qwen3-235B-MoE": (64, 64, 4),
+    "Llama-3.1-8B":   (128, 32, 8),
+    "Llama-3.1-70B":  (128, 64, 8),
+    "Qwen3-72B":      (128, 64, 8),
+    "Llama-3.1-405B": (128, 128, 8),
+}
+
+# Default: GPT-OSS 120B TP=8 (fast CI)
 HEAD_DIM = 64
 ROTARY_DIM = 64
 NUM_Q_HEADS = 8
 NUM_KV_HEADS = 1
-MAX_POS = 8192
-
-DEFAULT_BENCH_ITERS = 20
-DEFAULT_BENCH_WARMUP = 3
 
 
 def rope_neox_ref(q, k, cos_cache, sin_cache, positions):
@@ -194,19 +226,72 @@ def test_rope_dtypes(dtype_str):
     run_rope_test(num_tokens=32, dtype_str=dtype_str)
 
 
+# --- Multi-model tests (run with -m multi_model) ---
+
+_MULTI_MODEL_CASES = []
+for _model, (_hd, _total_qh, _total_kh) in MODEL_CONFIGS.items():
+    for _tp in [1, 8]:
+        _qh = _total_qh // _tp
+        _kh = max(1, _total_kh // _tp)
+        if _qh >= 1:
+            _MULTI_MODEL_CASES.append(
+                pytest.param(_model, _hd, _qh, _kh, id=f"{_model}-TP{_tp}")
+            )
+
+
+@pytest.mark.parametrize("model,head_dim,num_q_heads,num_kv_heads", _MULTI_MODEL_CASES)
+@pytest.mark.parametrize("num_tokens", [1, 32, 128])
+@pytest.mark.multi_model
+def test_rope_multi_model(model, head_dim, num_q_heads, num_kv_heads, num_tokens):
+    run_rope_test(num_tokens, head_dim=head_dim, rotary_dim=head_dim,
+                  num_q_heads=num_q_heads, num_kv_heads=num_kv_heads)
+
+
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="RoPE kernel test")
+    parser = argparse.ArgumentParser(
+        description="RoPE kernel test",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  # Single config:
+  PYTHONPATH=./ python tests/kernels/test_rope.py --num-tokens 32
+
+  # All models × TPs:
+  PYTHONPATH=./ python tests/kernels/test_rope.py --all-models
+
+  # With AITER comparison:
+  AITER_REPO=../aiter PYTHONPATH=./ python tests/kernels/test_rope.py --all-models
+""",
+    )
     parser.add_argument("--num-tokens", type=int, default=32)
     parser.add_argument("--dtype", type=str, default="bf16", choices=["f32", "f16", "bf16"])
     parser.add_argument("--num-iters", type=int, default=20)
     parser.add_argument("--num-warmup", type=int, default=3)
+    parser.add_argument("--all-models", action="store_true",
+                        help="Test all model configs × TP values")
     args = parser.parse_args()
 
-    run_rope_test(
-        num_tokens=args.num_tokens,
-        dtype_str=args.dtype,
-        num_iters=args.num_iters,
-        num_warmup=args.num_warmup,
-    )
+    configs = []
+    if args.all_models:
+        for model, (hd, total_qh, total_kh) in MODEL_CONFIGS.items():
+            for tp in [1, 8]:
+                qh = total_qh // tp
+                kh = max(1, total_kh // tp)
+                if qh >= 1:
+                    configs.append((model, tp, hd, qh, kh))
+    else:
+        configs = [("GPT-OSS-120B", 8, HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS)]
+
+    for model, tp, hd, qh, kh in configs:
+        print(f"\n{'='*60}")
+        print(f"{model} TP={tp}: QH={qh}, KH={kh}, D={hd}")
+        print(f"{'='*60}")
+        for m in [1, 4, 32, 128]:
+            run_rope_test(m, head_dim=hd, rotary_dim=hd,
+                          num_q_heads=qh, num_kv_heads=kh,
+                          dtype_str=args.dtype,
+                          num_iters=args.num_iters,
+                          num_warmup=args.num_warmup)
+    print("\nDone.")

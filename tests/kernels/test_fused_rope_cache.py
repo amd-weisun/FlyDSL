@@ -2,6 +2,11 @@
 """Fused RoPE + KV Cache kernel test.
 
 Tests correctness of the fused kernel against PyTorch reference.
+# FlyDSL only (no AITER dependency needed):
+PYTHONPATH=./ pytest tests/kernels/test_fused_rope_cache.py -v -s
+
+# With AITER performance comparison:
+AITER_REPO=../aiter PYTHONPATH=./ pytest tests/kernels/test_fused_rope_cache.py -v -s
 """
 
 import os
@@ -19,19 +24,37 @@ if os.path.isdir(_PYFLYDSL_SRC) and _PYFLYDSL_SRC not in sys.path:
     sys.path.insert(0, _PYFLYDSL_SRC)
 
 from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module
+from tests.test_common import run_perftest
 
 logging.basicConfig(level=logging.INFO)
+
+try:
+    from benchmark_common import bench_gpu_us_torch, maybe_enable_aiter
+    HAS_BENCH = True
+except ImportError:
+    HAS_BENCH = False
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA/ROCm not available.", allow_module_level=True)
 
-# GPT-OSS 120B config (TP=8)
+BLOCK_SIZE = 16
+MAX_POS = 8192
+
+# Model configs: (head_dim, total_q_heads, total_kv_heads)
+MODEL_CONFIGS = {
+    "GPT-OSS-120B":   (64, 64, 8),
+    "Qwen3-235B-MoE": (64, 64, 4),
+    "Llama-3.1-8B":   (128, 32, 8),
+    "Llama-3.1-70B":  (128, 64, 8),
+    "Qwen3-72B":      (128, 64, 8),
+    "Llama-3.1-405B": (128, 128, 8),
+}
+
+# Default: GPT-OSS 120B TP=8 (fast CI)
 HEAD_DIM = 64
 ROTARY_DIM = 64
 NUM_Q_HEADS = 8
 NUM_KV_HEADS = 1
-BLOCK_SIZE = 16
-MAX_POS = 8192
 
 
 def fused_rope_cache_ref(q, k, v, cos_cache, sin_cache, positions, slot_mapping,
@@ -79,42 +102,45 @@ def fused_rope_cache_ref(q, k, v, cos_cache, sin_cache, positions, slot_mapping,
     return q_out, k_out, key_cache_out, value_cache_out
 
 
-def run_fused_test(num_tokens, block_size=BLOCK_SIZE, max_pos=MAX_POS, flash_layout=True):
+def run_fused_test(num_tokens, head_dim=HEAD_DIM, num_q_heads=NUM_Q_HEADS,
+                   num_kv_heads=NUM_KV_HEADS, block_size=BLOCK_SIZE,
+                   max_pos=MAX_POS, flash_layout=True):
     """Run fused RoPE + KV cache kernel test."""
     device = torch.device("cuda")
     torch_dtype = torch.bfloat16
-    num_blocks = 32  # enough blocks for test
+    num_blocks = max(32, (num_tokens + block_size - 1) // block_size + 1)
+    rotary_dim = head_dim  # full rotation
 
     layout_name = "flash" if flash_layout else "non-flash"
     print(f"[fused_rope_cache] M={num_tokens}, BS={block_size}, "
-          f"QH={NUM_Q_HEADS}, KH={NUM_KV_HEADS}, D={HEAD_DIM}, layout={layout_name}")
+          f"QH={num_q_heads}, KH={num_kv_heads}, D={head_dim}, layout={layout_name}")
 
     launch_fn = build_fused_rope_cache_module(
-        head_dim=HEAD_DIM, rotary_dim=ROTARY_DIM,
-        num_q_heads=NUM_Q_HEADS, num_kv_heads=NUM_KV_HEADS,
+        head_dim=head_dim, rotary_dim=rotary_dim,
+        num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
         block_size=block_size, is_neox=True,
         flash_layout=flash_layout, dtype_str="bf16",
     )
 
     torch.manual_seed(42)
-    q = torch.randn(num_tokens, NUM_Q_HEADS, HEAD_DIM, device=device, dtype=torch_dtype)
-    k = torch.randn(num_tokens, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=torch_dtype)
-    v = torch.randn(num_tokens, NUM_KV_HEADS, HEAD_DIM, device=device, dtype=torch_dtype)
-    cos_cache = torch.randn(max_pos, ROTARY_DIM // 2, device=device, dtype=torch_dtype)
-    sin_cache = torch.randn(max_pos, ROTARY_DIM // 2, device=device, dtype=torch_dtype)
+    q = torch.randn(num_tokens, num_q_heads, head_dim, device=device, dtype=torch_dtype)
+    k = torch.randn(num_tokens, num_kv_heads, head_dim, device=device, dtype=torch_dtype)
+    v = torch.randn(num_tokens, num_kv_heads, head_dim, device=device, dtype=torch_dtype)
+    cos_cache = torch.randn(max_pos, rotary_dim // 2, device=device, dtype=torch_dtype)
+    sin_cache = torch.randn(max_pos, rotary_dim // 2, device=device, dtype=torch_dtype)
     positions = torch.randint(0, max_pos, (num_tokens,), device=device, dtype=torch.int32)
     slot_mapping = torch.arange(num_tokens, device=device, dtype=torch.int32)
 
     x_size = 16
     if flash_layout:
-        key_cache = torch.zeros(num_blocks, block_size, NUM_KV_HEADS, HEAD_DIM,
+        key_cache = torch.zeros(num_blocks, block_size, num_kv_heads, head_dim,
                                  device=device, dtype=torch_dtype)
-        value_cache = torch.zeros(num_blocks, block_size, NUM_KV_HEADS, HEAD_DIM,
+        value_cache = torch.zeros(num_blocks, block_size, num_kv_heads, head_dim,
                                    device=device, dtype=torch_dtype)
     else:
-        key_cache = torch.zeros(num_blocks, NUM_KV_HEADS, HEAD_DIM // x_size, block_size, x_size,
+        key_cache = torch.zeros(num_blocks, num_kv_heads, head_dim // x_size, block_size, x_size,
                                  device=device, dtype=torch_dtype)
-        value_cache = torch.zeros(num_blocks, NUM_KV_HEADS, HEAD_DIM, block_size,
+        value_cache = torch.zeros(num_blocks, num_kv_heads, head_dim, block_size,
                                    device=device, dtype=torch_dtype)
 
     q_out = torch.empty_like(q)
@@ -126,11 +152,25 @@ def run_fused_test(num_tokens, block_size=BLOCK_SIZE, max_pos=MAX_POS, flash_lay
         key_cache.clone(), value_cache.clone(), block_size, flash_layout=flash_layout,
     )
 
-    # Launch FlyDSL kernel
+    # Launch FlyDSL kernel with perf measurement
     stream = torch.cuda.current_stream()
-    launch_fn(q, k, v, positions, cos_cache, sin_cache, slot_mapping,
-              key_cache, value_cache, q_out, k_out, num_tokens, stream=stream)
+
+    def launch(qi, ki, vi, pos, cc, sc, sm, kc, vc, qo, ko):
+        launch_fn(qi, ki, vi, pos, cc, sc, sm, kc, vc, qo, ko,
+                  num_tokens, stream=stream)
+
+    _, us = run_perftest(
+        launch, q, k, v, positions, cos_cache, sin_cache, slot_mapping,
+        key_cache, value_cache, q_out, k_out,
+        num_iters=20, num_warmup=3,
+    )
     torch.cuda.synchronize()
+
+    # Compute bandwidth
+    total_bytes = (q.nelement() + k.nelement() + v.nelement()) * 2 * 2  # read+write bf16
+    total_bytes += cos_cache[0:1].nelement() * 2 * 2 * num_tokens  # cos+sin per token
+    bw_gbs = total_bytes / (us * 1e-6) / 1e9 if us > 0 else 0
+    print(f"  [flyc] {us:.1f} us, BW: {bw_gbs:.2f} GB/s")
 
     # Verify
     atol = 0.1
@@ -143,9 +183,49 @@ def run_fused_test(num_tokens, block_size=BLOCK_SIZE, max_pos=MAX_POS, flash_lay
 
     print(f"  q_err={q_err:.6f}, k_err={k_err:.6f}, kc_err={kc_err:.6f}, vc_err={vc_err:.6f}")
 
+    # Optional AITER comparison
+    if HAS_BENCH and maybe_enable_aiter():
+        try:
+            from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_rope_reshape_and_cache
+        except ImportError:
+            try:
+                from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
+            except ImportError:
+                fused_qk_rope_reshape_and_cache = None
+
+        if fused_qk_rope_reshape_and_cache is not None:
+            cos_4d = cos_cache.unsqueeze(1).unsqueeze(1)
+            sin_4d = sin_cache.unsqueeze(1).unsqueeze(1)
+            pos_i64 = positions.to(torch.int64)
+            slots_i64 = slot_mapping.to(torch.int64)
+            if flash_layout:
+                kc_aiter = torch.zeros_like(key_cache)
+                vc_aiter = torch.zeros_like(value_cache)
+            else:
+                kc_aiter = torch.zeros_like(key_cache)
+                vc_aiter = torch.zeros_like(value_cache)
+            qo_aiter = torch.empty_like(q)
+            ko_aiter = torch.empty_like(k)
+            ks = torch.tensor([1.0], device=device, dtype=torch.float32)
+            vs = torch.tensor([1.0], device=device, dtype=torch.float32)
+
+            def launch_aiter():
+                fused_qk_rope_reshape_and_cache(
+                    q.clone(), k.clone(), v.clone(), kc_aiter, vc_aiter,
+                    slots_i64, pos_i64, cos_4d, sin_4d, ks, vs,
+                    is_neox=True, flash_layout=flash_layout,
+                    apply_scale=False, q_out=qo_aiter, k_out=ko_aiter,
+                    output_zeros=False,
+                )
+
+            aiter_us = bench_gpu_us_torch(launch_aiter, warmup=10, iters=100)
+            print(f"  [aiter] {aiter_us:.1f} us → FlyDSL/AITER: {aiter_us/us:.2f}x")
+
     ok = q_err < atol and k_err < atol and kc_err < atol and vc_err < atol
     return ok, q_err, k_err, kc_err, vc_err
 
+
+# --- Default tests: GPT-OSS 120B TP=8 (fast CI) ---
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 16, 32, 128])
 def test_fused_rope_cache_flash(num_tokens):
@@ -159,11 +239,63 @@ def test_fused_rope_cache_nonflash(num_tokens):
     assert ok, f"FAILED: q={q_err:.2e} k={k_err:.2e} kc={kc_err:.2e} vc={vc_err:.2e}"
 
 
+# --- Multi-model tests (larger, run with --run-all-models) ---
+
+_MULTI_MODEL_CASES = []
+for _model, (_hd, _total_qh, _total_kh) in MODEL_CONFIGS.items():
+    for _tp in [1, 8]:
+        _qh = _total_qh // _tp
+        _kh = max(1, _total_kh // _tp)
+        if _qh >= 1:
+            _MULTI_MODEL_CASES.append(
+                pytest.param(_model, _hd, _qh, _kh, id=f"{_model}-TP{_tp}")
+            )
+
+
+@pytest.mark.parametrize("model,head_dim,num_q_heads,num_kv_heads", _MULTI_MODEL_CASES)
+@pytest.mark.parametrize("num_tokens", [1, 32, 128])
+@pytest.mark.parametrize("flash_layout", [True, False], ids=["flash", "nonflash"])
+@pytest.mark.multi_model
+def test_fused_rope_cache_multi_model(model, head_dim, num_q_heads, num_kv_heads,
+                                       num_tokens, flash_layout):
+    ok, q_err, k_err, kc_err, vc_err = run_fused_test(
+        num_tokens, head_dim=head_dim,
+        num_q_heads=num_q_heads, num_kv_heads=num_kv_heads,
+        flash_layout=flash_layout,
+    )
+    assert ok, f"FAILED ({model}): q={q_err:.2e} k={k_err:.2e} kc={kc_err:.2e} vc={vc_err:.2e}"
+
+
 if __name__ == "__main__":
-    for layout_name, flash in [("flash", True), ("non-flash", False)]:
-        print(f"\n--- {layout_name} layout ---")
-        for m in [1, 4, 16, 32, 128]:
-            ok, q_err, k_err, kc_err, vc_err = run_fused_test(m, flash_layout=flash)
-            status = "PASS" if ok else "FAIL"
-            print(f"  [{status}] M={m} q={q_err:.2e} k={k_err:.2e} kc={kc_err:.2e} vc={vc_err:.2e}")
-    print("Done.")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--all-models", action="store_true",
+                        help="Test all model configs (default: GPT-OSS-120B TP=8 only)")
+    args = parser.parse_args()
+
+    configs = []
+    if args.all_models:
+        for model, (hd, total_qh, total_kh) in MODEL_CONFIGS.items():
+            for tp in [1, 8]:
+                qh = total_qh // tp
+                kh = max(1, total_kh // tp)
+                if qh >= 1:
+                    configs.append((model, tp, hd, qh, kh))
+    else:
+        configs = [("GPT-OSS-120B", 8, HEAD_DIM, NUM_Q_HEADS, NUM_KV_HEADS)]
+
+    for model, tp, hd, qh, kh in configs:
+        print(f"\n{'='*60}")
+        print(f"{model} TP={tp}: QH={qh}, KH={kh}, D={hd}")
+        print(f"{'='*60}")
+        for flash_layout in [True, False]:
+            layout = "flash" if flash_layout else "non-flash"
+            for m in [1, 4, 32, 128]:
+                ok, q_err, k_err, kc_err, vc_err = run_fused_test(
+                    m, head_dim=hd, num_q_heads=qh, num_kv_heads=kh,
+                    flash_layout=flash_layout,
+                )
+                status = "PASS" if ok else "FAIL"
+                print(f"  [{status}] {layout:>9s} M={m:>4d} "
+                      f"q={q_err:.2e} k={k_err:.2e} kc={kc_err:.2e} vc={vc_err:.2e}")
+    print("\nDone.")
