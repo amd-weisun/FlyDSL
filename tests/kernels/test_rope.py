@@ -16,9 +16,6 @@ Usage:
 
     # CLI — all models:
     PYTHONPATH=./ python tests/kernels/test_rope.py --all-models
-
-    # CLI — all models:
-    PYTHONPATH=./ python tests/kernels/test_rope.py --all-models
 """
 
 import os

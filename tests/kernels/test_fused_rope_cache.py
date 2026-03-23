@@ -2,11 +2,23 @@
 """Fused RoPE + KV Cache kernel test.
 
 Tests correctness of the fused kernel against PyTorch reference.
-# FlyDSL only (no AITER dependency needed):
-PYTHONPATH=./ pytest tests/kernels/test_fused_rope_cache.py -v -s
+Supports both flash and non-flash KV cache layouts.
 
-# With AITER performance comparison:
-AITER_REPO=../aiter PYTHONPATH=./ pytest tests/kernels/test_fused_rope_cache.py -v -s
+Usage:
+    # Fast CI (GPT-OSS 120B TP=8, 10 tests):
+    PYTHONPATH=./ pytest tests/kernels/test_fused_rope_cache.py -v -s
+
+    # All models × TPs (multi-model sweep):
+    PYTHONPATH=./ pytest tests/kernels/test_fused_rope_cache.py -v -s -k multi_model
+
+    # With AITER performance comparison:
+    AITER_REPO=../aiter PYTHONPATH=./ pytest tests/kernels/test_fused_rope_cache.py -v -s
+
+    # CLI — all models:
+    PYTHONPATH=./ python tests/kernels/test_fused_rope_cache.py --all-models
+
+    # CLI — with AITER comparison:
+    AITER_REPO=../aiter PYTHONPATH=./ python tests/kernels/test_fused_rope_cache.py --all-models
 """
 
 import os
@@ -225,7 +237,15 @@ def run_fused_test(num_tokens, head_dim=HEAD_DIM, num_q_heads=NUM_Q_HEADS,
 
             aiter_us = bench_gpu_us_torch(launch_aiter, warmup=10, iters=100)
             speedup = aiter_us / us if us > 0 else 0
-            print(f"  [aiter] {aiter_us:.1f} us → FlyDSL/AITER: {speedup:.2f}x")
+
+            # Cross-validate: AITER Q/K output must match FlyDSL Q/K output
+            torch.cuda.synchronize()
+            q_cross_err = (qo_aiter.float() - q_out.float()).abs().max().item()
+            k_cross_err = (ko_aiter.float() - k_out.float()).abs().max().item()
+            cross_ok = q_cross_err < 0.1 and k_cross_err < 0.1
+            cross_status = "MATCH" if cross_ok else "MISMATCH"
+            print(f"  [aiter] {aiter_us:.1f} us → FlyDSL/AITER: {speedup:.2f}x "
+                  f"(cross-check: {cross_status}, Q={q_cross_err:.2e}, K={k_cross_err:.2e})")
 
     ok = q_err < atol and k_err < atol and kc_err < atol and vc_err < atol
     return ok, q_err, k_err, kc_err, vc_err
