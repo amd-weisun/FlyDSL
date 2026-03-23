@@ -199,6 +199,7 @@ def run_rope_test(
                 rotary_emb = get_rope(
                     head_dim, rotary_dim, max_pos, rope_base,
                     True,  # is_neox
+                    None,  # rope_scaling
                     torch_dtype,
                 )
                 # Move cos/sin caches to device
