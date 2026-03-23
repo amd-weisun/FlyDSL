@@ -29,10 +29,14 @@ from tests.test_common import run_perftest
 logging.basicConfig(level=logging.INFO)
 
 try:
-    from benchmark_common import bench_gpu_us_torch, maybe_enable_aiter
+    from tests.kernels.benchmark_common import bench_gpu_us_torch, maybe_enable_aiter
     HAS_BENCH = True
 except ImportError:
-    HAS_BENCH = False
+    try:
+        from benchmark_common import bench_gpu_us_torch, maybe_enable_aiter
+        HAS_BENCH = True
+    except ImportError:
+        HAS_BENCH = False
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA/ROCm not available.", allow_module_level=True)
