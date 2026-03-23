@@ -156,19 +156,20 @@ def run_fused_test(num_tokens, head_dim=HEAD_DIM, num_q_heads=NUM_Q_HEADS,
         key_cache.clone(), value_cache.clone(), block_size, flash_layout=flash_layout,
     )
 
-    # Launch FlyDSL kernel with perf measurement
+    # Launch FlyDSL kernel — correctness run
     stream = torch.cuda.current_stream()
-
-    def launch(qi, ki, vi, pos, cc, sc, sm, kc, vc, qo, ko):
-        launch_fn(qi, ki, vi, pos, cc, sc, sm, kc, vc, qo, ko,
-                  num_tokens, stream=stream)
-
-    _, us = run_perftest(
-        launch, q, k, v, positions, cos_cache, sin_cache, slot_mapping,
-        key_cache, value_cache, q_out, k_out,
-        num_iters=20, num_warmup=3,
-    )
+    launch_fn(q, k, v, positions, cos_cache, sin_cache, slot_mapping,
+              key_cache, value_cache, q_out, k_out, num_tokens, stream=stream)
     torch.cuda.synchronize()
+
+    # Perf measurement using bench_gpu_us_torch (same timer used for AITER comparison)
+    if HAS_BENCH:
+        def run_flydsl():
+            launch_fn(q, k, v, positions, cos_cache, sin_cache, slot_mapping,
+                      key_cache, value_cache, q_out, k_out, num_tokens, stream=stream)
+        us = bench_gpu_us_torch(run_flydsl, warmup=10, iters=100)
+    else:
+        us = 0.0
 
     # Compute bandwidth
     total_bytes = (q.nelement() + k.nelement() + v.nelement()) * 2 * 2  # read+write bf16
@@ -223,7 +224,8 @@ def run_fused_test(num_tokens, head_dim=HEAD_DIM, num_q_heads=NUM_Q_HEADS,
                 )
 
             aiter_us = bench_gpu_us_torch(launch_aiter, warmup=10, iters=100)
-            print(f"  [aiter] {aiter_us:.1f} us → FlyDSL/AITER: {aiter_us/us:.2f}x")
+            speedup = aiter_us / us if us > 0 else 0
+            print(f"  [aiter] {aiter_us:.1f} us → FlyDSL/AITER: {speedup:.2f}x")
 
     ok = q_err < atol and k_err < atol and kc_err < atol and vc_err < atol
     return ok, q_err, k_err, kc_err, vc_err
