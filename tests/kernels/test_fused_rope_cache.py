@@ -32,11 +32,15 @@ import torch
 import pytest
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-_PYFLYDSL_SRC = os.path.join(_REPO_ROOT, "flydsl", "src")
-if os.path.isdir(_PYFLYDSL_SRC) and _PYFLYDSL_SRC not in sys.path:
-    sys.path.insert(0, _PYFLYDSL_SRC)
+_PYTHON_CANDIDATES = [
+    os.path.join(_REPO_ROOT, "build", "python_packages"),
+    os.path.join(_REPO_ROOT, "build-fly", "python_packages"),
+    os.path.join(_REPO_ROOT, "flydsl", "src"),
+    _REPO_ROOT,
+]
+for _p in reversed(_PYTHON_CANDIDATES):
+    if os.path.isdir(_p) and _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from kernels.fused_rope_cache_kernel import build_fused_rope_cache_module
 

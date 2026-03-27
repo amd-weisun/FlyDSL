@@ -89,10 +89,8 @@ def build_fused_rope_cache_module(
     if rotary_dim != head_dim:
         raise NotImplementedError("Partial rotation not yet supported")
     if dtype_str not in ("bf16", "f16"):
-        raise NotImplementedError(
-            f"Only bf16 and f16 are supported (got dtype_str={dtype_str!r}). "
-            f"f32 requires vec_width=8 for buffer_load/store which exceeds "
-            f"the hardware maximum of 4 dwords."
+        raise ValueError(
+            f"dtype_str must be 'bf16' or 'f16', got {dtype_str!r}"
         )
 
     half_dim = rotary_dim // 2
