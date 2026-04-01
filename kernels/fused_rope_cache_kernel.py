@@ -187,8 +187,8 @@ def build_fused_rope_cache_module(
         SinCache: fx.Tensor,     # [max_pos, half_dim]
         Q_out: fx.Tensor,        # [T, QH, D]
     ):
-        pid = fx.block_idx.x    # program id: 0..T*QH-1
-        tid = fx.thread_idx.x   # 0..63
+        bid_x, _, _ = fx.block_idx  # program id: 0..T*QH-1
+        tid = fx.thread_idx.x       # 0..63
 
         elem_type = dtype_to_elem_type(dtype_str)
         vec_type_e = T.vec(VEC_WIDTH, elem_type)
@@ -206,8 +206,8 @@ def build_fused_rope_cache_module(
         cos_sin_layout = fx.make_layout(_cos_shape, _cos_stride)
 
         if arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_head)):
-            pid_t = pid // num_q_heads
-            pid_hq = pid % num_q_heads
+            pid_t = bid_x // num_q_heads
+            pid_hq = bid_x % num_q_heads
 
             # Load position
             pos_val = buffer_ops.buffer_load(pos_rsrc, pid_t, vec_width=1, dtype=T.i32)
@@ -251,8 +251,8 @@ def build_fused_rope_cache_module(
         ValueCache: fx.Tensor,   # flash: [T_cache, BS, KH, D]
         K_out: fx.Tensor,        # [T, KH, D]
     ):
-        pid = fx.block_idx.x    # program id: 0..T*KH-1
-        tid = fx.thread_idx.x   # 0..63
+        bid_x, _, _ = fx.block_idx  # program id: 0..T*KH-1
+        tid = fx.thread_idx.x       # 0..63
 
         elem_type = dtype_to_elem_type(dtype_str)
         vec_type_e = T.vec(VEC_WIDTH, elem_type)
@@ -274,8 +274,8 @@ def build_fused_rope_cache_module(
         cos_sin_layout = fx.make_layout(_cos_shape, _cos_stride)
 
         if arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_head)):
-            pid_t = pid // num_kv_heads
-            pid_hk = pid % num_kv_heads
+            pid_t = bid_x // num_kv_heads
+            pid_hk = bid_x % num_kv_heads
 
             # Load position
             pos_val = buffer_ops.buffer_load(pos_rsrc, pid_t, vec_width=1, dtype=T.i32)
