@@ -212,9 +212,10 @@ def build_fused_rope_cache_module(
             pid_hq = bid_x % num_q_heads
 
             # Select this program's tile [head_dim] → reshape to 2D for tiled copy
-            gQ_1d = gQ[0, pid_t, 0, pid_hq, None, 0]
+            # flat_divide mode order: (inner_T, inner_QH, inner_D, outer_T, outer_QH, outer_D)
+            gQ_1d = gQ[0, 0, None, pid_t, pid_hq, 0]
             gQ_2d = fx.logical_divide(gQ_1d, fx.make_layout(VEC_WIDTH, 1))
-            gQo_1d = gQo[0, pid_t, 0, pid_hq, None, 0]
+            gQo_1d = gQo[0, 0, None, pid_t, pid_hq, 0]
             gQo_2d = fx.logical_divide(gQo_1d, fx.make_layout(VEC_WIDTH, 1))
 
             # Load Q via layout API (global → register — Step 4)
@@ -313,11 +314,12 @@ def build_fused_rope_cache_module(
             pid_hk = bid_x % num_kv_heads
 
             # --- Select program tiles and reshape to 2D ---
-            gK_1d = gK[0, pid_t, 0, pid_hk, None, 0]
+            # flat_divide mode order: (inner_T, inner_KH, inner_D, outer_T, outer_KH, outer_D)
+            gK_1d = gK[0, 0, None, pid_t, pid_hk, 0]
             gK_2d = fx.logical_divide(gK_1d, fx.make_layout(VEC_WIDTH, 1))
-            gV_1d = gV[0, pid_t, 0, pid_hk, None, 0]
+            gV_1d = gV[0, 0, None, pid_t, pid_hk, 0]
             gV_2d = fx.logical_divide(gV_1d, fx.make_layout(VEC_WIDTH, 1))
-            gKo_1d = gKo[0, pid_t, 0, pid_hk, None, 0]
+            gKo_1d = gKo[0, 0, None, pid_t, pid_hk, 0]
             gKo_2d = fx.logical_divide(gKo_1d, fx.make_layout(VEC_WIDTH, 1))
 
             # --- Load K via layout API (global → register) ---
