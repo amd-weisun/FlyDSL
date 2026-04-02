@@ -47,6 +47,16 @@ def _layout_to_dword_off(coord, layout, elem_bytes):
     return (ArithValue(elem_off) * elem_bytes) >> fx.Int32(2)
 
 
+def _make_contiguous_1d_view(tensor):
+    """Return a 1-D contiguous view of ``tensor`` for flat_divide usage.
+
+    We rely on the underlying tensor being fully contiguous so that remapping
+    to a stride-1 vector view (equivalent to fx.coalesce) is layout-safe.
+    """
+    flat_layout = fx.make_layout((None,), (1,))
+    return fx.make_view(fx.get_iter(tensor), flat_layout)
+
+
 def _apply_neox_rope(qk_e, cos_rsrc, sin_rsrc, cos_dw,
                      pair_rsrc, pair_dw, is_first_half,
                      vec_dwords, vec_type_e):
@@ -189,12 +199,16 @@ def build_fused_rope_cache_module(
         Q = fx.rocdl.make_buffer_tensor(Q)
         Q_out = fx.rocdl.make_buffer_tensor(Q_out)
 
-        # Coalesce [T,QH,D]:(QH*D,D,1) → 1D [T*QH*D]:1 (all modes are contiguous)
+        # Remap [T,QH,D] contiguous layout to a 1D stride-1 view before flat_divide
+        # (mimics fx.coalesce while avoiding runtime pattern kwargs).
+        q_linear = _make_contiguous_1d_view(Q)
+        qo_linear = _make_contiguous_1d_view(Q_out)
+
         # flat_divide on 1D with 1D tile → 2-mode (head_dim, T*QH); each program
         # selects its [head_dim] tile via bid_x directly — matches example-04 pattern.
         tile_1d = fx.make_tile(head_dim)
-        gQ = fx.flat_divide(fx.coalesce(Q), tile_1d)
-        gQo = fx.flat_divide(fx.coalesce(Q_out), tile_1d)
+        gQ = fx.flat_divide(q_linear, tile_1d)
+        gQo = fx.flat_divide(qo_linear, tile_1d)
 
         # --- Layouts for manual-path offsets (pair, cos/sin) ---
         q_layout = fx.make_layout(_q_shape, _q_stride)
@@ -289,11 +303,16 @@ def build_fused_rope_cache_module(
         V = fx.rocdl.make_buffer_tensor(V)
         K_out = fx.rocdl.make_buffer_tensor(K_out)
 
-        # Coalesce [T,KH,D]:(KH*D,D,1) → 1D; flat_divide → (head_dim, T*KH)
+        # Remap [T,KH,D] to a 1D contiguous view prior to flat_divide (fx.coalesce analog).
+        k_linear = _make_contiguous_1d_view(K)
+        v_linear = _make_contiguous_1d_view(V)
+        ko_linear = _make_contiguous_1d_view(K_out)
+
+        # flat_divide → (head_dim, T*KH)
         tile_1d = fx.make_tile(head_dim)
-        gK = fx.flat_divide(fx.coalesce(K), tile_1d)
-        gV = fx.flat_divide(fx.coalesce(V), tile_1d)
-        gKo = fx.flat_divide(fx.coalesce(K_out), tile_1d)
+        gK = fx.flat_divide(k_linear, tile_1d)
+        gV = fx.flat_divide(v_linear, tile_1d)
+        gKo = fx.flat_divide(ko_linear, tile_1d)
 
         # --- Layouts for manual-path offsets (pair, cos/sin, KV cache) ---
         kv_layout = fx.make_layout(_kv_shape, _kv_stride)
