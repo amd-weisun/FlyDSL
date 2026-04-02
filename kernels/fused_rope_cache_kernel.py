@@ -49,8 +49,9 @@ def _layout_to_dword_off(coord, layout, elem_bytes):
 
 def _head_tile_tensor(tensor, head_dim):
     """View ``tensor`` as [num_tiles, head_dim] with contiguous head slices."""
+    coalesced = fx.rocdl.make_buffer_tensor(fx.coalesce(tensor))
     tile_layout = fx.make_layout((None, head_dim), (head_dim, 1))
-    tile_view = fx.make_view(fx.get_iter(tensor), tile_layout)
+    tile_view = fx.make_view(fx.get_iter(coalesced), tile_layout)
     return fx.Tensor(tile_view)
 
 
