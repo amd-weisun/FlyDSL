@@ -47,36 +47,21 @@ def _layout_to_dword_off(coord, layout, elem_bytes):
     return (ArithValue(elem_off) * elem_bytes) >> fx.Int32(2)
 
 
-def _apply_neox_rope(qk_rsrc, qk_dw, cos_rsrc, sin_rsrc, cos_dw,
+def _apply_neox_rope(qk_e, cos_rsrc, sin_rsrc, cos_dw,
                      pair_rsrc, pair_dw, is_first_half,
-                     vec_dwords, vec_type_e, i32_vec_ty):
-    """Load, rotate (NeoX), and return the rotated vector as i32.
+                     vec_dwords, vec_type_e):
+    """Rotate qk_e (pre-loaded element vec) using NeoX-style RoPE.
 
-    Performs:
-      out[first_half]  = qk * cos - pair * sin
-      out[second_half] = qk * cos + pair * sin
+    qk_e is pre-loaded via the layout API.  cos/sin and the paired-half
+    vector are loaded via buffer_load (runtime-computed / non-affine indices).
 
-    Args:
-        qk_rsrc:       buffer resource for Q or K
-        qk_dw:         dword offset of the current thread's vec in qk_rsrc
-        cos_rsrc:      buffer resource for CosCache
-        sin_rsrc:      buffer resource for SinCache
-        cos_dw:        dword offset into cos/sin (shared for both halves)
-        pair_rsrc:     buffer resource for the paired-half vec (same as qk_rsrc)
-        pair_dw:       dword offset of the partner vec in pair_rsrc
-        is_first_half: i1 predicate — true when tid < vecs_per_half
-        vec_dwords:    number of i32 dwords per vector load
-        vec_type_e:    MLIR vector type in element dtype (e.g. vec<8xbf16>)
-        i32_vec_ty:    MLIR vector type in i32 (e.g. vec<4xi32>)
-
-    Returns:
-        rot_i32: rotated vector as i32 vector, ready for buffer_store
+    Returns rot_e in element dtype — caller bitcasts to i32 when needed for
+    buffer_store (KV cache writes).
     """
     def _load_e(rsrc, dw):
         raw = buffer_ops.buffer_load(rsrc, dw, vec_width=vec_dwords, dtype=T.i32)
         return vector.bitcast(vec_type_e, raw)
 
-    qk_e   = _load_e(qk_rsrc,   qk_dw)
     cos_e  = _load_e(cos_rsrc,  cos_dw)
     sin_e  = _load_e(sin_rsrc,  cos_dw)
     pair_e = _load_e(pair_rsrc, pair_dw)
@@ -87,7 +72,7 @@ def _apply_neox_rope(qk_rsrc, qk_dw, cos_rsrc, sin_rsrc, cos_dw,
     sin_term = arith.select(is_first_half, arith.negf(pair_sin), pair_sin)
     rot_e    = ArithValue(qk_cos) + ArithValue(sin_term)
 
-    return vector.bitcast(i32_vec_ty, rot_e)
+    return rot_e
 
 
 def build_fused_rope_cache_module(
@@ -167,8 +152,7 @@ def build_fused_rope_cache_module(
 
     # Layout shape/stride tuples (plain Python ints) — materialized as
     # fx.make_layout inside each kernel where an MLIR context is active.
-    # None is used for dynamic/unknown extents (token count, position range,
-    # block count) so the layout shape matches the actual indexing domain.
+    # These are ONLY used for the manual-path offsets (pair, cos/sin, KV cache).
     _q_shape = (None, num_q_heads, vecs_per_head)
     _q_stride = (num_q_heads * head_dim, head_dim, VEC_WIDTH)
     _kv_shape = (None, num_kv_heads, vecs_per_head)
@@ -194,47 +178,77 @@ def build_fused_rope_cache_module(
         vec_type_e = T.vec(VEC_WIDTH, elem_type)
         i32_vec_ty = T.vec(vec_dwords, T.i32)
 
-        # Buffer resources at top level (not inside scf.if)
-        q_rsrc = buffer_ops.create_buffer_resource(Q, max_size=True)
+        # --- Buffer resources for scalar / runtime-indexed / non-affine loads ---
+        # Must be created BEFORE make_buffer_tensor rebinds the Python name.
+        q_pair_rsrc = buffer_ops.create_buffer_resource(Q, max_size=True)
         pos_rsrc = buffer_ops.create_buffer_resource(Positions, max_size=True)
         cos_rsrc = buffer_ops.create_buffer_resource(CosCache, max_size=True)
         sin_rsrc = buffer_ops.create_buffer_resource(SinCache, max_size=True)
-        qo_rsrc = buffer_ops.create_buffer_resource(Q_out, max_size=True)
 
-        # Layouts (materialized inside kernel where MLIR context is active)
+        # --- Convert to buffer tensors for layout API (Step 1) ---
+        Q = fx.rocdl.make_buffer_tensor(Q)
+        Q_out = fx.rocdl.make_buffer_tensor(Q_out)
+
+        # --- Tile selection via flat_divide (3D tile on 3D tensor — Step 3) ---
+        tile_3d = fx.make_tile(1, 1, head_dim)
+        gQ = fx.flat_divide(Q, tile_3d)
+        gQo = fx.flat_divide(Q_out, tile_3d)
+
+        # --- Layouts for manual-path offsets (pair, cos/sin) ---
         q_layout = fx.make_layout(_q_shape, _q_stride)
         cos_sin_layout = fx.make_layout(_cos_shape, _cos_stride)
+
+        # --- Tiled copy setup (before guard — Step 9) ---
+        copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_type)
+        thr_layout = fx.make_layout((1, vecs_per_head), (1, 1))
+        val_layout = fx.make_layout((VEC_WIDTH, 1), (1, 1))
+        layout_tv = fx.raked_product(thr_layout, val_layout)
+        tile_copy = fx.make_tile(VEC_WIDTH, vecs_per_head)
+        tiled_copy = fx.make_tiled_copy(copy_atom, layout_tv, tile_copy)
+        thr_copy = tiled_copy.get_slice(tid)
 
         if arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_head)):
             pid_t = bid_x // num_q_heads
             pid_hq = bid_x % num_q_heads
 
-            # Load position
+            # Select this program's tile [head_dim] → reshape to 2D for tiled copy
+            gQ_1d = gQ[0, pid_t, 0, pid_hq, None, 0]
+            gQ_2d = fx.logical_divide(gQ_1d, fx.make_layout(VEC_WIDTH, 1))
+            gQo_1d = gQo[0, pid_t, 0, pid_hq, None, 0]
+            gQo_2d = fx.logical_divide(gQo_1d, fx.make_layout(VEC_WIDTH, 1))
+
+            # Load Q via layout API (global → register — Step 4)
+            src_Q = thr_copy.partition_S(gQ_2d)
+            frag_Q = fx.make_fragment_like(src_Q)
+            fx.copy(copy_atom, src_Q, frag_Q)
+            q_e = fx.memref_load_vec(frag_Q)
+
+            # Load position (scalar, runtime index — Step 8 exception)
             pos_val = buffer_ops.buffer_load(pos_rsrc, pid_t, vec_width=1, dtype=T.i32)
 
-            # -- Q address via crd2idx --
-            q_coord = (pid_t, fx.Int32(pid_hq), tid)
-            q_dw = _layout_to_dword_off(q_coord, q_layout, elem_bytes)
-
-            # -- cos/sin address via crd2idx --
-            # tid % vecs_per_half wraps second-half threads [vecs_per_half, vecs_per_head)
-            # back to [0, vecs_per_half): NeoX uses the same cos/sin for both halves;
-            # only the sign of the sin term differs (handled by is_first_half select below).
+            # cos/sin address (runtime pos_val index — no layout-API equivalent)
             cos_vec_idx = tid % vecs_per_half
             cos_coord = (pos_val, fx.Int32(cos_vec_idx))
             cos_dw = _layout_to_dword_off(cos_coord, cos_sin_layout, elem_bytes)
 
-            # -- Paired-half load + NeoX rotation --
+            # Paired-half (non-affine access — no layout-API equivalent)
             is_first_half = arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_half))
             pair_tid = arith.select(is_first_half, tid + vecs_per_half, tid - vecs_per_half)
             pair_coord = (pid_t, fx.Int32(pid_hq), pair_tid)
             pair_dw = _layout_to_dword_off(pair_coord, q_layout, elem_bytes)
-            rot_i32 = _apply_neox_rope(
-                q_rsrc, q_dw, cos_rsrc, sin_rsrc, cos_dw,
-                q_rsrc, pair_dw, is_first_half,
-                vec_dwords, vec_type_e, i32_vec_ty,
+
+            # RoPE rotation (q_e pre-loaded via layout API — Step 6)
+            rot_e = _apply_neox_rope(
+                q_e, cos_rsrc, sin_rsrc, cos_dw,
+                q_pair_rsrc, pair_dw, is_first_half,
+                vec_dwords, vec_type_e,
             )
-            buffer_ops.buffer_store(rot_i32, qo_rsrc, q_dw)
+
+            # Store rotated Q via layout API (register → global — Step 4)
+            dst_Qo = thr_copy.partition_D(gQo_2d)
+            frag_Qo = fx.make_fragment_like(dst_Qo)
+            fx.memref_store_vec(rot_e, frag_Qo)
+            fx.copy(copy_atom, frag_Qo, dst_Qo)
 
     # ----- Kernel 2: K RoPE + KV cache write -----
     # Grid: (T * KH, 1, 1), one program per (token, kv_head)
@@ -258,61 +272,103 @@ def build_fused_rope_cache_module(
         vec_type_e = T.vec(VEC_WIDTH, elem_type)
         i32_vec_ty = T.vec(vec_dwords, T.i32)
 
-        # Buffer resources at top level
-        k_rsrc = buffer_ops.create_buffer_resource(K, max_size=True)
-        v_rsrc = buffer_ops.create_buffer_resource(V, max_size=True)
+        # --- Buffer resources (before make_buffer_tensor) ---
+        # Pair load (non-affine)
+        k_pair_rsrc = buffer_ops.create_buffer_resource(K, max_size=True)
+        # Scalar / runtime-indexed
         pos_rsrc = buffer_ops.create_buffer_resource(Positions, max_size=True)
         cos_rsrc = buffer_ops.create_buffer_resource(CosCache, max_size=True)
         sin_rsrc = buffer_ops.create_buffer_resource(SinCache, max_size=True)
         slot_rsrc = buffer_ops.create_buffer_resource(SlotMapping, max_size=True)
+        # KV cache (runtime slot index)
         kc_rsrc = buffer_ops.create_buffer_resource(KeyCache, max_size=True)
         vc_rsrc = buffer_ops.create_buffer_resource(ValueCache, max_size=True)
-        ko_rsrc = buffer_ops.create_buffer_resource(K_out, max_size=True)
 
-        # Layouts (materialized inside kernel where MLIR context is active)
+        # --- Buffer tensors for layout API (Step 1) ---
+        K = fx.rocdl.make_buffer_tensor(K)
+        V = fx.rocdl.make_buffer_tensor(V)
+        K_out = fx.rocdl.make_buffer_tensor(K_out)
+
+        # --- Tile selection via flat_divide (3D tile — Step 3) ---
+        tile_3d = fx.make_tile(1, 1, head_dim)
+        gK = fx.flat_divide(K, tile_3d)
+        gV = fx.flat_divide(V, tile_3d)
+        gKo = fx.flat_divide(K_out, tile_3d)
+
+        # --- Layouts for manual-path offsets (pair, cos/sin, KV cache) ---
         kv_layout = fx.make_layout(_kv_shape, _kv_stride)
         cos_sin_layout = fx.make_layout(_cos_shape, _cos_stride)
+
+        # --- Tiled copy setup (before guard — Step 9) ---
+        copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_type)
+        thr_layout = fx.make_layout((1, vecs_per_head), (1, 1))
+        val_layout = fx.make_layout((VEC_WIDTH, 1), (1, 1))
+        layout_tv = fx.raked_product(thr_layout, val_layout)
+        tile_copy = fx.make_tile(VEC_WIDTH, vecs_per_head)
+        tiled_copy = fx.make_tiled_copy(copy_atom, layout_tv, tile_copy)
+        thr_copy = tiled_copy.get_slice(tid)
 
         if arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_head)):
             pid_t = bid_x // num_kv_heads
             pid_hk = bid_x % num_kv_heads
 
-            # Load position
+            # --- Select program tiles and reshape to 2D ---
+            gK_1d = gK[0, pid_t, 0, pid_hk, None, 0]
+            gK_2d = fx.logical_divide(gK_1d, fx.make_layout(VEC_WIDTH, 1))
+            gV_1d = gV[0, pid_t, 0, pid_hk, None, 0]
+            gV_2d = fx.logical_divide(gV_1d, fx.make_layout(VEC_WIDTH, 1))
+            gKo_1d = gKo[0, pid_t, 0, pid_hk, None, 0]
+            gKo_2d = fx.logical_divide(gKo_1d, fx.make_layout(VEC_WIDTH, 1))
+
+            # --- Load K via layout API (global → register) ---
+            src_K = thr_copy.partition_S(gK_2d)
+            frag_K = fx.make_fragment_like(src_K)
+            fx.copy(copy_atom, src_K, frag_K)
+            k_e = fx.memref_load_vec(frag_K)
+
+            # --- Position (scalar, runtime) ---
             pos_val = buffer_ops.buffer_load(pos_rsrc, pid_t, vec_width=1, dtype=T.i32)
 
-            # -- K/V address via crd2idx --
-            kv_coord = (pid_t, fx.Int32(pid_hk), tid)
-            k_dw = _layout_to_dword_off(kv_coord, kv_layout, elem_bytes)
-
-            # -- cos/sin address via crd2idx --
-            # tid % vecs_per_half wraps second-half threads [vecs_per_half, vecs_per_head)
-            # back to [0, vecs_per_half): NeoX uses the same cos/sin for both halves;
-            # only the sign of the sin term differs (handled by is_first_half select below).
+            # --- cos/sin address (runtime pos_val index) ---
             cos_vec_idx = tid % vecs_per_half
             cos_coord = (pos_val, fx.Int32(cos_vec_idx))
             cos_dw = _layout_to_dword_off(cos_coord, cos_sin_layout, elem_bytes)
 
-            # -- Paired-half load + NeoX rotation --
+            # --- Paired-half (non-affine) ---
             is_first_half = arith.cmpi(arith.CmpIPredicate.ult, tid, fx.Int32(vecs_per_half))
             pair_tid = arith.select(is_first_half, tid + vecs_per_half, tid - vecs_per_half)
             pair_coord = (pid_t, fx.Int32(pid_hk), pair_tid)
             pair_dw = _layout_to_dword_off(pair_coord, kv_layout, elem_bytes)
-            k_rot_i32 = _apply_neox_rope(
-                k_rsrc, k_dw, cos_rsrc, sin_rsrc, cos_dw,
-                k_rsrc, pair_dw, is_first_half,
-                vec_dwords, vec_type_e, i32_vec_ty,
-            )
-            buffer_ops.buffer_store(k_rot_i32, ko_rsrc, k_dw)
 
-            # --- KV Cache write ---
+            # --- K RoPE rotation ---
+            k_rot_e = _apply_neox_rope(
+                k_e, cos_rsrc, sin_rsrc, cos_dw,
+                k_pair_rsrc, pair_dw, is_first_half,
+                vec_dwords, vec_type_e,
+            )
+
+            # --- Store rotated K via layout API (register → global) ---
+            dst_Ko = thr_copy.partition_D(gKo_2d)
+            frag_Ko = fx.make_fragment_like(dst_Ko)
+            fx.memref_store_vec(k_rot_e, frag_Ko)
+            fx.copy(copy_atom, frag_Ko, dst_Ko)
+
+            # --- KV Cache write (runtime slot index — stays manual, Step 8) ---
             slot_val = buffer_ops.buffer_load(slot_rsrc, pid_t, vec_width=1, dtype=T.i32)
 
             if arith.cmpi(arith.CmpIPredicate.sge, slot_val, fx.Int32(0)):
                 pid_t_slot = ArithValue(slot_val) // block_size
                 pid_b = ArithValue(slot_val) % block_size
 
-                # Load V for cache write (same offset as K)
-                v_raw = buffer_ops.buffer_load(v_rsrc, k_dw, vec_width=vec_dwords, dtype=T.i32)
+                # Load V via layout API (global → register)
+                src_V = thr_copy.partition_S(gV_2d)
+                frag_V = fx.make_fragment_like(src_V)
+                fx.copy(copy_atom, src_V, frag_V)
+                v_e = fx.memref_load_vec(frag_V)
+                v_raw = vector.bitcast(i32_vec_ty, v_e)
+
+                # K rotated as i32 for KV cache buffer_store
+                k_rot_i32 = vector.bitcast(i32_vec_ty, k_rot_e)
 
                 if flash_layout:
                     # -- Flash KV cache: [num_blocks, BS, KH, D] via crd2idx --
@@ -352,8 +408,6 @@ def build_fused_rope_cache_module(
                     # Scalar stores required: stride-1 dim is block_size (not D), so
                     # consecutive elements along D are block_size apart in memory —
                     # a vector store would scatter across non-contiguous addresses.
-                    v_e = vector.bitcast(vec_type_e, v_raw)
-
                     vc_nf_layout = fx.make_layout(
                         (None, num_kv_heads, head_dim, block_size),
                         (num_kv_heads * head_dim * block_size,
