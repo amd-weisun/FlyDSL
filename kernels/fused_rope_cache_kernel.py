@@ -189,10 +189,12 @@ def build_fused_rope_cache_module(
         Q = fx.rocdl.make_buffer_tensor(Q)
         Q_out = fx.rocdl.make_buffer_tensor(Q_out)
 
-        # --- Tile selection via flat_divide (3D tile on 3D tensor — Step 3) ---
-        tile_3d = fx.make_tile(1, 1, head_dim)
-        gQ = fx.flat_divide(Q, tile_3d)
-        gQo = fx.flat_divide(Q_out, tile_3d)
+        # Coalesce [T,QH,D]:(QH*D,D,1) → 1D [T*QH*D]:1 (all modes are contiguous)
+        # flat_divide on 1D with 1D tile → 2-mode (head_dim, T*QH); each program
+        # selects its [head_dim] tile via bid_x directly — matches example-04 pattern.
+        tile_1d = fx.make_tile(head_dim)
+        gQ = fx.flat_divide(fx.coalesce(Q), tile_1d)
+        gQo = fx.flat_divide(fx.coalesce(Q_out), tile_1d)
 
         # --- Layouts for manual-path offsets (pair, cos/sin) ---
         q_layout = fx.make_layout(_q_shape, _q_stride)
@@ -211,12 +213,9 @@ def build_fused_rope_cache_module(
             pid_t = bid_x // num_q_heads
             pid_hq = bid_x % num_q_heads
 
-            # Select this program's tile [head_dim] → reshape to 2D for tiled copy
-            # flat_divide mode order: (inner_T, inner_QH, inner_D, outer_T, outer_QH, outer_D)
-            gQ_1d = gQ[0, 0, None, pid_t, pid_hq, 0]
-            gQ_2d = fx.logical_divide(gQ_1d, fx.make_layout(VEC_WIDTH, 1))
-            gQo_1d = gQo[0, 0, None, pid_t, pid_hq, 0]
-            gQo_2d = fx.logical_divide(gQo_1d, fx.make_layout(VEC_WIDTH, 1))
+            # gQ modes: (head_dim, T*QH); bid_x = pid_t*QH + pid_hq selects the tile.
+            gQ_2d = fx.logical_divide(gQ[None, bid_x], fx.make_layout(VEC_WIDTH, 1))
+            gQo_2d = fx.logical_divide(gQo[None, bid_x], fx.make_layout(VEC_WIDTH, 1))
 
             # Load Q via layout API (global → register — Step 4)
             src_Q = thr_copy.partition_S(gQ_2d)
@@ -290,11 +289,11 @@ def build_fused_rope_cache_module(
         V = fx.rocdl.make_buffer_tensor(V)
         K_out = fx.rocdl.make_buffer_tensor(K_out)
 
-        # --- Tile selection via flat_divide (3D tile — Step 3) ---
-        tile_3d = fx.make_tile(1, 1, head_dim)
-        gK = fx.flat_divide(K, tile_3d)
-        gV = fx.flat_divide(V, tile_3d)
-        gKo = fx.flat_divide(K_out, tile_3d)
+        # Coalesce [T,KH,D]:(KH*D,D,1) → 1D; flat_divide → (head_dim, T*KH)
+        tile_1d = fx.make_tile(head_dim)
+        gK = fx.flat_divide(fx.coalesce(K), tile_1d)
+        gV = fx.flat_divide(fx.coalesce(V), tile_1d)
+        gKo = fx.flat_divide(fx.coalesce(K_out), tile_1d)
 
         # --- Layouts for manual-path offsets (pair, cos/sin, KV cache) ---
         kv_layout = fx.make_layout(_kv_shape, _kv_stride)
@@ -313,14 +312,10 @@ def build_fused_rope_cache_module(
             pid_t = bid_x // num_kv_heads
             pid_hk = bid_x % num_kv_heads
 
-            # --- Select program tiles and reshape to 2D ---
-            # flat_divide mode order: (inner_T, inner_KH, inner_D, outer_T, outer_KH, outer_D)
-            gK_1d = gK[0, 0, None, pid_t, pid_hk, 0]
-            gK_2d = fx.logical_divide(gK_1d, fx.make_layout(VEC_WIDTH, 1))
-            gV_1d = gV[0, 0, None, pid_t, pid_hk, 0]
-            gV_2d = fx.logical_divide(gV_1d, fx.make_layout(VEC_WIDTH, 1))
-            gKo_1d = gKo[0, 0, None, pid_t, pid_hk, 0]
-            gKo_2d = fx.logical_divide(gKo_1d, fx.make_layout(VEC_WIDTH, 1))
+            # gK/gV/gKo modes: (head_dim, T*KH); bid_x selects the program's tile.
+            gK_2d = fx.logical_divide(gK[None, bid_x], fx.make_layout(VEC_WIDTH, 1))
+            gV_2d = fx.logical_divide(gV[None, bid_x], fx.make_layout(VEC_WIDTH, 1))
+            gKo_2d = fx.logical_divide(gKo[None, bid_x], fx.make_layout(VEC_WIDTH, 1))
 
             # --- Load K via layout API (global → register) ---
             src_K = thr_copy.partition_S(gK_2d)
