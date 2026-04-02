@@ -50,7 +50,7 @@ def _layout_to_dword_off(coord, layout, elem_bytes):
 def _reshape_to_head_tiles(tensor, head_dim):
     """View ``tensor`` as [head_dim, num_tiles] assuming contiguous storage."""
     tile_layout = fx.make_layout((head_dim, None), (1, head_dim))
-    return fx.make_view(fx.get_iter(tensor), tile_layout)
+    return fx.Tensor(fx.make_view(fx.get_iter(tensor), tile_layout))
 
 
 def _apply_neox_rope(qk_e, cos_rsrc, sin_rsrc, cos_dw,
