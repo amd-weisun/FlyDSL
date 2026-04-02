@@ -47,14 +47,10 @@ def _layout_to_dword_off(coord, layout, elem_bytes):
     return (ArithValue(elem_off) * elem_bytes) >> fx.Int32(2)
 
 
-def _make_contiguous_1d_view(tensor):
-    """Return a 1-D contiguous view of ``tensor`` for flat_divide usage.
-
-    We rely on the underlying tensor being fully contiguous so that remapping
-    to a stride-1 vector view (equivalent to fx.coalesce) is layout-safe.
-    """
-    flat_layout = fx.make_layout((None,), (1,))
-    return fx.make_view(fx.get_iter(tensor), flat_layout)
+def _reshape_to_head_tiles(tensor, head_dim):
+    """View ``tensor`` as [head_dim, num_tiles] assuming contiguous storage."""
+    tile_layout = fx.make_layout((head_dim, None), (1, head_dim))
+    return fx.make_view(fx.get_iter(tensor), tile_layout)
 
 
 def _apply_neox_rope(qk_e, cos_rsrc, sin_rsrc, cos_dw,
@@ -199,15 +195,9 @@ def build_fused_rope_cache_module(
         Q = fx.rocdl.make_buffer_tensor(Q)
         Q_out = fx.rocdl.make_buffer_tensor(Q_out)
 
-        # Remap [T,QH,D] contiguous layout to a 1D stride-1 view before tiling
-        # (mimics fx.coalesce while avoiding runtime pattern kwargs).
-        q_linear = _make_contiguous_1d_view(Q)
-        qo_linear = _make_contiguous_1d_view(Q_out)
-
-        # logical_divide produces (head_dim, tile_index) so we can slice the
-        # current program via bid_x, matching the vectorAdd reference pattern.
-        q_tiles = fx.logical_divide(q_linear, fx.make_layout(head_dim, 1))
-        qo_tiles = fx.logical_divide(qo_linear, fx.make_layout(head_dim, 1))
+        # View [T,QH,D] as [num_tiles, head_dim] (num_tiles dynamic = T*QH).
+        q_tiles = _reshape_to_head_tiles(Q, head_dim)
+        qo_tiles = _reshape_to_head_tiles(Q_out, head_dim)
 
         # --- Layouts for manual-path offsets (pair, cos/sin) ---
         q_layout = fx.make_layout(_q_shape, _q_stride)
@@ -226,7 +216,7 @@ def build_fused_rope_cache_module(
             pid_t = bid_x // num_q_heads
             pid_hq = bid_x % num_q_heads
 
-            # gQ modes: (head_dim, num_tiles); bid_x selects the tile slice for this program.
+            # Select this program's head_dim slice and partition for vector copy.
             gQ_tile = fx.slice(q_tiles, (None, bid_x))
             gQo_tile = fx.slice(qo_tiles, (None, bid_x))
             gQ_2d = fx.logical_divide(gQ_tile, fx.make_layout(VEC_WIDTH, 1))
@@ -304,14 +294,10 @@ def build_fused_rope_cache_module(
         V = fx.rocdl.make_buffer_tensor(V)
         K_out = fx.rocdl.make_buffer_tensor(K_out)
 
-        # Remap [T,KH,D] to a 1D contiguous view prior to tiling (fx.coalesce analog).
-        k_linear = _make_contiguous_1d_view(K)
-        v_linear = _make_contiguous_1d_view(V)
-        ko_linear = _make_contiguous_1d_view(K_out)
-
-        k_tiles = fx.logical_divide(k_linear, fx.make_layout(head_dim, 1))
-        v_tiles = fx.logical_divide(v_linear, fx.make_layout(head_dim, 1))
-        ko_tiles = fx.logical_divide(ko_linear, fx.make_layout(head_dim, 1))
+        # View [T,KH,D] as [num_tiles, head_dim] for layout-friendly slicing.
+        k_tiles = _reshape_to_head_tiles(K, head_dim)
+        v_tiles = _reshape_to_head_tiles(V, head_dim)
+        ko_tiles = _reshape_to_head_tiles(K_out, head_dim)
 
         # --- Layouts for manual-path offsets (pair, cos/sin, KV cache) ---
         kv_layout = fx.make_layout(_kv_shape, _kv_stride)
