@@ -47,12 +47,12 @@ def _layout_to_dword_off(coord, layout, elem_bytes):
     return (ArithValue(elem_off) * elem_bytes) >> fx.Int32(2)
 
 
-def _linearize_buffer_tensor(tensor):
-    """Return a 1-D contiguous buffer tensor view of ``tensor``."""
-    flat_layout = fx.make_layout((None,), (1,))
-    flat_view = fx.make_view(fx.get_iter(tensor), flat_layout)
-    flat_tensor = fx.Tensor(flat_view)
-    return fx.rocdl.make_buffer_tensor(flat_tensor)
+def _coalesced_buffer_tensor(tensor):
+    """Return a buffer tensor view using the coalesced layout of ``tensor``."""
+    layout = fx.coalesce(fx.get_layout(tensor))
+    coalesced_view = fx.make_view(fx.get_iter(tensor), layout)
+    coalesced_tensor = fx.Tensor(coalesced_view)
+    return fx.rocdl.make_buffer_tensor(coalesced_tensor)
 
 
 def _apply_neox_rope(qk_e, cos_rsrc, sin_rsrc, cos_dw,
@@ -197,13 +197,8 @@ def build_fused_rope_cache_module(
         Q = fx.rocdl.make_buffer_tensor(Q)
         Q_out = fx.rocdl.make_buffer_tensor(Q_out)
 
-        # View [T,QH,D] as [num_tiles, head_dim] (num_tiles dynamic = T*QH).
-        q_linear = _linearize_buffer_tensor(Q)
-        qo_linear = _linearize_buffer_tensor(Q_out)
-
-        tile_1d = fx.make_tile(head_dim)
-        gQ = fx.flat_divide(q_linear, tile_1d)
-        gQo = fx.flat_divide(qo_linear, tile_1d)
+        q_tiles = fx.logical_divide(_coalesced_buffer_tensor(Q), fx.make_layout(head_dim, 1))
+        qo_tiles = fx.logical_divide(_coalesced_buffer_tensor(Q_out), fx.make_layout(head_dim, 1))
 
         # --- Layouts for manual-path offsets (pair, cos/sin) ---
         q_layout = fx.make_layout(_q_shape, _q_stride)
@@ -223,8 +218,8 @@ def build_fused_rope_cache_module(
             pid_hq = bid_x % num_q_heads
 
             # Select this program's head_dim slice and partition for vector copy.
-            gQ_2d = fx.logical_divide(gQ[None, bid_x], fx.make_layout(VEC_WIDTH, 1))
-            gQo_2d = fx.logical_divide(gQo[None, bid_x], fx.make_layout(VEC_WIDTH, 1))
+            gQ_2d = fx.logical_divide(fx.slice(q_tiles, (None, bid_x)), fx.make_layout(VEC_WIDTH, 1))
+            gQo_2d = fx.logical_divide(fx.slice(qo_tiles, (None, bid_x)), fx.make_layout(VEC_WIDTH, 1))
 
             # Load Q via layout API (global → register — Step 4)
             src_Q = thr_copy.partition_S(gQ_2d)
@@ -299,13 +294,9 @@ def build_fused_rope_cache_module(
         K_out = fx.rocdl.make_buffer_tensor(K_out)
 
         # View [T,KH,D] as [num_tiles, head_dim] for layout-friendly slicing.
-        k_linear = _linearize_buffer_tensor(K)
-        v_linear = _linearize_buffer_tensor(V)
-        ko_linear = _linearize_buffer_tensor(K_out)
-
-        gK = fx.flat_divide(k_linear, tile_1d)
-        gV = fx.flat_divide(v_linear, tile_1d)
-        gKo = fx.flat_divide(ko_linear, tile_1d)
+        k_tiles = fx.logical_divide(_coalesced_buffer_tensor(K), fx.make_layout(head_dim, 1))
+        v_tiles = fx.logical_divide(_coalesced_buffer_tensor(V), fx.make_layout(head_dim, 1))
+        ko_tiles = fx.logical_divide(_coalesced_buffer_tensor(K_out), fx.make_layout(head_dim, 1))
 
         # --- Layouts for manual-path offsets (pair, cos/sin, KV cache) ---
         kv_layout = fx.make_layout(_kv_shape, _kv_stride)
@@ -325,9 +316,9 @@ def build_fused_rope_cache_module(
             pid_hk = bid_x % num_kv_heads
 
             # gK/gV/gKo tiles: bid_x selects the program's slice.
-            gK_2d = fx.logical_divide(gK[None, bid_x], fx.make_layout(VEC_WIDTH, 1))
-            gV_2d = fx.logical_divide(gV[None, bid_x], fx.make_layout(VEC_WIDTH, 1))
-            gKo_2d = fx.logical_divide(gKo[None, bid_x], fx.make_layout(VEC_WIDTH, 1))
+            gK_2d = fx.logical_divide(fx.slice(k_tiles, (None, bid_x)), fx.make_layout(VEC_WIDTH, 1))
+            gV_2d = fx.logical_divide(fx.slice(v_tiles, (None, bid_x)), fx.make_layout(VEC_WIDTH, 1))
+            gKo_2d = fx.logical_divide(fx.slice(ko_tiles, (None, bid_x)), fx.make_layout(VEC_WIDTH, 1))
 
             # --- Load K via layout API (global → register) ---
             src_K = thr_copy.partition_S(gK_2d)
