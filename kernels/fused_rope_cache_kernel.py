@@ -47,12 +47,11 @@ def _layout_to_dword_off(coord, layout, elem_bytes):
     return (ArithValue(elem_off) * elem_bytes) >> fx.Int32(2)
 
 
-def _coalesced_buffer_tensor(tensor):
-    """Return a buffer tensor view using the coalesced layout of ``tensor``."""
-    layout = fx.coalesce(fx.get_layout(tensor))
-    coalesced_view = fx.make_view(fx.get_iter(tensor), layout)
-    coalesced_tensor = fx.Tensor(coalesced_view)
-    return fx.rocdl.make_buffer_tensor(coalesced_tensor)
+def _head_tile_tensor(tensor, head_dim):
+    """View ``tensor`` as [num_tiles, head_dim] with contiguous head slices."""
+    tile_layout = fx.make_layout((None, head_dim), (head_dim, 1))
+    tile_view = fx.make_view(fx.get_iter(tensor), tile_layout)
+    return fx.Tensor(tile_view)
 
 
 def _apply_neox_rope(qk_e, cos_rsrc, sin_rsrc, cos_dw,
@@ -197,8 +196,8 @@ def build_fused_rope_cache_module(
         Q = fx.rocdl.make_buffer_tensor(Q)
         Q_out = fx.rocdl.make_buffer_tensor(Q_out)
 
-        q_tiles = fx.logical_divide(_coalesced_buffer_tensor(Q), fx.make_layout(head_dim, 1))
-        qo_tiles = fx.logical_divide(_coalesced_buffer_tensor(Q_out), fx.make_layout(head_dim, 1))
+        q_tiles = fx.logical_divide(_head_tile_tensor(Q, head_dim), fx.make_layout(head_dim, 1))
+        qo_tiles = fx.logical_divide(_head_tile_tensor(Q_out, head_dim), fx.make_layout(head_dim, 1))
 
         # --- Layouts for manual-path offsets (pair, cos/sin) ---
         q_layout = fx.make_layout(_q_shape, _q_stride)
@@ -294,9 +293,9 @@ def build_fused_rope_cache_module(
         K_out = fx.rocdl.make_buffer_tensor(K_out)
 
         # View [T,KH,D] as [num_tiles, head_dim] for layout-friendly slicing.
-        k_tiles = fx.logical_divide(_coalesced_buffer_tensor(K), fx.make_layout(head_dim, 1))
-        v_tiles = fx.logical_divide(_coalesced_buffer_tensor(V), fx.make_layout(head_dim, 1))
-        ko_tiles = fx.logical_divide(_coalesced_buffer_tensor(K_out), fx.make_layout(head_dim, 1))
+        k_tiles = fx.logical_divide(_head_tile_tensor(K, head_dim), fx.make_layout(head_dim, 1))
+        v_tiles = fx.logical_divide(_head_tile_tensor(V, head_dim), fx.make_layout(head_dim, 1))
+        ko_tiles = fx.logical_divide(_head_tile_tensor(K_out, head_dim), fx.make_layout(head_dim, 1))
 
         # --- Layouts for manual-path offsets (pair, cos/sin, KV cache) ---
         kv_layout = fx.make_layout(_kv_shape, _kv_stride)
