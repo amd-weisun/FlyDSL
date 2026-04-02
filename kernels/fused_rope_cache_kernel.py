@@ -199,16 +199,15 @@ def build_fused_rope_cache_module(
         Q = fx.rocdl.make_buffer_tensor(Q)
         Q_out = fx.rocdl.make_buffer_tensor(Q_out)
 
-        # Remap [T,QH,D] contiguous layout to a 1D stride-1 view before flat_divide
+        # Remap [T,QH,D] contiguous layout to a 1D stride-1 view before tiling
         # (mimics fx.coalesce while avoiding runtime pattern kwargs).
         q_linear = _make_contiguous_1d_view(Q)
         qo_linear = _make_contiguous_1d_view(Q_out)
 
-        # flat_divide on 1D with 1D tile → 2-mode (head_dim, T*QH); each program
-        # selects its [head_dim] tile via bid_x directly — matches example-04 pattern.
-        tile_1d = fx.make_tile(head_dim)
-        gQ = fx.flat_divide(q_linear, tile_1d)
-        gQo = fx.flat_divide(qo_linear, tile_1d)
+        # logical_divide produces (head_dim, tile_index) so we can slice the
+        # current program via bid_x, matching the vectorAdd reference pattern.
+        q_tiles = fx.logical_divide(q_linear, fx.make_layout(head_dim, 1))
+        qo_tiles = fx.logical_divide(qo_linear, fx.make_layout(head_dim, 1))
 
         # --- Layouts for manual-path offsets (pair, cos/sin) ---
         q_layout = fx.make_layout(_q_shape, _q_stride)
@@ -227,9 +226,11 @@ def build_fused_rope_cache_module(
             pid_t = bid_x // num_q_heads
             pid_hq = bid_x % num_q_heads
 
-            # gQ modes: (head_dim, T*QH); bid_x = pid_t*QH + pid_hq selects the tile.
-            gQ_2d = fx.logical_divide(gQ[None, bid_x], fx.make_layout(VEC_WIDTH, 1))
-            gQo_2d = fx.logical_divide(gQo[None, bid_x], fx.make_layout(VEC_WIDTH, 1))
+            # gQ modes: (head_dim, num_tiles); bid_x selects the tile slice for this program.
+            gQ_tile = fx.slice(q_tiles, (None, bid_x))
+            gQo_tile = fx.slice(qo_tiles, (None, bid_x))
+            gQ_2d = fx.logical_divide(gQ_tile, fx.make_layout(VEC_WIDTH, 1))
+            gQo_2d = fx.logical_divide(gQo_tile, fx.make_layout(VEC_WIDTH, 1))
 
             # Load Q via layout API (global → register — Step 4)
             src_Q = thr_copy.partition_S(gQ_2d)
@@ -303,16 +304,14 @@ def build_fused_rope_cache_module(
         V = fx.rocdl.make_buffer_tensor(V)
         K_out = fx.rocdl.make_buffer_tensor(K_out)
 
-        # Remap [T,KH,D] to a 1D contiguous view prior to flat_divide (fx.coalesce analog).
+        # Remap [T,KH,D] to a 1D contiguous view prior to tiling (fx.coalesce analog).
         k_linear = _make_contiguous_1d_view(K)
         v_linear = _make_contiguous_1d_view(V)
         ko_linear = _make_contiguous_1d_view(K_out)
 
-        # flat_divide → (head_dim, T*KH)
-        tile_1d = fx.make_tile(head_dim)
-        gK = fx.flat_divide(k_linear, tile_1d)
-        gV = fx.flat_divide(v_linear, tile_1d)
-        gKo = fx.flat_divide(ko_linear, tile_1d)
+        k_tiles = fx.logical_divide(k_linear, fx.make_layout(head_dim, 1))
+        v_tiles = fx.logical_divide(v_linear, fx.make_layout(head_dim, 1))
+        ko_tiles = fx.logical_divide(ko_linear, fx.make_layout(head_dim, 1))
 
         # --- Layouts for manual-path offsets (pair, cos/sin, KV cache) ---
         kv_layout = fx.make_layout(_kv_shape, _kv_stride)
@@ -331,10 +330,13 @@ def build_fused_rope_cache_module(
             pid_t = bid_x // num_kv_heads
             pid_hk = bid_x % num_kv_heads
 
-            # gK/gV/gKo modes: (head_dim, T*KH); bid_x selects the program's tile.
-            gK_2d = fx.logical_divide(gK[None, bid_x], fx.make_layout(VEC_WIDTH, 1))
-            gV_2d = fx.logical_divide(gV[None, bid_x], fx.make_layout(VEC_WIDTH, 1))
-            gKo_2d = fx.logical_divide(gKo[None, bid_x], fx.make_layout(VEC_WIDTH, 1))
+            # gK/gV/gKo tiles: bid_x selects the program's slice.
+            gK_tile = fx.slice(k_tiles, (None, bid_x))
+            gV_tile = fx.slice(v_tiles, (None, bid_x))
+            gKo_tile = fx.slice(ko_tiles, (None, bid_x))
+            gK_2d = fx.logical_divide(gK_tile, fx.make_layout(VEC_WIDTH, 1))
+            gV_2d = fx.logical_divide(gV_tile, fx.make_layout(VEC_WIDTH, 1))
+            gKo_2d = fx.logical_divide(gKo_tile, fx.make_layout(VEC_WIDTH, 1))
 
             # --- Load K via layout API (global → register) ---
             src_K = thr_copy.partition_S(gK_2d)
