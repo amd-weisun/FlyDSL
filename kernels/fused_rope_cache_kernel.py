@@ -47,10 +47,11 @@ def _layout_to_dword_off(coord, layout, elem_bytes):
     return (ArithValue(elem_off) * elem_bytes) >> fx.Int32(2)
 
 
-def _coalesce_to_1d_buffer(tensor):
-    """Return a buffer tensor with a contiguous 1-D view of ``tensor``."""
+def _linearize_buffer_tensor(tensor):
+    """Return a 1-D contiguous buffer tensor view of ``tensor``."""
     flat_layout = fx.make_layout((None,), (1,))
-    flat_tensor = fx.Tensor(fx.make_view(fx.get_iter(tensor), flat_layout))
+    flat_view = fx.make_view(fx.get_iter(tensor), flat_layout)
+    flat_tensor = fx.Tensor(flat_view)
     return fx.rocdl.make_buffer_tensor(flat_tensor)
 
 
@@ -197,8 +198,8 @@ def build_fused_rope_cache_module(
         Q_out = fx.rocdl.make_buffer_tensor(Q_out)
 
         # View [T,QH,D] as [num_tiles, head_dim] (num_tiles dynamic = T*QH).
-        q_linear = _coalesce_to_1d_buffer(Q)
-        qo_linear = _coalesce_to_1d_buffer(Q_out)
+        q_linear = _linearize_buffer_tensor(Q)
+        qo_linear = _linearize_buffer_tensor(Q_out)
 
         tile_1d = fx.make_tile(head_dim)
         gQ = fx.flat_divide(q_linear, tile_1d)
@@ -298,9 +299,9 @@ def build_fused_rope_cache_module(
         K_out = fx.rocdl.make_buffer_tensor(K_out)
 
         # View [T,KH,D] as [num_tiles, head_dim] for layout-friendly slicing.
-        k_linear = _coalesce_to_1d_buffer(K)
-        v_linear = _coalesce_to_1d_buffer(V)
-        ko_linear = _coalesce_to_1d_buffer(K_out)
+        k_linear = _linearize_buffer_tensor(K)
+        v_linear = _linearize_buffer_tensor(V)
+        ko_linear = _linearize_buffer_tensor(K_out)
 
         gK = fx.flat_divide(k_linear, tile_1d)
         gV = fx.flat_divide(v_linear, tile_1d)
