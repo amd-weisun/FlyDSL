@@ -42,7 +42,6 @@ import flydsl.expr as fx
 from flydsl.expr import arith, vector, buffer_ops, range_constexpr
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
-from flydsl._mlir import ir
 from kernels.kernels_common import get_warp_size
 
 
@@ -162,27 +161,27 @@ def build_fused_rope_cache_module(
         def ds_bpermute_pair(vec_val, pair_byte_addr):
             """Return the copy of vec_val held by the rotary-pair thread, via ds_bpermute."""
             if VEC_WIDTH == 1:
-                # vector<1xf16/bf16> (16-bit) → vector<1xi16> → scalar i16 → zero-extend i32
-                v1i16 = vector.bitcast(ir.VectorType.get([1], T.i16), vec_val)
-                i16_val = vector.extract(v1i16, static_position=[0], dynamic_position=[])
+                # vector<1xf16/bf16> → extract scalar → bitcast to i16 → zero-extend i32
+                elem_val = vector.extract(vec_val, static_position=[0], dynamic_position=[])
+                i16_val = ArithValue(elem_val).bitcast(T.i16)
                 i32_val = ArithValue(i16_val).extui(T.i32)
                 # Cross-lane shuffle: get pair thread's 32-bit VGPR (pair elem in low 16 bits)
                 peer_i32 = fx.rocdl.ds_bpermute(T.i32, pair_byte_addr, i32_val)
                 # Truncate back to i16, bitcast to elem_type, reconstruct vector<1xelem_type>
                 peer_i16 = ArithValue(peer_i32).trunci(T.i16)
                 peer_elem = ArithValue(peer_i16).bitcast(elem_type)
-                return vector.from_elements(ir.VectorType.get([1], elem_type), [peer_elem])
+                return vector.from_elements(T.vec(1, elem_type), [peer_elem])
             else:
                 # VEC_WIDTH>=2: VEC_WIDTH bf16/f16 elements → n_i32 x i32, one ds_bpermute per chunk.
                 # VEC_WIDTH=2 → n_i32=1 (32 bits); VEC_WIDTH=4 → n_i32=2 (64 bits), etc.
                 n_i32 = VEC_WIDTH // 2
-                v_i32 = vector.bitcast(ir.VectorType.get([n_i32], T.i32), vec_val)
+                v_i32 = vector.bitcast(T.vec(n_i32, T.i32), vec_val)
                 peer_chunks = []
                 for ci in range_constexpr(n_i32):
                     chunk = vector.extract(v_i32, static_position=[ci], dynamic_position=[])
                     peer_chunks.append(fx.rocdl.ds_bpermute(T.i32, pair_byte_addr, chunk))
-                peer_v_i32 = vector.from_elements(ir.VectorType.get([n_i32], T.i32), peer_chunks)
-                return vector.bitcast(ir.VectorType.get([VEC_WIDTH], elem_type), peer_v_i32)
+                peer_v_i32 = vector.from_elements(T.vec(n_i32, T.i32), peer_chunks)
+                return vector.bitcast(T.vec(VEC_WIDTH, elem_type), peer_v_i32)
 
         if tid < fx.Int32(vecs_per_head):
             # --- Load position (scalar i32) ---
