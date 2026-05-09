@@ -288,7 +288,7 @@ def make_tensor_descriptor_2d(
     # -- Global address (byte address for descriptor) --
     glb_ptr_type = ir.Type.parse("!llvm.ptr<1>")
     i64 = ir.IntegerType.get_signless(64)
-    a_raw = global_ptr.__fly_values__()[0]
+    a_raw = global_ptr.__extract_to_ir_values__()[0]
     glb_ptr = _fly_d.extract_aligned_pointer_as_index(glb_ptr_type, a_raw)
     glb_base_i64 = _ArithValue(llvm_dialect.ptrtoint(i64, glb_ptr))
     glb_elem_off = (
@@ -646,7 +646,7 @@ def make_tensor_gather_dgroup0(
 
     glb_ptr_type = ir.Type.parse("!llvm.ptr<1>")
     i64 = ir.IntegerType.get_signless(64)
-    a_raw = global_ptr.__fly_values__()[0]
+    a_raw = global_ptr.__extract_to_ir_values__()[0]
     glb_ptr = _fly_d.extract_aligned_pointer_as_index(glb_ptr_type, a_raw)
     glb_base_i64 = _ArithValue(llvm_dialect.ptrtoint(i64, glb_ptr))
     if global_byte_offset is not None:
@@ -1122,7 +1122,7 @@ def l2_prefetch_tile(
     # Get global base address as i64
     glb_ptr_type = ir.Type.parse("!llvm.ptr<1>")
     i64 = ir.IntegerType.get_signless(64)
-    a_raw = global_ptr.__fly_values__()[0]
+    a_raw = global_ptr.__extract_to_ir_values__()[0]
     glb_ptr = _fly_d.extract_aligned_pointer_as_index(glb_ptr_type, a_raw)
     glb_base_i64 = _ArithValue(llvm_dialect.ptrtoint(i64, glb_ptr))
 
