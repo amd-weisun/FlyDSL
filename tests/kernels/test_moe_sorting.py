@@ -312,10 +312,10 @@ def run_test(T, E, topk, unit_size=UNIT_SIZE, max_tokens=None):
     """
     # Let moe_sorting_flydsl auto-select decode/prefill path.
     # max_tokens is only needed for explicit decode-path override.
-    from kernels.moe_sorting_kernel import _compute_sub_tokens
+    from kernels.moe_sorting_kernel import BLOCK_SIZE, _compute_sub_tokens
 
     sub_tokens = _compute_sub_tokens(E)
-    DECODE_MAX_T = 16
+    DECODE_MAX_T = min(sub_tokens, max(16, BLOCK_SIZE // max(topk, E // 8)))
     path = "decode" if T <= min(sub_tokens, DECODE_MAX_T) else "prefill"
 
     if max_tokens is None and path == "decode":
@@ -535,10 +535,10 @@ def test_moe_sorting_prefill_full(T, E, topk):
 
 def run_test_ep(T, E, topk, mask_ratio=0.5, unit_size=UNIT_SIZE):
     """Run MoE sorting test with expert_mask (EP mode)."""
-    from kernels.moe_sorting_kernel import _compute_sub_tokens
+    from kernels.moe_sorting_kernel import BLOCK_SIZE, _compute_sub_tokens
 
     sub_tokens = _compute_sub_tokens(E)
-    DECODE_MAX_T = 16
+    DECODE_MAX_T = min(sub_tokens, max(16, BLOCK_SIZE // max(topk, E // 8)))
     if T <= min(sub_tokens, DECODE_MAX_T):
         path = "decode"
     else:
