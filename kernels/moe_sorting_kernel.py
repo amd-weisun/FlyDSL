@@ -163,6 +163,114 @@ def _extend_local_idx_for_extra_experts(cumsum_mr, mask_rsrc, K4_BLOCK, E, has_m
 
 
 @flyc.jit
+def _p23_scatter_mesh(
+    tid,
+    scatter_mr,
+    ws_rsrc,
+    weights_rsrc,
+    sorted_ids_rsrc,
+    sorted_w_rsrc,
+    mask_rsrc,
+    my_expert,
+    my_start,
+    my_end,
+    i32_mesh_stride,
+    c_topk,
+    K4_BLOCK,
+    has_mask,
+):
+    """P23 Step 4: EP mask check, read uint8 mesh, DPP prefix sum, scatter tokens."""
+    lane = tid % WARP_SIZE
+    wave = tid // WARP_SIZE
+    K4_NUM_WAVES = K4_BLOCK // WARP_SIZE
+    c_zero, c_one, c4 = fx.Int32(0), fx.Int32(1), fx.Int32(4)
+    c_ff, c_oob_idx = fx.Int32(0xFF), fx.Int32(0x7FFFFFFF)
+    p23_bid_enabled = c_one != c_zero
+    if has_mask:
+        p23_bid_mask = buffer_ops.buffer_load(mask_rsrc, my_expert, vec_width=1, dtype=T.i32)
+        p23_bid_enabled = p23_bid_mask != c_zero
+    i32_words_per_row = i32_mesh_stride >> fx.Int32(2)
+    n_mesh_iters = (my_start != my_end).select(
+        (i32_words_per_row + fx.Int32(K4_BLOCK - 1)) // fx.Int32(K4_BLOCK), c_zero
+    )
+    mesh_row_i32_base = (my_expert * i32_mesh_stride) >> fx.Int32(2)
+    for _si, state in range(fx.Index(0), ArithValue(n_mesh_iters).index_cast(T.index), fx.Index(1), init=[my_start]):
+        position = state[0]
+        word_idx = fx.Int32(_si) * fx.Int32(K4_BLOCK) + tid
+        col_valid = p23_bid_enabled & (word_idx < i32_words_per_row)
+        safe_word_idx = col_valid.select(word_idx, c_zero)
+        word = buffer_ops.buffer_load(ws_rsrc, mesh_row_i32_base + safe_word_idx, vec_width=1, dtype=T.i32)
+        x0 = word & c_ff
+        x1 = (word >> fx.Int32(8)) & c_ff
+        x2 = (word >> fx.Int32(16)) & c_ff
+        x3 = (word >> fx.Int32(24)) & c_ff
+        base_col = word_idx * c4
+        h0 = col_valid & (x0 != c_zero)
+        h1 = col_valid & (x1 != c_zero)
+        h2 = col_valid & (x2 != c_zero)
+        h3 = col_valid & (x3 != c_zero)
+        my_cnt = (
+            h0.select(c_one, c_zero) + h1.select(c_one, c_zero) + h2.select(c_one, c_zero) + h3.select(c_one, c_zero)
+        )
+        my_cnt, my_cnt_inclusive = _allwave_inclusive_prefix_sum(
+            my_cnt, lane, wave, scatter_mr, K4_NUM_WAVES, WARP_SIZE
+        )
+        wave_offset = my_cnt_inclusive - my_cnt
+        batch_total = c_zero
+        for _w in range_constexpr(K4_NUM_WAVES):
+            batch_total = batch_total + _lds_load_raw(scatter_mr, fx.Int32(_w))
+        gpu.barrier()
+        my_thread_count = (
+            h0.select(c_one, c_zero) + h1.select(c_one, c_zero) + h2.select(c_one, c_zero) + h3.select(c_one, c_zero)
+        )
+        my_exclusive = my_cnt - my_thread_count + wave_offset
+        scatter_base = position + my_exclusive
+        pid_0 = (h0.select(x0 - c_one, c_zero) << fx.Int32(24)) | base_col
+        pid_1 = (h1.select(x1 - c_one, c_zero) << fx.Int32(24)) | (base_col + c_one)
+        pid_2 = (h2.select(x2 - c_one, c_zero) << fx.Int32(24)) | (base_col + fx.Int32(2))
+        pid_3 = (h3.select(x3 - c_one, c_zero) << fx.Int32(24)) | (base_col + fx.Int32(3))
+        safe_slot_0 = h0.select(scatter_base, c_oob_idx)
+        off1 = scatter_base + h0.select(c_one, c_zero)
+        safe_slot_1 = h1.select(off1, c_oob_idx)
+        off2 = off1 + h1.select(c_one, c_zero)
+        safe_slot_2 = h2.select(off2, c_oob_idx)
+        off3 = off2 + h2.select(c_one, c_zero)
+        safe_slot_3 = h3.select(off3, c_oob_idx)
+        w_val_0 = buffer_ops.buffer_load(
+            weights_rsrc, h0.select(base_col * c_topk + h0.select(x0 - c_one, c_zero), c_zero), vec_width=1, dtype=T.i32
+        )
+        w_val_1 = buffer_ops.buffer_load(
+            weights_rsrc,
+            h1.select((base_col + c_one) * c_topk + h1.select(x1 - c_one, c_zero), c_zero),
+            vec_width=1,
+            dtype=T.i32,
+        )
+        w_val_2 = buffer_ops.buffer_load(
+            weights_rsrc,
+            h2.select((base_col + fx.Int32(2)) * c_topk + h2.select(x2 - c_one, c_zero), c_zero),
+            vec_width=1,
+            dtype=T.i32,
+        )
+        w_val_3 = buffer_ops.buffer_load(
+            weights_rsrc,
+            h3.select((base_col + fx.Int32(3)) * c_topk + h3.select(x3 - c_one, c_zero), c_zero),
+            vec_width=1,
+            dtype=T.i32,
+        )
+        buffer_ops.buffer_store(pid_0, sorted_ids_rsrc, safe_slot_0)
+        buffer_ops.buffer_store(pid_1, sorted_ids_rsrc, safe_slot_1)
+        buffer_ops.buffer_store(pid_2, sorted_ids_rsrc, safe_slot_2)
+        buffer_ops.buffer_store(pid_3, sorted_ids_rsrc, safe_slot_3)
+        buffer_ops.buffer_store(w_val_0, sorted_w_rsrc, safe_slot_0)
+        buffer_ops.buffer_store(w_val_1, sorted_w_rsrc, safe_slot_1)
+        buffer_ops.buffer_store(w_val_2, sorted_w_rsrc, safe_slot_2)
+        buffer_ops.buffer_store(w_val_3, sorted_w_rsrc, safe_slot_3)
+        pos_next = position + batch_total
+        results = yield [pos_next]
+    return results
+
+
+@flyc.jit
 def _fill_sentinel_slots(sorted_ids_rsrc, sorted_w_rsrc, start, count, sentinel, block_size, tid, oob_idx):
     """Cooperative sentinel fill: threads fill [start, start+count) with sentinels."""
     c_zero = fx.Int32(0)
@@ -1188,13 +1296,11 @@ def compile_moe_sorting_prefill(
         wave = tid // WARP_SIZE
         c_zero = fx.Int32(0)
         c_one = fx.Int32(1)
-        c4 = fx.Int32(4)
         c_E = fx.Int32(E)
         c_unit = fx.Int32(unit_size)
         c_topk = fx.Int32(topk)
         c_sentinel = fx.Int32(topk << 24)
         c_oob_idx = fx.Int32(0x7FFFFFFF)
-        c_ff = fx.Int32(0xFF)
 
         # Buffer resources
         ws_rsrc = buffer_ops.create_buffer_resource(workspace, max_size=True)
@@ -1222,8 +1328,7 @@ def compile_moe_sorting_prefill(
 
         # ================ PARALLEL PREFIX-SUM + MESH SCATTER (blocks 0..E-1) ==
         # Each block independently: prefix sum (redundant), scatter for its expert only.
-        _if_sort = scf.IfOp(is_sort_block.ir_value())
-        with _if_then(_if_sort):
+        if is_sort_block:
             my_expert = bid
 
             # Step 1: Load expert counts from workspace -> pad to unit_size -> LDS cumsum
@@ -1320,123 +1425,25 @@ def compile_moe_sorting_prefill(
             sorted_e_rsrc = buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=True)
             blk_start = my_start // c_unit
             blk_end = my_end // c_unit
-            n_blks = blk_end - blk_start
-            n_eid_iters = (n_blks + fx.Int32(K4_BLOCK) - c_one) // fx.Int32(K4_BLOCK)
-            for _eii in range(fx.Index(0), ArithValue(n_eid_iters).index_cast(T.index), fx.Index(1)):
-                blk_idx = blk_start + fx.Int32(_eii) * fx.Int32(K4_BLOCK) + tid
-                buffer_ops.buffer_store(my_local_idx, sorted_e_rsrc, (blk_idx < blk_end).select(blk_idx, c_oob_idx))
+            _write_expert_id_blocks(sorted_e_rsrc, my_local_idx, blk_start, blk_end - blk_start)
 
-            # Step 4: Mesh-based scatter — read uint8 mesh from HBM, extract tokens,
-            # DPP prefix sum over counts, cross-wave LDS reduction, scatter stores.
-            p23_bid_enabled = c_one != c_zero
-            if has_mask:
-                # EP: skip scatter for masked experts (my_start == my_end, but mesh has data)
-                p23_bid_mask = buffer_ops.buffer_load(mask_rsrc, my_expert, vec_width=1, dtype=T.i32)
-                p23_bid_enabled = p23_bid_mask != c_zero
-
-            i32_words_per_row = i32_mesh_stride >> fx.Int32(2)
-            n_mesh_iters_raw = (i32_words_per_row + fx.Int32(K4_BLOCK - 1)) // fx.Int32(K4_BLOCK)
-            has_work = my_start != my_end
-            n_mesh_iters = has_work.select(n_mesh_iters_raw, c_zero)
-            mesh_row_i32_base = (my_expert * i32_mesh_stride) >> fx.Int32(2)
-
-            for _si, state in range(
-                fx.Index(0), ArithValue(n_mesh_iters).index_cast(T.index), fx.Index(1), init=[my_start]
-            ):
-                position = state[0]
-
-                word_idx = fx.Int32(_si) * fx.Int32(K4_BLOCK) + tid
-                col_valid = p23_bid_enabled & (word_idx < i32_words_per_row)
-                safe_word_idx = col_valid.select(word_idx, c_zero)
-                word = buffer_ops.buffer_load(ws_rsrc, mesh_row_i32_base + safe_word_idx, vec_width=1, dtype=T.i32)
-
-                # Extract 4 bytes from the i32 word
-                x0 = word & c_ff
-                x1 = (word >> fx.Int32(8)) & c_ff
-                x2 = (word >> fx.Int32(16)) & c_ff
-                x3 = (word >> fx.Int32(24)) & c_ff
-                base_col = word_idx * c4
-
-                h0 = col_valid & (x0 != c_zero)
-                h1 = col_valid & (x1 != c_zero)
-                h2 = col_valid & (x2 != c_zero)
-                h3 = col_valid & (x3 != c_zero)
-
-                my_cnt = (
-                    h0.select(c_one, c_zero)
-                    + h1.select(c_one, c_zero)
-                    + h2.select(c_one, c_zero)
-                    + h3.select(c_one, c_zero)
-                )
-
-                my_cnt, my_cnt_inclusive = _allwave_inclusive_prefix_sum(
-                    my_cnt, lane, wave, scatter_mr, K4_NUM_WAVES, WARP_SIZE
-                )
-                wave_offset = my_cnt_inclusive - my_cnt
-                batch_total = c_zero
-                for _w in range_constexpr(K4_NUM_WAVES):
-                    batch_total = batch_total + _lds_load_raw(scatter_mr, fx.Int32(_w))
-                gpu.barrier()
-
-                # Convert to exclusive prefix: my_exclusive = my_cnt - my_thread_count
-                my_thread_count = (
-                    h0.select(c_one, c_zero)
-                    + h1.select(c_one, c_zero)
-                    + h2.select(c_one, c_zero)
-                    + h3.select(c_one, c_zero)
-                )
-                my_exclusive = my_cnt - my_thread_count + wave_offset
-
-                # Scatter: compute all addresses, batch-load weights, then batch-store.
-                scatter_base = position + my_exclusive
-
-                # Compute packed IDs and output slots for all 4 tokens
-                token_id_0 = base_col
-                topk_slot_0 = h0.select(x0 - c_one, c_zero)
-                pid_0 = (topk_slot_0 << fx.Int32(24)) | token_id_0
-                safe_slot_0 = h0.select(scatter_base, c_oob_idx)
-
-                off1 = scatter_base + h0.select(c_one, c_zero)
-                token_id_1 = base_col + c_one
-                topk_slot_1 = h1.select(x1 - c_one, c_zero)
-                pid_1 = (topk_slot_1 << fx.Int32(24)) | token_id_1
-                safe_slot_1 = h1.select(off1, c_oob_idx)
-
-                off2 = off1 + h1.select(c_one, c_zero)
-                token_id_2 = base_col + fx.Int32(2)
-                topk_slot_2 = h2.select(x2 - c_one, c_zero)
-                pid_2 = (topk_slot_2 << fx.Int32(24)) | token_id_2
-                safe_slot_2 = h2.select(off2, c_oob_idx)
-
-                off3 = off2 + h2.select(c_one, c_zero)
-                token_id_3 = base_col + fx.Int32(3)
-                topk_slot_3 = h3.select(x3 - c_one, c_zero)
-                pid_3 = (topk_slot_3 << fx.Int32(24)) | token_id_3
-                safe_slot_3 = h3.select(off3, c_oob_idx)
-
-                # Batch-issue all 4 weight loads (increases load-use distance)
-                w_addr_0 = h0.select(token_id_0 * c_topk + topk_slot_0, c_zero)
-                w_addr_1 = h1.select(token_id_1 * c_topk + topk_slot_1, c_zero)
-                w_addr_2 = h2.select(token_id_2 * c_topk + topk_slot_2, c_zero)
-                w_addr_3 = h3.select(token_id_3 * c_topk + topk_slot_3, c_zero)
-                w_val_0 = buffer_ops.buffer_load(weights_rsrc, w_addr_0, vec_width=1, dtype=T.i32)
-                w_val_1 = buffer_ops.buffer_load(weights_rsrc, w_addr_1, vec_width=1, dtype=T.i32)
-                w_val_2 = buffer_ops.buffer_load(weights_rsrc, w_addr_2, vec_width=1, dtype=T.i32)
-                w_val_3 = buffer_ops.buffer_load(weights_rsrc, w_addr_3, vec_width=1, dtype=T.i32)
-
-                # Batch-store: all packed IDs, then all weights
-                buffer_ops.buffer_store(pid_0, sorted_ids_rsrc, safe_slot_0)
-                buffer_ops.buffer_store(pid_1, sorted_ids_rsrc, safe_slot_1)
-                buffer_ops.buffer_store(pid_2, sorted_ids_rsrc, safe_slot_2)
-                buffer_ops.buffer_store(pid_3, sorted_ids_rsrc, safe_slot_3)
-                buffer_ops.buffer_store(w_val_0, sorted_w_rsrc, safe_slot_0)
-                buffer_ops.buffer_store(w_val_1, sorted_w_rsrc, safe_slot_1)
-                buffer_ops.buffer_store(w_val_2, sorted_w_rsrc, safe_slot_2)
-                buffer_ops.buffer_store(w_val_3, sorted_w_rsrc, safe_slot_3)
-
-                pos_next = position + batch_total
-                results = yield [pos_next]
-            scatter_end_pos_t0 = results
+            # Step 4: Mesh-based scatter (EP mask + uint8 mesh read + DPP prefix sum + scatter)
+            scatter_end_pos_t0 = _p23_scatter_mesh(
+                tid,
+                scatter_mr,
+                ws_rsrc,
+                weights_rsrc,
+                sorted_ids_rsrc,
+                sorted_w_rsrc,
+                mask_rsrc,
+                my_expert,
+                my_start,
+                my_end,
+                i32_mesh_stride,
+                c_topk,
+                K4_BLOCK,
+                has_mask,
+            )
 
             # Step 5: Fill padding with sentinel for THIS expert (parallel)
             _fill_sentinel_slots(
