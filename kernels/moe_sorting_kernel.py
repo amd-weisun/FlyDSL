@@ -197,7 +197,7 @@ _dummy_mask_cache = {}  # device -> torch.Tensor(1, dtype=i32, value=1)
 # FlyDSL GPU kernel — decode path (single kernel, SubTokenOneShot)
 # ---------------------------------------------------------------------------
 @functools.lru_cache(maxsize=256)
-def compile_moe_sorting_decode(
+def _compile_moe_sorting_decode(
     *,
     num_experts: int,
     topk: int,
@@ -709,7 +709,7 @@ def compile_moe_sorting_decode(
 # FlyDSL GPU kernels — prefill path (4 kernels, large T via HBM workspace)
 # ---------------------------------------------------------------------------
 @functools.lru_cache(maxsize=256)
-def compile_moe_sorting_prefill(
+def _compile_moe_sorting_prefill(
     *,
     num_experts: int,
     topk: int,
@@ -1564,7 +1564,7 @@ def _compute_sub_tokens(num_experts, arch=None):
     """Compute the LDS-capacity threshold (sub_tokens) for decode vs prefill decision.
 
     Returns the max T that fits in LDS for the decode (single-kernel) path.
-    Same formula as compile_moe_sorting_decode.
+    Same formula as _compile_moe_sorting_decode.
     """
     if arch is None:
         arch = get_hip_arch()
@@ -1598,6 +1598,21 @@ def moe_sorting_get_workspace_size(M, num_experts, topk, unit_size=UNIT_SIZE):
     ws_mesh_bytes = num_experts * mesh_stride
     ws_mesh_i32 = (ws_mesh_bytes + 3) // 4
     return ws_mesh_i32 + (num_experts + 1)
+
+
+def compile_moe_sorting(*, num_experts, topk, max_tokens=128, unit_size=UNIT_SIZE, has_mask=False):
+    """Compile MoE sorting kernels for all paths (decode + prefill).
+
+    Returns (launch_decode, launch_p0v2_p23, launch_4k_fused) covering all T ranges.
+    Decode compilation depends on max_tokens (LDS sizing); prefill is independent.
+    """
+    launch_decode = _compile_moe_sorting_decode(
+        num_experts=num_experts, topk=topk, max_tokens=max_tokens, unit_size=unit_size, has_mask=has_mask
+    )
+    _, _, _, _, _, launch_p0v2_p23, launch_4k_fused = _compile_moe_sorting_prefill(
+        num_experts=num_experts, topk=topk, unit_size=unit_size, has_mask=has_mask
+    )
+    return launch_decode, launch_p0v2_p23, launch_4k_fused
 
 
 def _launch_cached(cache, key, launch_fn, args, stream):
@@ -1666,16 +1681,17 @@ def moe_sorting_flydsl(
 
     DECODE_MAX_T = min(sub_tokens, max(16, BLOCK_SIZE // max(topk, num_experts // 8)))
 
+    target_occupancy = 2
+    num_cu = torch.cuda.get_device_properties(device).multi_processor_count
+
     if M <= min(sub_tokens, DECODE_MAX_T):
         max_tokens = max(M, 8)
         max_tokens = ((max_tokens + 7) // 8) * 8
 
-        target_occupancy = 2
-        num_cu = torch.cuda.get_device_properties(topk_ids.device).multi_processor_count
         n_zero_blocks = min((moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, num_cu * target_occupancy)
         n_grid_blocks = 1 + n_zero_blocks
 
-        launch_fn = compile_moe_sorting_decode(
+        launch_decode, _, _ = compile_moe_sorting(
             num_experts=num_experts, topk=topk, max_tokens=max_tokens, unit_size=unit_size, has_mask=has_mask
         )
         decode_args = (
@@ -1692,9 +1708,8 @@ def moe_sorting_flydsl(
             n_grid_blocks,
         )
         cache_key = (num_experts, topk, max_tokens, unit_size, has_mask, device.index)
-        _launch_cached(_decode_cf_cache, cache_key, launch_fn, decode_args, torch.cuda.current_stream())
+        _launch_cached(_decode_cf_cache, cache_key, launch_decode, decode_args, torch.cuda.current_stream())
     else:
-        # Prefill path: multiple kernels via HBM workspace
         mesh_stride = ((M + unit_size - 1) // unit_size) * unit_size
         ws_mesh_bytes = num_experts * mesh_stride
         ws_mesh_i32 = (ws_mesh_bytes + 3) // 4
@@ -1702,12 +1717,10 @@ def moe_sorting_flydsl(
         if workspace is None:
             workspace = torch.empty(ws_total, dtype=torch.int32, device=device)
 
-        _, _, _, _, _, launch_p0v2_p23, launch_4k_fused = compile_moe_sorting_prefill(
+        _, launch_p0v2_p23, launch_4k_fused = compile_moe_sorting(
             num_experts=num_experts, topk=topk, unit_size=unit_size, has_mask=has_mask
         )
         stream = torch.cuda.current_stream()
-        num_cu = torch.cuda.get_device_properties(device).multi_processor_count
-        target_occupancy = 2
         n_zero_blocks = min((moe_buf_elems + BLOCK_SIZE - 1) // BLOCK_SIZE, num_cu * target_occupancy)
         k4_grid = num_experts + n_zero_blocks
         base_key = (num_experts, topk, unit_size, has_mask, device.index)
