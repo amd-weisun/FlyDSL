@@ -14,7 +14,7 @@ Three paths (selected by T and DECODE_MAX_T = min(sub_tokens, BLOCK_SIZE // max(
   - DECODE_MAX_T < T <= 2048: 2 kernels (fused P0v2 + P23) via HBM workspace.
   - Prefill/4 kernels (T > 2048): 4 kernels via HBM workspace (ClearWS → P0 scatter → P1 count → P23).
     - DECODE_MAX_T = 16 for large models(Qwen3-MoE, MiMo-V2-Flash .. DeepSeekR1 V4) on current LDS sizes.
-    - DECODE_MAX_T is larger fro small model like 128 for Mixtral-8x7B, 32 for GPT-OSS and MiniMax-M2 
+    - DECODE_MAX_T is larger fro small model like 128 for Mixtral-8x7B, 32 for GPT-OSS and MiniMax-M2
 
 Packed token ID format: (topk_position << 24) | token_id
   - Upper 8 bits: topk slot (0..topk-1)
