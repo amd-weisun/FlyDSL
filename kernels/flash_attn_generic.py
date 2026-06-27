@@ -150,9 +150,9 @@ def build_flash_attn_func_module_primary(
             raise ValueError(f"fp8 flash_attn requires head_dim == 128 (got {head_dim})")
         if cu_seqlens_q is not None or cu_seqlens_kv is not None:
             raise ValueError("fp8 flash_attn does not support varlen (cu_seqlens) yet")
-        from kernels.flash_attn_gfx950 import build_flash_attn_dualwave_swp_module
+        from kernels.flash_attn_fp8_gfx950 import build_flash_attn_dualwave_swp_fp8_module
 
-        return build_flash_attn_dualwave_swp_module(
+        return build_flash_attn_dualwave_swp_fp8_module(
             num_heads=num_heads,
             head_dim=head_dim,
             causal=causal,
@@ -589,6 +589,12 @@ def build_flash_attn_func_module_primary(
         # turn this into a dynamic dispatch and lose `kv_head_idx`.
         kv_head_idx = q_head_idx if GQA_GROUP_SIZE == 1 else q_head_idx // GQA_GROUP_SIZE
 
+        # Non-DMA KV loads use raw k_ptr/v_ptr; fold the per-batch element
+        # offset so 0-based global_idx_kv reads this batch (DMA path uses k/v_rsrc).
+        _kv_ptr_batch_off = batch_idx * seq_len_v * fx.Index(STRIDE_TOKEN_KV)
+        k_ptr = buffer_ops.get_element_ptr(k_ptr, _kv_ptr_batch_off, elem_type=elem_type)
+        v_ptr = buffer_ops.get_element_ptr(v_ptr, _kv_ptr_batch_off, elem_type=elem_type)
+
         # ---- Cooperative load decomposition ----
         load_row_in_batch = tid // THREADS_PER_ROW_LOAD
         load_lane_in_row = tid % THREADS_PER_ROW_LOAD
@@ -596,13 +602,13 @@ def build_flash_attn_func_module_primary(
 
         # ---- Helper: global flat indices ----
         # Q/O are laid out with NUM_HEADS_Q heads; K/V with NUM_HEADS_KV.
+        # batch_idx*seq_len is folded into each tensor's descriptor base (see q/k/v/o_rsrc),
+        # so token indices are 0-based within the batch.
         def global_idx_q(token_idx, col):
-            token = batch_idx * seq_len_v + token_idx
-            return token * STRIDE_TOKEN_Q + q_head_idx * HEAD_DIM + col
+            return token_idx * STRIDE_TOKEN_Q + q_head_idx * HEAD_DIM + col
 
         def global_idx_kv(token_idx, col):
-            token = batch_idx * seq_len_v + token_idx
-            return token * STRIDE_TOKEN_KV + kv_head_idx * HEAD_DIM + col
+            return token_idx * STRIDE_TOKEN_KV + kv_head_idx * HEAD_DIM + col
 
         def _kv_row_clamp(row_idx):
             # Non-DMA KV loads use raw pointers (no hardware bounds), so clamp the
@@ -749,17 +755,27 @@ def build_flash_attn_func_module_primary(
                     lds_row = load_row_in_batch + row_offset
                     _v_store_to_lds(v_base, lds_row, vecs[batch])
 
-        # Per-batch num_records bound: rows >= seq_len read/write past this batch's
-        # region, so OOB loads return 0 and OOB stores drop (arbitrary-seqlen safe;
-        # aligned hot path unchanged). Same asm trick, used for K/V/Q loads + O-store.
-        _kv_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_v * fx.Index(STRIDE_TOKEN_KV * 2))
-        _q_nrec_bytes = _raw((batch_idx + fx.Index(1)) * seq_len_v * fx.Index(STRIDE_TOKEN_Q * 2))
-        q_rsrc = buffer_ops.create_buffer_resource(Q, max_size=False, num_records_bytes=_q_nrec_bytes)
-        o_rsrc = buffer_ops.create_buffer_resource(O, max_size=False, num_records_bytes=_q_nrec_bytes)
+        # Per-batch descriptors: fold batch_idx*seq_len into each tensor's 48-bit base and
+        # bound num_records to ONE batch. Global indices are 0-based within the batch (see
+        # global_idx_q/kv + DMA global_row), so the 32-bit voffset and the int32 C-ABI
+        # shape field never see the whole-tensor numel (which can reach 2^31). OOB rows
+        # within the batch still read 0 / drop on store (arbitrary-seqlen safe).
+        _kv_nrec_bytes = _raw(seq_len_v * fx.Index(STRIDE_TOKEN_KV * 2))
+        _q_nrec_bytes = _raw(seq_len_v * fx.Index(STRIDE_TOKEN_Q * 2))
+        _q_batch_byte_off = _raw(batch_idx * seq_len_v * fx.Index(STRIDE_TOKEN_Q * 2))
+        _kv_batch_byte_off = _raw(batch_idx * seq_len_v * fx.Index(STRIDE_TOKEN_KV * 2))
+        q_rsrc = buffer_ops.create_buffer_resource(
+            Q, max_size=False, num_records_bytes=_q_nrec_bytes, base_byte_offset=_q_batch_byte_off
+        )
+        o_rsrc = buffer_ops.create_buffer_resource(
+            O, max_size=False, num_records_bytes=_q_nrec_bytes, base_byte_offset=_q_batch_byte_off
+        )
 
         # ---- DMA loading for K (buffer_load_dwordx4 ... lds) ----
         if const_expr(ENABLE_DMA):
-            k_rsrc = buffer_ops.create_buffer_resource(K, max_size=False, num_records_bytes=_kv_nrec_bytes)
+            k_rsrc = buffer_ops.create_buffer_resource(
+                K, max_size=False, num_records_bytes=_kv_nrec_bytes, base_byte_offset=_kv_batch_byte_off
+            )
             DMA_BYTES = 16  # buffer_load_dwordx4 = 16 bytes per lane
             DMA_BATCH_BYTES = BLOCK_SIZE * DMA_BYTES
             K_TILE_BYTES = BLOCK_N * K_STRIDE * 2
@@ -791,7 +807,7 @@ def build_flash_attn_func_module_primary(
                     xor_mask = (row_in_tile & fx.Index(0x7)) << fx.Index(4)
                     unsw_col_f16 = swiz_col_f16 ^ xor_mask
                     col_byte = unsw_col_f16 * 2
-                    global_row = batch_idx * seq_len_v + tile_start + row_in_tile
+                    global_row = tile_start + row_in_tile  # 0-based: batch base folded into k/v_rsrc
                     global_byte = (
                         global_row * fx.Index(STRIDE_TOKEN_KV * 2) + kv_head_idx * fx.Index(HEAD_DIM * 2) + col_byte
                     )
@@ -814,7 +830,9 @@ def build_flash_attn_func_module_primary(
 
         # ---- DMA loading for V (buffer_load_dwordx4 ... lds) ----
         if const_expr(ENABLE_DMA):
-            v_rsrc = buffer_ops.create_buffer_resource(V, max_size=False, num_records_bytes=_kv_nrec_bytes)
+            v_rsrc = buffer_ops.create_buffer_resource(
+                V, max_size=False, num_records_bytes=_kv_nrec_bytes, base_byte_offset=_kv_batch_byte_off
+            )
             V_TILE_BYTES = BLOCK_N * V_STRIDE * 2
             NUM_DMA_V = V_TILE_BYTES // DMA_BATCH_BYTES
             LANES_PER_V_ROW = HEAD_DIM * 2 // DMA_BYTES
@@ -836,7 +854,7 @@ def build_flash_attn_func_module_primary(
                     xor_mask = (row_in_tile & fx.Index(0x3)) << fx.Index(4)
                     unsw_col_f16 = swiz_col_f16 ^ xor_mask
                     col_byte = unsw_col_f16 * 2
-                    global_row = batch_idx * seq_len_v + tile_start + row_in_tile
+                    global_row = tile_start + row_in_tile  # 0-based: batch base folded into k/v_rsrc
                     global_byte = (
                         global_row * fx.Index(STRIDE_TOKEN_KV * 2) + kv_head_idx * fx.Index(HEAD_DIM * 2) + col_byte
                     )
