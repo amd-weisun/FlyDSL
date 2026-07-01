@@ -1,0 +1,1882 @@
+{
+ "schema": 1,
+ "updated": "2026-07-01T15:13:52Z",
+ "repo": "amd-weisun/FlyDSL",
+ "runs": [
+  {
+   "run_id": 28515225986,
+   "pr": null,
+   "commit": "56849698b361f41e2bb9c0483767e7d380f00cbc",
+   "branch": "main",
+   "event": "push",
+   "title": "[pa] Deterministic split-partition reduce for PS decode (#776)",
+   "status": "queued",
+   "conclusion": null,
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28515225986",
+   "created_at": "2026-07-01T11:47:25Z",
+   "updated_at": "2026-07-01T11:48:06Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "queued",
+     "conclusion": null,
+     "started_at": "2026-07-01T11:48:06Z",
+     "completed_at": null,
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28515225986/job/84525310722"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "queued",
+     "conclusion": null,
+     "started_at": "2026-07-01T11:48:06Z",
+     "completed_at": null,
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28515225986/job/84525310743"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "queued",
+     "conclusion": null,
+     "started_at": "2026-07-01T11:48:06Z",
+     "completed_at": null,
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28515225986/job/84525310748"
+    }
+   ]
+  },
+  {
+   "run_id": 28439737589,
+   "pr": null,
+   "commit": "a4d8b0f07423cef7fafcb9e75e540e929566fd26",
+   "branch": "main",
+   "event": "push",
+   "title": "[Enh] Add FallbackLocations rewriter for bare-op source locations (#777)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28439737589",
+   "created_at": "2026-06-30T11:06:30Z",
+   "updated_at": "2026-07-01T11:07:12Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-30T11:07:11Z",
+     "completed_at": "2026-07-01T11:07:11Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28439737589/job/84274488299"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-30T11:07:11Z",
+     "completed_at": "2026-07-01T11:07:11Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28439737589/job/84274488304"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-30T11:07:11Z",
+     "completed_at": "2026-07-01T11:07:11Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28439737589/job/84274488316"
+    }
+   ]
+  },
+  {
+   "run_id": 28094236840,
+   "pr": null,
+   "commit": "a35627a2fef0a5a70c63536c4174674223866737",
+   "branch": "main",
+   "event": "push",
+   "title": "[Fix] Let Layout permissive in the IntTupleLike ops (#728)",
+   "status": "completed",
+   "conclusion": "failure",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28094236840",
+   "created_at": "2026-06-24T11:09:18Z",
+   "updated_at": "2026-06-24T11:10:03Z",
+   "actor": "amd-weisun",
+   "jobs": []
+  },
+  {
+   "run_id": 27346220535,
+   "pr": null,
+   "commit": "f423c0036ae5bea843b8e85a31fc92fb4fdbeee7",
+   "branch": "main",
+   "event": "push",
+   "title": "[Docs] Onboarding notebooks (2/n): layout algebra (#665)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27346220535",
+   "created_at": "2026-06-11T12:18:51Z",
+   "updated_at": "2026-06-12T12:19:33Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-11T12:19:31Z",
+     "completed_at": "2026-06-12T12:19:32Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27346220535/job/80795608562"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-11T12:19:31Z",
+     "completed_at": "2026-06-12T12:19:32Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27346220535/job/80795608619"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-11T12:19:31Z",
+     "completed_at": "2026-06-12T12:19:32Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27346220535/job/80795608760"
+    }
+   ]
+  },
+  {
+   "run_id": 27265176230,
+   "pr": null,
+   "commit": "91e0a695fb112d8a63de3bffbbd5d696c7176215",
+   "branch": "main",
+   "event": "push",
+   "title": "[Fix] fill missing location info during the rewrite pass (#664)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27265176230",
+   "created_at": "2026-06-10T08:58:32Z",
+   "updated_at": "2026-06-11T08:59:13Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-10T08:59:11Z",
+     "completed_at": "2026-06-11T08:59:12Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27265176230/job/80520510778"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-10T08:59:11Z",
+     "completed_at": "2026-06-11T08:59:12Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27265176230/job/80520510790"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-10T08:59:11Z",
+     "completed_at": "2026-06-11T08:59:12Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27265176230/job/80520511008"
+    }
+   ]
+  },
+  {
+   "run_id": 27091390766,
+   "pr": null,
+   "commit": "48170e30482daa0117eae4951106a4208f99f4b1",
+   "branch": "main",
+   "event": "push",
+   "title": "pa: vendor PA metadata scheduler, drop aiter get_pa_metadata_v1 dep (\u2026",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27091390766",
+   "created_at": "2026-06-07T11:35:32Z",
+   "updated_at": "2026-06-08T11:36:13Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-07T11:36:12Z",
+     "completed_at": "2026-06-08T11:36:12Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27091390766/job/79955559675"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-07T11:36:12Z",
+     "completed_at": "2026-06-08T11:36:12Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27091390766/job/79955559679"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-07T11:36:12Z",
+     "completed_at": "2026-06-08T11:36:12Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27091390766/job/79955559683"
+    }
+   ]
+  },
+  {
+   "run_id": 27020656924,
+   "pr": null,
+   "commit": "90b999b2c637dcfef8969ed5aebe73773430782b",
+   "branch": "main",
+   "event": "push",
+   "title": "flash_attn_gfx950: migrate to layout/atom API and clean up the kernel\u2026",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27020656924",
+   "created_at": "2026-06-05T14:25:35Z",
+   "updated_at": "2026-06-06T14:26:17Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-05T14:26:15Z",
+     "completed_at": "2026-06-06T14:26:16Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27020656924/job/79747492445"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-05T14:26:15Z",
+     "completed_at": "2026-06-06T14:26:16Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27020656924/job/79747492475"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-05T14:26:15Z",
+     "completed_at": "2026-06-06T14:26:16Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/27020656924/job/79747492496"
+    }
+   ]
+  },
+  {
+   "run_id": 26951818631,
+   "pr": null,
+   "commit": "293b3b2b81b0da5de963eb821fdf7d0d20c00a44",
+   "branch": "main",
+   "event": "push",
+   "title": "Add optimized FMHA kernel on MI355X (#629)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26951818631",
+   "created_at": "2026-06-04T12:30:49Z",
+   "updated_at": "2026-06-05T12:31:30Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-04T12:31:29Z",
+     "completed_at": "2026-06-05T12:31:30Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26951818631/job/79518816414"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-04T12:31:29Z",
+     "completed_at": "2026-06-05T12:31:30Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26951818631/job/79518816429"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-04T12:31:29Z",
+     "completed_at": "2026-06-05T12:31:30Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26951818631/job/79518816462"
+    }
+   ]
+  },
+  {
+   "run_id": 26881580405,
+   "pr": null,
+   "commit": "28a18d328b4882c999864b2df2f8f9fe3fcc8b47",
+   "branch": "main",
+   "event": "push",
+   "title": "[Bugfix] Drop arch env vars from the JIT cache key (fix AOT cache mis\u2026",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26881580405",
+   "created_at": "2026-06-03T11:24:32Z",
+   "updated_at": "2026-06-04T11:25:12Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-03T11:25:10Z",
+     "completed_at": "2026-06-04T11:25:10Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26881580405/job/79282822767"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-03T11:25:10Z",
+     "completed_at": "2026-06-04T11:25:11Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26881580405/job/79282822808"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-03T11:25:10Z",
+     "completed_at": "2026-06-04T11:25:11Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26881580405/job/79282822924"
+    }
+   ]
+  },
+  {
+   "run_id": 26812311182,
+   "pr": null,
+   "commit": "61a9130baad437be7c1bf2ddbebd7f8140569fd5",
+   "branch": "main",
+   "event": "push",
+   "title": "[Bugfix]: Handling the case where freevars decrease in non-top-level \u2026",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26812311182",
+   "created_at": "2026-06-02T09:55:04Z",
+   "updated_at": "2026-06-03T09:55:48Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-02T09:55:46Z",
+     "completed_at": "2026-06-03T09:55:47Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26812311182/job/79045308720"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-02T09:55:46Z",
+     "completed_at": "2026-06-03T09:55:47Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26812311182/job/79045308751"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-02T09:55:46Z",
+     "completed_at": "2026-06-03T09:55:47Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26812311182/job/79045308806"
+    }
+   ]
+  },
+  {
+   "run_id": 26763439622,
+   "pr": null,
+   "commit": "ad1d4a507603b0524318be0fa3f076c31b676e3d",
+   "branch": "main",
+   "event": "push",
+   "title": "[Enh] Add current_device_id() to DeviceRuntime via HIP hipGetDevice (\u2026",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26763439622",
+   "created_at": "2026-06-01T15:06:48Z",
+   "updated_at": "2026-06-02T09:55:06Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-01T15:07:42Z",
+     "completed_at": "2026-06-02T09:55:05Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26763439622/job/78883265432"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-01T15:07:42Z",
+     "completed_at": "2026-06-02T09:55:05Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26763439622/job/78883265461"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-06-01T15:07:42Z",
+     "completed_at": "2026-06-02T09:55:05Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26763439622/job/78883265476"
+    }
+   ]
+  },
+  {
+   "run_id": 26518045290,
+   "pr": null,
+   "commit": "3790e1f83f684542b4e6d1d11b3b557e0ed02104",
+   "branch": "main",
+   "event": "push",
+   "title": "[Feat] Add FlyDSL MoE sorting kernel (#540)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26518045290",
+   "created_at": "2026-05-27T14:36:45Z",
+   "updated_at": "2026-05-28T14:37:31Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-27T14:37:28Z",
+     "completed_at": "2026-05-28T14:37:29Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26518045290/job/78100930659"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-27T14:37:28Z",
+     "completed_at": "2026-05-28T14:37:29Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26518045290/job/78100930729"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-27T14:37:28Z",
+     "completed_at": "2026-05-28T14:37:29Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26518045290/job/78100930785"
+    }
+   ]
+  },
+  {
+   "run_id": 26449469212,
+   "pr": null,
+   "commit": "801fc4e6d798c1e2bdba5c93acf515e1630ea970",
+   "branch": "main",
+   "event": "push",
+   "title": "TensorAdaptor: split static / layout-dynamic adaptation paths (#566)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26449469212",
+   "created_at": "2026-05-26T13:00:31Z",
+   "updated_at": "2026-05-27T13:01:15Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-26T13:01:13Z",
+     "completed_at": "2026-05-27T13:01:14Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26449469212/job/77865941510"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-26T13:01:13Z",
+     "completed_at": "2026-05-27T13:01:14Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26449469212/job/77865941582"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-26T13:01:13Z",
+     "completed_at": "2026-05-27T13:01:14Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26449469212/job/77865941662"
+    }
+   ]
+  },
+  {
+   "run_id": 26220559887,
+   "pr": null,
+   "commit": "5e64bba28438d6a3588ffc5782000519dba57003",
+   "branch": "main",
+   "event": "push",
+   "title": "[Feat] Add GFX11 WMMA atom (RDNA3 / RDNA3.5, wave32) (#544)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26220559887",
+   "created_at": "2026-05-21T10:30:49Z",
+   "updated_at": "2026-05-22T10:31:30Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-21T10:31:28Z",
+     "completed_at": "2026-05-22T10:31:29Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26220559887/job/77154235475"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-21T10:31:28Z",
+     "completed_at": "2026-05-22T10:31:29Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26220559887/job/77154235477"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-21T10:31:28Z",
+     "completed_at": "2026-05-22T10:31:29Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26220559887/job/77154235506"
+    }
+   ]
+  },
+  {
+   "run_id": 26102244934,
+   "pr": null,
+   "commit": "2812676041e92c63e09ebc81c1af82af6268d088",
+   "branch": "main",
+   "event": "push",
+   "title": "hgemm_splitk: add mixed sllitk/slicek policies (#530)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26102244934",
+   "created_at": "2026-05-19T14:01:22Z",
+   "updated_at": "2026-05-20T14:02:07Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-19T14:02:04Z",
+     "completed_at": "2026-05-20T14:02:04Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26102244934/job/76756311430"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-19T14:02:04Z",
+     "completed_at": "2026-05-20T14:02:05Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26102244934/job/76756311506"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-19T14:02:04Z",
+     "completed_at": "2026-05-20T14:02:04Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26102244934/job/76756311568"
+    }
+   ]
+  },
+  {
+   "run_id": 26032054245,
+   "pr": null,
+   "commit": "337049014c9a953617468f2f4de0d05bbf34a03c",
+   "branch": "main",
+   "event": "push",
+   "title": "[Enh] Implement Storable for struct type (#536)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26032054245",
+   "created_at": "2026-05-18T11:58:14Z",
+   "updated_at": "2026-05-19T11:58:56Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-18T11:58:55Z",
+     "completed_at": "2026-05-19T11:58:55Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26032054245/job/76520411438"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-18T11:58:55Z",
+     "completed_at": "2026-05-19T11:58:55Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26032054245/job/76520411456"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-18T11:58:55Z",
+     "completed_at": "2026-05-19T11:58:55Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/26032054245/job/76520411547"
+    }
+   ]
+  },
+  {
+   "run_id": 25852796333,
+   "pr": null,
+   "commit": "6eddc3b4ca46a9547546b0e70d0cb9ace834126c",
+   "branch": "main",
+   "event": "push",
+   "title": "Fix/fly opt gpu llvm translations (#503)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25852796333",
+   "created_at": "2026-05-14T09:32:37Z",
+   "updated_at": "2026-05-15T09:33:18Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-14T09:33:17Z",
+     "completed_at": "2026-05-15T09:33:17Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25852796333/job/75963267658"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-14T09:33:17Z",
+     "completed_at": "2026-05-15T09:33:17Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25852796333/job/75963267669"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-14T09:33:17Z",
+     "completed_at": "2026-05-15T09:33:17Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25852796333/job/75963267673"
+    }
+   ]
+  },
+  {
+   "run_id": 25748078207,
+   "pr": null,
+   "commit": "f161257c46220cad204e0c450d75dfd265b9bd71",
+   "branch": "main",
+   "event": "push",
+   "title": "test(compiler): generalize attach-target link helpers (#502)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25748078207",
+   "created_at": "2026-05-12T16:32:13Z",
+   "updated_at": "2026-05-13T16:33:00Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-12T16:32:58Z",
+     "completed_at": "2026-05-13T16:32:59Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25748078207/job/75616818128"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-12T16:32:58Z",
+     "completed_at": "2026-05-13T16:32:58Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25748078207/job/75616818152"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-12T16:32:58Z",
+     "completed_at": "2026-05-13T16:32:59Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25748078207/job/75616818223"
+    }
+   ]
+  },
+  {
+   "run_id": 25668708392,
+   "pr": null,
+   "commit": "1663f3d1c4b5cf510058f3831fa39651f50a5881",
+   "branch": "main",
+   "event": "push",
+   "title": "ci: recover git metadata for wheel builds (#501)",
+   "status": "completed",
+   "conclusion": "failure",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25668708392",
+   "created_at": "2026-05-11T11:58:18Z",
+   "updated_at": "2026-05-11T11:59:03Z",
+   "actor": "amd-weisun",
+   "jobs": []
+  },
+  {
+   "run_id": 25566029404,
+   "pr": null,
+   "commit": "cd67ea90e07c74a49ff60bb8ce1ea92a4fecf331",
+   "branch": "main",
+   "event": "push",
+   "title": "Support using external mlir_opt bin to compile mlir native pass (#486)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25566029404",
+   "created_at": "2026-05-08T16:07:55Z",
+   "updated_at": "2026-05-09T16:07:57Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-08T16:07:55Z",
+     "completed_at": "2026-05-09T16:07:56Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25566029404/job/75049556751"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-08T16:07:55Z",
+     "completed_at": "2026-05-09T16:07:56Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25566029404/job/75049556765"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-08T16:07:55Z",
+     "completed_at": "2026-05-09T16:07:56Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25566029404/job/75049556775"
+    }
+   ]
+  },
+  {
+   "run_id": 25434001306,
+   "pr": null,
+   "commit": "282fa5fdfa75c1eed9fc83c3bcf541a31082bddf",
+   "branch": "main",
+   "event": "push",
+   "title": "Update ATOM nightly models to MXFP4 variants (#471)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25434001306",
+   "created_at": "2026-05-06T12:01:43Z",
+   "updated_at": "2026-05-07T12:01:45Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-06T12:01:44Z",
+     "completed_at": "2026-05-07T12:01:44Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25434001306/job/74607103166"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-06T12:01:44Z",
+     "completed_at": "2026-05-07T12:01:44Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25434001306/job/74607103185"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-06T12:01:44Z",
+     "completed_at": "2026-05-07T12:01:44Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25434001306/job/74607103190"
+    }
+   ]
+  },
+  {
+   "run_id": 25385107876,
+   "pr": null,
+   "commit": "35be33ad296fed0585eba137dba4bd6fcaef2fb5",
+   "branch": "main",
+   "event": "push",
+   "title": "feat(pa): add persistent FP8 decode path (#454)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25385107876",
+   "created_at": "2026-05-05T15:16:48Z",
+   "updated_at": "2026-05-06T12:01:44Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-05T15:16:48Z",
+     "completed_at": "2026-05-06T12:01:43Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25385107876/job/74443901197"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-05T15:16:48Z",
+     "completed_at": "2026-05-06T12:01:43Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25385107876/job/74443901203"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-05-05T15:16:48Z",
+     "completed_at": "2026-05-06T12:01:43Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25385107876/job/74443901451"
+    }
+   ]
+  },
+  {
+   "run_id": 25166274841,
+   "pr": null,
+   "commit": "fe33703b2add20c277fc01cff91c39fe20c0f5d3",
+   "branch": "main",
+   "event": "push",
+   "title": "docs: Update FlyDSL agent guidance (#463)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25166274841",
+   "created_at": "2026-04-30T12:49:23Z",
+   "updated_at": "2026-05-01T12:49:26Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-30T12:49:24Z",
+     "completed_at": "2026-05-01T12:49:24Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25166274841/job/73773183865"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-30T12:49:24Z",
+     "completed_at": "2026-05-01T12:49:25Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25166274841/job/73773183899"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-30T12:49:24Z",
+     "completed_at": "2026-05-01T12:49:25Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/25166274841/job/73773183930"
+    }
+   ]
+  },
+  {
+   "run_id": 24826514583,
+   "pr": null,
+   "commit": "25510d1b513802542f6d51f80cb71d585be85f11",
+   "branch": "main",
+   "event": "push",
+   "title": "Implement MLA decode fwd nh128 a8w8 kernel with FlyDSL. (#403)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24826514583",
+   "created_at": "2026-04-23T09:01:15Z",
+   "updated_at": "2026-04-24T09:01:18Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-23T09:01:16Z",
+     "completed_at": "2026-04-24T09:01:17Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24826514583/job/72663775565"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-23T09:01:16Z",
+     "completed_at": "2026-04-24T09:01:17Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24826514583/job/72663775613"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-23T09:01:16Z",
+     "completed_at": "2026-04-24T09:01:17Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24826514583/job/72663775630"
+    }
+   ]
+  },
+  {
+   "run_id": 24771497849,
+   "pr": null,
+   "commit": "3f7b6b573f0a9fd6701c30fcf6c79999e54cf585",
+   "branch": "main",
+   "event": "push",
+   "title": "Port v2 gemm to main (#422)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24771497849",
+   "created_at": "2026-04-22T09:42:23Z",
+   "updated_at": "2026-04-23T09:01:17Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-22T09:42:23Z",
+     "completed_at": "2026-04-23T09:01:15Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24771497849/job/72478861472"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-22T09:42:23Z",
+     "completed_at": "2026-04-23T09:01:15Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24771497849/job/72478861522"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-22T09:42:23Z",
+     "completed_at": "2026-04-23T09:01:15Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24771497849/job/72478861537"
+    }
+   ]
+  },
+  {
+   "run_id": 24669675807,
+   "pr": null,
+   "commit": "23f59ab2e765b7ce4aa34a7a590a94919fa435e7",
+   "branch": "main",
+   "event": "push",
+   "title": "Add fused epilogue support to preshuffle GEMM: bias + ReLU/SiLU/GeLU \u2026",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24669675807",
+   "created_at": "2026-04-20T13:37:47Z",
+   "updated_at": "2026-04-21T13:37:50Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-20T13:37:48Z",
+     "completed_at": "2026-04-21T13:37:49Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24669675807/job/72136659858"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-20T13:37:48Z",
+     "completed_at": "2026-04-21T13:37:49Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24669675807/job/72136659883"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-20T13:37:48Z",
+     "completed_at": "2026-04-21T13:37:49Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24669675807/job/72136659919"
+    }
+   ]
+  },
+  {
+   "run_id": 24638581238,
+   "pr": null,
+   "commit": "8d3456cfc0f316a07b7b1a09230e5e18899fd072",
+   "branch": "main",
+   "event": "push",
+   "title": "fix version err after uninstall (#413)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24638581238",
+   "created_at": "2026-04-19T20:37:13Z",
+   "updated_at": "2026-04-20T13:37:49Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-19T20:37:13Z",
+     "completed_at": "2026-04-20T13:37:48Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24638581238/job/72038376447"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-19T20:37:13Z",
+     "completed_at": "2026-04-20T13:37:47Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24638581238/job/72038376452"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-19T20:37:13Z",
+     "completed_at": "2026-04-20T13:37:48Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24638581238/job/72038376463"
+    }
+   ]
+  },
+  {
+   "run_id": 24568075421,
+   "pr": null,
+   "commit": "68f57256c78a6d2ffc54bf874ce326489360857c",
+   "branch": "main",
+   "event": "push",
+   "title": "[OPT] Add pass promote-regmem-to-vectorssa (#410)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24568075421",
+   "created_at": "2026-04-17T13:39:22Z",
+   "updated_at": "2026-04-18T13:39:24Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-17T13:39:23Z",
+     "completed_at": "2026-04-18T13:39:23Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24568075421/job/71833459635"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-17T13:39:23Z",
+     "completed_at": "2026-04-18T13:39:23Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24568075421/job/71833459663"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-17T13:39:23Z",
+     "completed_at": "2026-04-18T13:39:23Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24568075421/job/71833459680"
+    }
+   ]
+  },
+  {
+   "run_id": 24199528183,
+   "pr": null,
+   "commit": "02a15526abd2eb8cea632338e817fe27b9fe4cc1",
+   "branch": "main",
+   "event": "push",
+   "title": "[Fix] Support IntAttr tiled MMA permutation modes (#372)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24199528183",
+   "created_at": "2026-04-09T15:47:52Z",
+   "updated_at": "2026-04-10T15:47:54Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-09T15:47:53Z",
+     "completed_at": "2026-04-10T15:47:53Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24199528183/job/70638990678"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-09T15:47:53Z",
+     "completed_at": "2026-04-10T15:47:53Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24199528183/job/70638990701"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-09T15:47:53Z",
+     "completed_at": "2026-04-10T15:47:53Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24199528183/job/70638990780"
+    }
+   ]
+  },
+  {
+   "run_id": 24144364710,
+   "pr": null,
+   "commit": "6ca05b883389d9c40bdd0dea69ac9a7929b4c243",
+   "branch": "main",
+   "event": "push",
+   "title": "[Refactor] Convert norm/softmax kernels from raw buffer_ops to layout\u2026",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24144364710",
+   "created_at": "2026-04-08T15:43:00Z",
+   "updated_at": "2026-04-09T15:43:04Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-09T15:43:03Z",
+     "completed_at": "2026-04-09T15:43:03Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24144364710/job/70454208172"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-08T15:43:02Z",
+     "completed_at": "2026-04-09T15:43:03Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24144364710/job/70454208192"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-08T15:43:03Z",
+     "completed_at": "2026-04-09T15:43:03Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/24144364710/job/70454208225"
+    }
+   ]
+  },
+  {
+   "run_id": 23909120174,
+   "pr": null,
+   "commit": "3f5b50c68736ed0aad728b7a53f9a808a489f7ba",
+   "branch": "main",
+   "event": "push",
+   "title": "[FEAT] Add print_typst for Layout, TiledCopy/Mmma (#339)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23909120174",
+   "created_at": "2026-04-02T15:48:49Z",
+   "updated_at": "2026-04-03T15:48:51Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-02T15:48:50Z",
+     "completed_at": "2026-04-03T15:48:50Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23909120174/job/69726061303"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-02T15:48:50Z",
+     "completed_at": "2026-04-03T15:48:50Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23909120174/job/69726061307"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-03T15:48:50Z",
+     "completed_at": "2026-04-03T15:48:50Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23909120174/job/69726061413"
+    }
+   ]
+  },
+  {
+   "run_id": 23857669638,
+   "pr": null,
+   "commit": "6db20cb2cc8eb539b94c02b6400bce7d48e71ae1",
+   "branch": "main",
+   "event": "push",
+   "title": "Add FMHA kernel (#225)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23857669638",
+   "created_at": "2026-04-01T15:52:04Z",
+   "updated_at": "2026-04-02T15:48:50Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-01T15:52:06Z",
+     "completed_at": "2026-04-02T15:48:49Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23857669638/job/69555319704"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-01T15:52:06Z",
+     "completed_at": "2026-04-02T15:48:49Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23857669638/job/69555319726"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-02T15:48:49Z",
+     "completed_at": "2026-04-02T15:48:49Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23857669638/job/69555319754"
+    }
+   ]
+  },
+  {
+   "run_id": 23841710603,
+   "pr": null,
+   "commit": "5a1385c6c972920952129fd0e0499a04160c145c",
+   "branch": "main",
+   "event": "push",
+   "title": "[FlyDSL] fused RoPE kernel with layout APIs  (#300)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23841710603",
+   "created_at": "2026-04-01T09:26:17Z",
+   "updated_at": "2026-04-01T15:52:06Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-01T15:52:05Z",
+     "completed_at": "2026-04-01T15:52:05Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23841710603/job/69498713492"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-01T15:52:05Z",
+     "completed_at": "2026-04-01T15:52:05Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23841710603/job/69498713516"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-04-01T15:52:05Z",
+     "completed_at": "2026-04-01T15:52:05Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23841710603/job/69498713531"
+    }
+   ]
+  },
+  {
+   "run_id": 23748461820,
+   "pr": null,
+   "commit": "dafd11667aff6763ac127699ee7191b5fd482fe0",
+   "branch": "main",
+   "event": "push",
+   "title": " preshuffled gemm iglp (#259)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23748461820",
+   "created_at": "2026-03-30T13:55:12Z",
+   "updated_at": "2026-03-31T13:55:14Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-31T13:55:13Z",
+     "completed_at": "2026-03-31T13:55:13Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23748461820/job/69183459365"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-31T13:55:13Z",
+     "completed_at": "2026-03-31T13:55:13Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23748461820/job/69183459397"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-31T13:55:13Z",
+     "completed_at": "2026-03-31T13:55:13Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23748461820/job/69183459432"
+    }
+   ]
+  },
+  {
+   "run_id": 23648349969,
+   "pr": null,
+   "commit": "529111cb29766dc699df52d4f3e6fc775a03b7d4",
+   "branch": "main",
+   "event": "push",
+   "title": "[Fix] fix the type of value in the adaptor may differ with IntAttr.wi\u2026",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23648349969",
+   "created_at": "2026-03-27T13:24:45Z",
+   "updated_at": "2026-03-28T13:24:48Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-27T13:24:47Z",
+     "completed_at": "2026-03-28T13:24:47Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23648349969/job/68886204515"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-28T13:24:47Z",
+     "completed_at": "2026-03-28T13:24:47Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23648349969/job/68886204535"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-27T13:24:47Z",
+     "completed_at": "2026-03-28T13:24:48Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23648349969/job/68886204937"
+    }
+   ]
+  },
+  {
+   "run_id": 23600383808,
+   "pr": null,
+   "commit": "4c889930f33eed575a5db30123185408468ab10f",
+   "branch": "main",
+   "event": "push",
+   "title": "[Prune] Remove the stale lang package. (#292)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23600383808",
+   "created_at": "2026-03-26T14:40:41Z",
+   "updated_at": "2026-03-27T13:24:47Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "in_progress",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-27T13:24:46Z",
+     "completed_at": "2026-03-27T13:24:46Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23600383808/job/68728465047"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "in_progress",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-27T13:24:46Z",
+     "completed_at": "2026-03-27T13:24:46Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23600383808/job/68728465078"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-26T14:40:42Z",
+     "completed_at": "2026-03-27T13:24:46Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23600383808/job/68728465101"
+    }
+   ]
+  },
+  {
+   "run_id": 23590833794,
+   "pr": null,
+   "commit": "c52b4d74ad6055f3e5bbf0520ba4c068c8b640db",
+   "branch": "main",
+   "event": "push",
+   "title": "[Fix][DSL] Fix the semantic of MmaMakeFragment and apply cse on pure \u2026",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23590833794",
+   "created_at": "2026-03-26T11:00:52Z",
+   "updated_at": "2026-03-26T14:40:42Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-26T14:40:41Z",
+     "completed_at": "2026-03-26T14:40:41Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23590833794/job/68695357635"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-26T14:40:41Z",
+     "completed_at": "2026-03-26T14:40:41Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23590833794/job/68695357651"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "in_progress",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-26T14:40:41Z",
+     "completed_at": "2026-03-26T14:40:41Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23590833794/job/68695357667"
+    }
+   ]
+  },
+  {
+   "run_id": 23553755730,
+   "pr": null,
+   "commit": "f63022e19aec6af894efbefcfd2f4ac79ac87956",
+   "branch": "main",
+   "event": "push",
+   "title": "Register Python float to fx.Float32 and bool to fx.Boolean (#285)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23553755730",
+   "created_at": "2026-03-25T17:04:50Z",
+   "updated_at": "2026-03-26T11:00:54Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-26T11:00:53Z",
+     "completed_at": "2026-03-26T11:00:53Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23553755730/job/68574709152"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-25T17:04:51Z",
+     "completed_at": "2026-03-26T11:00:53Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23553755730/job/68574709203"
+    }
+   ]
+  },
+  {
+   "run_id": 23486634424,
+   "pr": null,
+   "commit": "eff27942184a5c4f6ae3d66de30efa865b61bf0a",
+   "branch": "main",
+   "event": "push",
+   "title": "Hot fix cache key (#280)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23486634424",
+   "created_at": "2026-03-24T11:15:47Z",
+   "updated_at": "2026-03-25T11:15:50Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "in_progress",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-25T11:15:49Z",
+     "completed_at": "2026-03-25T11:15:49Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23486634424/job/68343794666"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-25T11:15:49Z",
+     "completed_at": "2026-03-25T11:15:49Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23486634424/job/68343794686"
+    }
+   ]
+  },
+  {
+   "run_id": 23486606145,
+   "pr": null,
+   "commit": "4d84ee8f665fea906a0012cc98f0381e5f5d2818",
+   "branch": "main",
+   "event": "push",
+   "title": "use native fx.idx2crd, idx2crd ir.xxx  in gemm and moe, remove layout\u2026",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23486606145",
+   "created_at": "2026-03-24T11:15:05Z",
+   "updated_at": "2026-03-24T11:15:49Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-24T11:15:48Z",
+     "completed_at": "2026-03-24T11:15:48Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23486606145/job/68343699039"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "in_progress",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-24T11:15:48Z",
+     "completed_at": "2026-03-24T11:15:48Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23486606145/job/68343699041"
+    }
+   ]
+  },
+  {
+   "run_id": 23445783025,
+   "pr": null,
+   "commit": "67b3b9a823c5f0597b3df4613323a414c1b30976",
+   "branch": "main",
+   "event": "push",
+   "title": "update LLVM to 7f77ca0dbda4 and fix compatibility (#269)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23445783025",
+   "created_at": "2026-03-23T15:36:55Z",
+   "updated_at": "2026-03-24T11:15:06Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-24T11:15:06Z",
+     "completed_at": "2026-03-24T11:15:06Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23445783025/job/68209006011"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-24T11:15:06Z",
+     "completed_at": "2026-03-24T11:15:06Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23445783025/job/68209006062"
+    }
+   ]
+  },
+  {
+   "run_id": 23432021526,
+   "pr": null,
+   "commit": "d2ea52c355483c2eb395b063bdda18ce0163706f",
+   "branch": "main",
+   "event": "push",
+   "title": "[FEAT][DSL] Add get_dyn_shared to access dynamic shared memory (#264)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23432021526",
+   "created_at": "2026-03-23T10:09:56Z",
+   "updated_at": "2026-03-23T15:36:57Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-23T15:36:56Z",
+     "completed_at": "2026-03-23T15:36:56Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23432021526/job/68160518151"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-23T10:09:57Z",
+     "completed_at": "2026-03-23T15:36:56Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23432021526/job/68160518167"
+    }
+   ]
+  },
+  {
+   "run_id": 23344346595,
+   "pr": null,
+   "commit": "dea384f00c8c82de0b96bb0716a4151ef8fa9944",
+   "branch": "main",
+   "event": "push",
+   "title": "[FLYDSL]: Bugfixes for dynamic upper bound of range and dynamic share\u2026",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23344346595",
+   "created_at": "2026-03-20T13:11:23Z",
+   "updated_at": "2026-03-21T13:11:24Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-21T13:11:24Z",
+     "completed_at": "2026-03-21T13:11:24Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23344346595/job/67905638328"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-21T13:11:24Z",
+     "completed_at": "2026-03-21T13:11:24Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23344346595/job/67905638389"
+    }
+   ]
+  },
+  {
+   "run_id": 23298108933,
+   "pr": null,
+   "commit": "c9db4619a361e68073be3c8efa6a77347cf2aa48",
+   "branch": "main",
+   "event": "push",
+   "title": "add claude skills (#244)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23298108933",
+   "created_at": "2026-03-19T13:49:29Z",
+   "updated_at": "2026-03-20T13:11:24Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-20T13:11:23Z",
+     "completed_at": "2026-03-20T13:11:23Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23298108933/job/67751069634"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "in_progress",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-20T13:11:23Z",
+     "completed_at": "2026-03-20T13:11:23Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23298108933/job/67751069646"
+    }
+   ]
+  },
+  {
+   "run_id": 23239840744,
+   "pr": null,
+   "commit": "dd1b71cdc6ba8372d1cdee60bd44a92ae8b1c385",
+   "branch": "main",
+   "event": "push",
+   "title": "Tune launch overhead (#220)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23239840744",
+   "created_at": "2026-03-18T10:18:25Z",
+   "updated_at": "2026-03-19T10:18:27Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-18T10:18:26Z",
+     "completed_at": "2026-03-19T10:18:27Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23239840744/job/67553100790"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-18T10:18:26Z",
+     "completed_at": "2026-03-19T10:18:27Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23239840744/job/67553100953"
+    }
+   ]
+  },
+  {
+   "run_id": 23190079164,
+   "pr": null,
+   "commit": "2ca39139d948500a3c62f8aef8c72139820961e7",
+   "branch": "main",
+   "event": "push",
+   "title": "[Feat][FLY] Update TiledMma and Copy semantic (#203)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23190079164",
+   "created_at": "2026-03-17T10:37:13Z",
+   "updated_at": "2026-03-18T10:18:27Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-17T10:37:13Z",
+     "completed_at": "2026-03-18T10:18:26Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23190079164/job/67383574174"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-17T10:37:13Z",
+     "completed_at": "2026-03-18T10:18:26Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23190079164/job/67383574193"
+    }
+   ]
+  },
+  {
+   "run_id": 23058728219,
+   "pr": null,
+   "commit": "99ccb1e3c8af06f7771df9d9fa12a5670c57e206",
+   "branch": "main",
+   "event": "push",
+   "title": "update readme and doc (#208)",
+   "status": "completed",
+   "conclusion": "cancelled",
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23058728219",
+   "created_at": "2026-03-13T15:47:49Z",
+   "updated_at": "2026-03-14T15:47:50Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-13T15:47:49Z",
+     "completed_at": "2026-03-14T15:47:50Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23058728219/job/66979236350"
+    },
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "completed",
+     "conclusion": "cancelled",
+     "started_at": "2026-03-13T15:47:49Z",
+     "completed_at": "2026-03-14T15:47:50Z",
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23058728219/job/66979236416"
+    }
+   ]
+  }
+ ]
+}
