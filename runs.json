@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "updated": "2026-07-04T09:02:53Z",
+ "updated": "2026-07-04T09:36:16Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
   {
@@ -10,38 +10,38 @@
    "branch": "main",
    "event": "push",
    "title": "[Fix] Lower CDNA3 32x32x8 BF16 MFMA (#792)",
-   "status": "queued",
-   "conclusion": null,
+   "status": "completed",
+   "conclusion": "cancelled",
    "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28651917001",
    "created_at": "2026-07-03T09:35:01Z",
-   "updated_at": "2026-07-03T09:35:40Z",
+   "updated_at": "2026-07-04T09:35:41Z",
    "actor": "amd-weisun",
    "jobs": [
     {
      "runner": "linux-flydsl-mi325-1",
      "arch": "gfx942",
-     "status": "queued",
-     "conclusion": null,
+     "status": "completed",
+     "conclusion": "cancelled",
      "started_at": "2026-07-03T09:35:40Z",
-     "completed_at": null,
+     "completed_at": "2026-07-04T09:35:40Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28651917001/job/84971862845"
     },
     {
      "runner": "linux-flydsl-navi-2",
      "arch": "gfx1201",
-     "status": "queued",
-     "conclusion": null,
+     "status": "completed",
+     "conclusion": "cancelled",
      "started_at": "2026-07-03T09:35:40Z",
-     "completed_at": null,
+     "completed_at": "2026-07-04T09:35:40Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28651917001/job/84971862849"
     },
     {
      "runner": "linux-flydsl-mi355-1",
      "arch": "gfx950",
-     "status": "queued",
-     "conclusion": null,
+     "status": "completed",
+     "conclusion": "cancelled",
      "started_at": "2026-07-03T09:35:40Z",
-     "completed_at": null,
+     "completed_at": "2026-07-04T09:35:40Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28651917001/job/84971862915"
     }
    ]
