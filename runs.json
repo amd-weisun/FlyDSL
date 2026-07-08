@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "updated": "2026-07-08T08:45:51Z",
+ "updated": "2026-07-08T10:10:02Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
   {
@@ -10,38 +10,38 @@
    "branch": "main",
    "event": "push",
    "title": "[Feat] Add gather/scatter as derived exprs (#805)",
-   "status": "queued",
-   "conclusion": null,
+   "status": "completed",
+   "conclusion": "cancelled",
    "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28858321293",
    "created_at": "2026-07-07T10:08:35Z",
-   "updated_at": "2026-07-07T10:09:17Z",
+   "updated_at": "2026-07-08T10:09:18Z",
    "actor": "amd-weisun",
    "jobs": [
     {
      "runner": "linux-flydsl-mi325-1",
      "arch": "gfx942",
-     "status": "queued",
-     "conclusion": null,
+     "status": "completed",
+     "conclusion": "cancelled",
      "started_at": "2026-07-07T10:09:17Z",
-     "completed_at": null,
+     "completed_at": "2026-07-08T10:09:17Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28858321293/job/85590431383"
     },
     {
      "runner": "linux-flydsl-mi355-1",
      "arch": "gfx950",
-     "status": "queued",
-     "conclusion": null,
+     "status": "completed",
+     "conclusion": "cancelled",
      "started_at": "2026-07-07T10:09:17Z",
-     "completed_at": null,
+     "completed_at": "2026-07-08T10:09:17Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28858321293/job/85590431407"
     },
     {
      "runner": "linux-flydsl-navi-2",
      "arch": "gfx1201",
-     "status": "queued",
-     "conclusion": null,
+     "status": "completed",
+     "conclusion": "cancelled",
      "started_at": "2026-07-07T10:09:17Z",
-     "completed_at": null,
+     "completed_at": "2026-07-08T10:09:17Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/28858321293/job/85590431449"
     }
    ]
