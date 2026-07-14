@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "updated": "2026-07-14T08:29:41Z",
+ "updated": "2026-07-14T09:06:44Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
   {
@@ -10,38 +10,38 @@
    "branch": "main",
    "event": "push",
    "title": "[kernels] Structure-only cleanup: unify naming, dedup helpers, split \u2026",
-   "status": "queued",
-   "conclusion": null,
+   "status": "completed",
+   "conclusion": "cancelled",
    "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/29237733481",
    "created_at": "2026-07-13T09:05:13Z",
-   "updated_at": "2026-07-13T09:05:54Z",
+   "updated_at": "2026-07-14T09:05:55Z",
    "actor": "amd-weisun",
    "jobs": [
     {
      "runner": "linux-flydsl-mi325-1",
      "arch": "gfx942",
-     "status": "queued",
-     "conclusion": null,
+     "status": "completed",
+     "conclusion": "cancelled",
      "started_at": "2026-07-13T09:05:54Z",
-     "completed_at": null,
+     "completed_at": "2026-07-14T09:05:54Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/29237733481/job/86776388580"
     },
     {
      "runner": "linux-flydsl-navi-2",
      "arch": "gfx1201",
-     "status": "queued",
-     "conclusion": null,
+     "status": "completed",
+     "conclusion": "cancelled",
      "started_at": "2026-07-13T09:05:54Z",
-     "completed_at": null,
+     "completed_at": "2026-07-14T09:05:54Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/29237733481/job/86776388588"
     },
     {
      "runner": "linux-flydsl-mi355-1",
      "arch": "gfx950",
-     "status": "queued",
-     "conclusion": null,
+     "status": "completed",
+     "conclusion": "cancelled",
      "started_at": "2026-07-13T09:05:54Z",
-     "completed_at": null,
+     "completed_at": "2026-07-14T09:05:54Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/29237733481/job/86776388610"
     }
    ]
