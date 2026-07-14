@@ -1,8 +1,51 @@
 {
  "schema": 1,
- "updated": "2026-07-14T16:40:03Z",
+ "updated": "2026-07-14T19:46:04Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
+  {
+   "run_id": 29354175705,
+   "pr": null,
+   "commit": "fa4f8ae2d5b0a08ca2b428247fd0ff5a7863558d",
+   "branch": "main",
+   "event": "push",
+   "title": "[Misc] Propagate signatures through expr decorators (#835)",
+   "status": "queued",
+   "conclusion": null,
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/29354175705",
+   "created_at": "2026-07-14T17:32:14Z",
+   "updated_at": "2026-07-14T17:32:53Z",
+   "actor": "amd-weisun",
+   "jobs": [
+    {
+     "runner": "linux-flydsl-mi355-1",
+     "arch": "gfx950",
+     "status": "queued",
+     "conclusion": null,
+     "started_at": "2026-07-14T17:32:53Z",
+     "completed_at": null,
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/29354175705/job/87157710460"
+    },
+    {
+     "runner": "linux-flydsl-navi-2",
+     "arch": "gfx1201",
+     "status": "queued",
+     "conclusion": null,
+     "started_at": "2026-07-14T17:32:53Z",
+     "completed_at": null,
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/29354175705/job/87157710468"
+    },
+    {
+     "runner": "linux-flydsl-mi325-1",
+     "arch": "gfx942",
+     "status": "queued",
+     "conclusion": null,
+     "started_at": "2026-07-14T17:32:53Z",
+     "completed_at": null,
+     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/29354175705/job/87157710508"
+    }
+   ]
+  },
   {
    "run_id": 29237733481,
    "pr": null,
