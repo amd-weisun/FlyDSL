@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "updated": "2026-07-15T16:46:32Z",
+ "updated": "2026-07-15T17:33:45Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
   {
@@ -10,38 +10,38 @@
    "branch": "main",
    "event": "push",
    "title": "[Misc] Propagate signatures through expr decorators (#835)",
-   "status": "queued",
-   "conclusion": null,
+   "status": "completed",
+   "conclusion": "cancelled",
    "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/29354175705",
    "created_at": "2026-07-14T17:32:14Z",
-   "updated_at": "2026-07-14T17:32:53Z",
+   "updated_at": "2026-07-15T17:32:55Z",
    "actor": "amd-weisun",
    "jobs": [
     {
      "runner": "linux-flydsl-mi355-1",
      "arch": "gfx950",
-     "status": "queued",
-     "conclusion": null,
+     "status": "completed",
+     "conclusion": "cancelled",
      "started_at": "2026-07-14T17:32:53Z",
-     "completed_at": null,
+     "completed_at": "2026-07-15T17:32:54Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/29354175705/job/87157710460"
     },
     {
      "runner": "linux-flydsl-navi-2",
      "arch": "gfx1201",
-     "status": "queued",
-     "conclusion": null,
+     "status": "completed",
+     "conclusion": "cancelled",
      "started_at": "2026-07-14T17:32:53Z",
-     "completed_at": null,
+     "completed_at": "2026-07-15T17:32:54Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/29354175705/job/87157710468"
     },
     {
      "runner": "linux-flydsl-mi325-1",
      "arch": "gfx942",
-     "status": "queued",
-     "conclusion": null,
+     "status": "completed",
+     "conclusion": "cancelled",
      "started_at": "2026-07-14T17:32:53Z",
-     "completed_at": null,
+     "completed_at": "2026-07-15T17:32:54Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/29354175705/job/87157710508"
     }
    ]
