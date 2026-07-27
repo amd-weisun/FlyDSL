@@ -1,8 +1,23 @@
 {
  "schema": 1,
- "updated": "2026-07-27T10:11:40Z",
+ "updated": "2026-07-27T15:16:23Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
+  {
+   "run_id": 30269846146,
+   "pr": null,
+   "commit": "950bed539f5225c2502eb6062bc9ce7cfcf7ccf5",
+   "branch": "main",
+   "event": "push",
+   "title": "[Prune] Move arch-specific FP8 type selection to kernels_common (#908)",
+   "status": "queued",
+   "conclusion": null,
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/30269846146",
+   "created_at": "2026-07-27T13:20:46Z",
+   "updated_at": "2026-07-27T13:21:31Z",
+   "actor": "amd-weisun",
+   "jobs": []
+  },
   {
    "run_id": 29354175705,
    "pr": null,
