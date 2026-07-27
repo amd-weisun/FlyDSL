@@ -1,8 +1,23 @@
 {
  "schema": 1,
- "updated": "2026-07-27T15:16:23Z",
+ "updated": "2026-07-27T15:29:19Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
+  {
+   "run_id": 30280145795,
+   "pr": null,
+   "commit": "05d785e5e672ba87bc43e14f91fc6860be462d01",
+   "branch": "main",
+   "event": "push",
+   "title": "[perf]optimize flash attention fp8 for gfx950 (#905)",
+   "status": "in_progress",
+   "conclusion": null,
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/30280145795",
+   "created_at": "2026-07-27T15:28:23Z",
+   "updated_at": "2026-07-27T15:28:29Z",
+   "actor": "amd-weisun",
+   "jobs": []
+  },
   {
    "run_id": 30269846146,
    "pr": null,
@@ -10,11 +25,11 @@
    "branch": "main",
    "event": "push",
    "title": "[Prune] Move arch-specific FP8 type selection to kernels_common (#908)",
-   "status": "queued",
-   "conclusion": null,
+   "status": "completed",
+   "conclusion": "cancelled",
    "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/30269846146",
    "created_at": "2026-07-27T13:20:46Z",
-   "updated_at": "2026-07-27T13:21:31Z",
+   "updated_at": "2026-07-27T15:28:25Z",
    "actor": "amd-weisun",
    "jobs": []
   },
