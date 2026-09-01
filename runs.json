@@ -1,8 +1,23 @@
 {
  "schema": 1,
- "updated": "2026-09-01T08:42:41Z",
+ "updated": "2026-09-01T14:11:03Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
+  {
+   "run_id": 33508134370,
+   "pr": null,
+   "commit": "e6ddf6f42bb646cfbdc95026fc2bc4c61332a2dd",
+   "branch": "main",
+   "event": "push",
+   "title": "Ci/change image to speedup ci (#1076)",
+   "status": "queued",
+   "conclusion": null,
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/33508134370",
+   "created_at": "2026-09-01T12:31:14Z",
+   "updated_at": "2026-09-01T12:31:55Z",
+   "actor": "amd-weisun",
+   "jobs": []
+  },
   {
    "run_id": 32377296100,
    "pr": null,
