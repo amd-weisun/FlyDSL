@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "updated": "2026-09-04T16:24:49Z",
+ "updated": "2026-09-04T17:53:55Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
   {
@@ -10,11 +10,11 @@
    "branch": "main",
    "event": "push",
    "title": "[CI] accelerate prepare-mlir: run the CPU builder in the manylinux im\u2026",
-   "status": "queued",
-   "conclusion": null,
+   "status": "completed",
+   "conclusion": "cancelled",
    "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/33787107910",
    "created_at": "2026-09-03T17:52:15Z",
-   "updated_at": "2026-09-03T17:52:54Z",
+   "updated_at": "2026-09-04T17:52:56Z",
    "actor": "amd-weisun",
    "jobs": []
   },
