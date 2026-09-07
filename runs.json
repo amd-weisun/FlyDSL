@@ -1,8 +1,23 @@
 {
  "schema": 1,
- "updated": "2026-09-07T04:47:06Z",
+ "updated": "2026-09-07T12:39:27Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
+  {
+   "run_id": 34110355736,
+   "pr": null,
+   "commit": "b81e99d69fcb2cd6100502b6360d643be898d669",
+   "branch": "main",
+   "event": "push",
+   "title": "[Kernel] Add dilation, padding_mode and groups to convolution kernel.\u2026",
+   "status": "queued",
+   "conclusion": null,
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/34110355736",
+   "created_at": "2026-09-07T10:13:55Z",
+   "updated_at": "2026-09-07T10:14:38Z",
+   "actor": "amd-weisun",
+   "jobs": []
+  },
   {
    "run_id": 33787107910,
    "pr": null,
