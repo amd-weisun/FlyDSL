@@ -1,8 +1,23 @@
 {
  "schema": 1,
- "updated": "2026-09-08T11:23:49Z",
+ "updated": "2026-09-08T16:41:28Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
+  {
+   "run_id": 34229781837,
+   "pr": null,
+   "commit": "eb5592f35bf9c0cbc19586927573068df7ba832e",
+   "branch": "main",
+   "event": "push",
+   "title": "[DSL] Expose atomic operations via llvm dialect (#1100)",
+   "status": "queued",
+   "conclusion": null,
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/34229781837",
+   "created_at": "2026-09-08T13:04:50Z",
+   "updated_at": "2026-09-08T13:05:29Z",
+   "actor": "amd-weisun",
+   "jobs": []
+  },
   {
    "run_id": 34110355736,
    "pr": null,
