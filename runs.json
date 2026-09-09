@@ -1,8 +1,23 @@
 {
  "schema": 1,
- "updated": "2026-09-09T13:06:28Z",
+ "updated": "2026-09-09T16:41:56Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
+  {
+   "run_id": 34361707313,
+   "pr": null,
+   "commit": "ed70142704e1a6d5563fb53e1607e3a4b85d7111",
+   "branch": "main",
+   "event": "push",
+   "title": "[Chore] pre commit formatter (#1102)",
+   "status": "queued",
+   "conclusion": null,
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/34361707313",
+   "created_at": "2026-09-09T14:09:02Z",
+   "updated_at": "2026-09-09T14:09:44Z",
+   "actor": "amd-weisun",
+   "jobs": []
+  },
   {
    "run_id": 34229781837,
    "pr": null,
@@ -2176,40 +2191,6 @@
      "started_at": "2026-03-17T10:37:13Z",
      "completed_at": "2026-03-18T10:18:26Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23190079164/job/67383574193"
-    }
-   ]
-  },
-  {
-   "run_id": 23058728219,
-   "pr": null,
-   "commit": "99ccb1e3c8af06f7771df9d9fa12a5670c57e206",
-   "branch": "main",
-   "event": "push",
-   "title": "update readme and doc (#208)",
-   "status": "completed",
-   "conclusion": "cancelled",
-   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23058728219",
-   "created_at": "2026-03-13T15:47:49Z",
-   "updated_at": "2026-03-14T15:47:50Z",
-   "actor": "amd-weisun",
-   "jobs": [
-    {
-     "runner": "linux-flydsl-mi325-1",
-     "arch": "gfx942",
-     "status": "completed",
-     "conclusion": "cancelled",
-     "started_at": "2026-03-13T15:47:49Z",
-     "completed_at": "2026-03-14T15:47:50Z",
-     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23058728219/job/66979236350"
-    },
-    {
-     "runner": "linux-flydsl-mi355-1",
-     "arch": "gfx950",
-     "status": "completed",
-     "conclusion": "cancelled",
-     "started_at": "2026-03-13T15:47:49Z",
-     "completed_at": "2026-03-14T15:47:50Z",
-     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23058728219/job/66979236416"
     }
    ]
   }
