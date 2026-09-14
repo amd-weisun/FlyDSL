@@ -1,8 +1,23 @@
 {
  "schema": 1,
- "updated": "2026-09-14T05:01:03Z",
+ "updated": "2026-09-14T12:53:51Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
+  {
+   "run_id": 34826371225,
+   "pr": null,
+   "commit": "49cbefb45707e3ce84b7c1a7e7d6aa8022807362",
+   "branch": "main",
+   "event": "push",
+   "title": "[CI] Skip GPU tests for more non-code path changes (#1121)",
+   "status": "queued",
+   "conclusion": null,
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/34826371225",
+   "created_at": "2026-09-14T09:08:59Z",
+   "updated_at": "2026-09-14T09:09:39Z",
+   "actor": "amd-weisun",
+   "jobs": []
+  },
   {
    "run_id": 34361707313,
    "pr": null,
@@ -2157,40 +2172,6 @@
      "started_at": "2026-03-18T10:18:26Z",
      "completed_at": "2026-03-19T10:18:27Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23239840744/job/67553100953"
-    }
-   ]
-  },
-  {
-   "run_id": 23190079164,
-   "pr": null,
-   "commit": "2ca39139d948500a3c62f8aef8c72139820961e7",
-   "branch": "main",
-   "event": "push",
-   "title": "[Feat][FLY] Update TiledMma and Copy semantic (#203)",
-   "status": "completed",
-   "conclusion": "cancelled",
-   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23190079164",
-   "created_at": "2026-03-17T10:37:13Z",
-   "updated_at": "2026-03-18T10:18:27Z",
-   "actor": "amd-weisun",
-   "jobs": [
-    {
-     "runner": "linux-flydsl-mi355-1",
-     "arch": "gfx950",
-     "status": "completed",
-     "conclusion": "cancelled",
-     "started_at": "2026-03-17T10:37:13Z",
-     "completed_at": "2026-03-18T10:18:26Z",
-     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23190079164/job/67383574174"
-    },
-    {
-     "runner": "linux-flydsl-mi325-1",
-     "arch": "gfx942",
-     "status": "completed",
-     "conclusion": "cancelled",
-     "started_at": "2026-03-17T10:37:13Z",
-     "completed_at": "2026-03-18T10:18:26Z",
-     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23190079164/job/67383574193"
     }
    ]
   }
