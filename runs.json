@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "updated": "2026-09-15T04:58:34Z",
+ "updated": "2026-09-15T09:10:35Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
   {
@@ -10,11 +10,11 @@
    "branch": "main",
    "event": "push",
    "title": "[CI] Skip GPU tests for more non-code path changes (#1121)",
-   "status": "queued",
-   "conclusion": null,
+   "status": "completed",
+   "conclusion": "cancelled",
    "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/34826371225",
    "created_at": "2026-09-14T09:08:59Z",
-   "updated_at": "2026-09-14T09:09:39Z",
+   "updated_at": "2026-09-15T09:09:41Z",
    "actor": "amd-weisun",
    "jobs": []
   },
