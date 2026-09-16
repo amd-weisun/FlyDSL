@@ -1,8 +1,23 @@
 {
  "schema": 1,
- "updated": "2026-09-16T11:40:43Z",
+ "updated": "2026-09-16T17:01:58Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
+  {
+   "run_id": 35120191508,
+   "pr": null,
+   "commit": "8b06094935a34149f4ba5b6776e051d5d91e37e1",
+   "branch": "main",
+   "event": "push",
+   "title": "[CI] Fix silent skip of the MLIR lit stage (#1146)",
+   "status": "queued",
+   "conclusion": null,
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/35120191508",
+   "created_at": "2026-09-16T16:10:33Z",
+   "updated_at": "2026-09-16T16:11:15Z",
+   "actor": "amd-weisun",
+   "jobs": []
+  },
   {
    "run_id": 34826371225,
    "pr": null,
@@ -2138,40 +2153,6 @@
      "started_at": "2026-03-20T13:11:23Z",
      "completed_at": "2026-03-20T13:11:23Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23298108933/job/67751069646"
-    }
-   ]
-  },
-  {
-   "run_id": 23239840744,
-   "pr": null,
-   "commit": "dd1b71cdc6ba8372d1cdee60bd44a92ae8b1c385",
-   "branch": "main",
-   "event": "push",
-   "title": "Tune launch overhead (#220)",
-   "status": "completed",
-   "conclusion": "cancelled",
-   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23239840744",
-   "created_at": "2026-03-18T10:18:25Z",
-   "updated_at": "2026-03-19T10:18:27Z",
-   "actor": "amd-weisun",
-   "jobs": [
-    {
-     "runner": "linux-flydsl-mi325-1",
-     "arch": "gfx942",
-     "status": "completed",
-     "conclusion": "cancelled",
-     "started_at": "2026-03-18T10:18:26Z",
-     "completed_at": "2026-03-19T10:18:27Z",
-     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23239840744/job/67553100790"
-    },
-    {
-     "runner": "linux-flydsl-mi355-1",
-     "arch": "gfx950",
-     "status": "completed",
-     "conclusion": "cancelled",
-     "started_at": "2026-03-18T10:18:26Z",
-     "completed_at": "2026-03-19T10:18:27Z",
-     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23239840744/job/67553100953"
     }
    ]
   }
