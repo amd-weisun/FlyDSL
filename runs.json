@@ -1,8 +1,23 @@
 {
  "schema": 1,
- "updated": "2026-09-24T11:51:14Z",
+ "updated": "2026-09-24T17:15:25Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
+  {
+   "run_id": 36011049236,
+   "pr": null,
+   "commit": "89ad52fbbb9e252396829a8a44b12e18b7acd970",
+   "branch": "main",
+   "event": "push",
+   "title": "[script] Fix dumpir.sh silently succeeding with no command (#1187)",
+   "status": "queued",
+   "conclusion": null,
+   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/36011049236",
+   "created_at": "2026-09-24T14:12:03Z",
+   "updated_at": "2026-09-24T14:13:16Z",
+   "actor": "amd-weisun",
+   "jobs": []
+  },
   {
    "run_id": 35120191508,
    "pr": null,
@@ -2119,40 +2134,6 @@
      "started_at": "2026-03-21T13:11:24Z",
      "completed_at": "2026-03-21T13:11:24Z",
      "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23344346595/job/67905638389"
-    }
-   ]
-  },
-  {
-   "run_id": 23298108933,
-   "pr": null,
-   "commit": "c9db4619a361e68073be3c8efa6a77347cf2aa48",
-   "branch": "main",
-   "event": "push",
-   "title": "add claude skills (#244)",
-   "status": "completed",
-   "conclusion": "cancelled",
-   "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23298108933",
-   "created_at": "2026-03-19T13:49:29Z",
-   "updated_at": "2026-03-20T13:11:24Z",
-   "actor": "amd-weisun",
-   "jobs": [
-    {
-     "runner": "linux-flydsl-mi355-1",
-     "arch": "gfx950",
-     "status": "completed",
-     "conclusion": "cancelled",
-     "started_at": "2026-03-20T13:11:23Z",
-     "completed_at": "2026-03-20T13:11:23Z",
-     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23298108933/job/67751069634"
-    },
-    {
-     "runner": "linux-flydsl-mi325-1",
-     "arch": "gfx942",
-     "status": "in_progress",
-     "conclusion": "cancelled",
-     "started_at": "2026-03-20T13:11:23Z",
-     "completed_at": "2026-03-20T13:11:23Z",
-     "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/23298108933/job/67751069646"
     }
    ]
   }
