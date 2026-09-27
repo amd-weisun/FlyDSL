@@ -162,15 +162,33 @@ def quant_dequant(x: torch.Tensor, block: int = 128) -> torch.Tensor:
     return (q * scale).reshape(x.shape)
 
 
-def route(scores: torch.Tensor, bias: torch.Tensor):
+def route(scores: torch.Tensor, bias: torch.Tensor, n_groups: int | None = None, topk_groups: int | None = None):
     """sigmoid scores [E] -> (indices [8], probs [8]) in score order.
 
     Selection key (as in the kernel's packed-key argmax): the order-preserving bits
     of the f32 ``score + bias`` with the low byte replaced by ``255 - expert id``,
-    so keys are unique and near-ties go to the lower expert id."""
+    so keys are unique and near-ties go to the lower expert id.
+
+    ``n_groups``/``topk_groups`` add DeepSeek-V3-style group-limited routing: split
+    the experts into ``n_groups`` equal groups, keep only the ``topk_groups`` groups
+    whose top-2 (score + bias) sum is largest, and select the top-``TOP_K`` experts
+    from those groups only. The group top-2 also uses the unique packed key (not a
+    raw float topk) so a same-group tie is broken identically to the kernel's own
+    selection, rather than by torch's tie order."""
     bits = (scores.float() + bias.float()).view(torch.int32).long()
     okey = torch.where(bits >= 0, bits ^ (1 << 31), ~bits & 0xFFFFFFFF) & 0xFFFFFFFF
     key = (okey & 0xFFFFFF00) | (255 - torch.arange(N_EXPERTS, device=scores.device))
+    if n_groups is not None:
+        group_size = N_EXPERTS // n_groups
+        gkey = key.view(n_groups, group_size)
+        _, top2_local = gkey.topk(2, dim=-1)
+        top2_expert = torch.arange(n_groups, device=scores.device).unsqueeze(-1) * group_size + top2_local
+        sv = scores.float() + bias.float()
+        group_score = sv[top2_expert].sum(-1)
+        keep = torch.argsort(group_score, descending=True)[:topk_groups]
+        drop = torch.ones(n_groups, dtype=torch.bool, device=scores.device)
+        drop[keep] = False
+        key = key.view(n_groups, group_size).masked_fill(drop.unsqueeze(-1), -1).reshape(-1)
     idx = torch.argsort(key, descending=True)[:TOP_K]
     p = scores[idx]
     return idx, p / p.sum() * ROUTE_SCALE
@@ -243,12 +261,15 @@ def golden_moe(
     prob=None,
     xq=None,
     moe_mode: MoeMode | str = MoeMode.W8A8,
+    n_groups: int | None = None,
+    topk_groups: int | None = None,
 ):
     """MoE half of the layer from the post-attention hidden state ``a`` [S, HIDDEN] (bf16).
 
     ``xq`` [S, HIDDEN] overrides the quant-dequantized activation and
     ``mid``/``sel``/``prob`` ([S, 9, INTER] / [S, 9] / [S, 9]) the down-projection
     inputs, so each stage can be checked from the kernel's own inputs.
+    ``n_groups``/``topk_groups`` forward to :func:`route` for group-limited routing.
     """
     mode = as_moe_mode(moe_mode)
     fmt = moe_format(mode)
@@ -266,7 +287,7 @@ def golden_moe(
     xq = xq_ref if xq is None else xq.float()
     y = torch.zeros(S, HIDDEN, device=a.device)
     for s in range(S):
-        idx, p = route(scores[s], t["bias"])
+        idx, p = route(scores[s], t["bias"], n_groups=n_groups, topk_groups=topk_groups)
         experts = [SHARED_EXPERT] + idx.tolist()
         weights = [1.0] + p.tolist()
         mids = []

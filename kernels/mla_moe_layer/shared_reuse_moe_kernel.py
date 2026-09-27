@@ -311,8 +311,17 @@ def build_shared_reuse_kernel(
     scale: float = SOFTMAX_SCALE,
     timeline: bool = False,
     moe_mode: MoeMode | str = MoeMode.W8A8,
+    n_groups: int | None = None,
+    topk_groups: int | None = None,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer.
+
+    ``n_groups``/``topk_groups`` add DeepSeek-V3-style group-limited routing (see
+    ``reference.route``'s docstring for the exact selection semantics this mirrors);
+    ``None`` (the default) preserves GLM-5's original flat top-``TOP_K`` routing
+    unchanged. The group top-2 reduction is scoped to exactly one 32-lane wave-half
+    per group, so only ``N_EXPERTS // n_groups == 32`` is implemented today (matches
+    DeepSeek V3/R1's own ``n_group=8`` for ``N_EXPERTS=256``).
 
     ``timeline=True`` records ``s_memrealtime`` (100 MHz) at the start and end of
     every task, and once its inputs have arrived, into the ``timeline`` buffer:
@@ -326,6 +335,11 @@ def build_shared_reuse_kernel(
         "the split-attention mapping needs a whole number of wave-groups per head, heads <= 16"
     )
     assert topk % SPLIT_KEYS == 0 and 1 <= S <= 8
+    assert (n_groups is None) == (topk_groups is None), "n_groups and topk_groups must be set together"
+    assert n_groups is None or (N_EXPERTS % n_groups == 0 and N_EXPERTS // n_groups == 32), (
+        "only N_EXPERTS // n_groups == 32 is implemented (one wave-half per group)"
+    )
+    assert topk_groups is None or 1 <= topk_groups <= n_groups
     fmt = moe_format(moe_mode)
     use_fp8_block128 = fmt.activation is ExpertActivation.FP8_BLOCK128
     use_mxfp8_block32 = fmt.activation is ExpertActivation.MXFP8_BLOCK32
@@ -343,6 +357,8 @@ def build_shared_reuse_kernel(
     H = heads
     W = npes
     G = BLOCKS
+    NG = n_groups
+    TG = topk_groups
     SC, SY = layout(S, H, W, topk, moe_mode)
     N_SPLIT = topk // SPLIT_KEYS
     QB_ROWS = H * (NOPE_DIM + PE_DIM)
@@ -939,10 +955,63 @@ def build_shared_reuse_kernel(
                 raws = getf_many([(mb("scores"), s * N_EXPERTS + lane + i * 64) for i in range(N_EXPERTS // 64)])
                 stamp("ug", bid, 7)
             ks = []
+            biased = []
             for i in range_constexpr(N_EXPERTS // 64):
-                kb = (raws[i] + bs[i]).bitcast(fx.Int32)
+                biased.append(raws[i] + bs[i])
+                kb = biased[i].bitcast(fx.Int32)
                 ok = (kb >= 0).select(kb ^ fx.Int32(-(2**31)), ~kb)
                 ks.append(fx.Uint32((ok & fx.Int32(-256)) | (255 - (lane + i * 64))))
+            if const_expr(NG is not None):
+                # DeepSeek-V3-style group-limited routing (see reference.route's
+                # docstring): each 64-lane word spans exactly 2 groups of 32 experts
+                # (lanes 0-31 / 32-63), so a group's "top-2 (score + bias) sum" is a
+                # 32-lane-scoped reduction. Two passes of the unique-key wave-max (the
+                # same trick the 8-round selection below uses, just width-32 and depth-2
+                # instead of width-64 and depth-8) find that group's top-2 keys; each key
+                # is then resolved back to its original float value (ds_bpermute, exactly
+                # as the final weight recovery below does) so the two get summed as
+                # values, not as order-preserving bits.
+                lo_half = lane < 32
+                group_val, other_val = [], []
+                for i in range_constexpr(N_EXPERTS // 64):
+                    # Unsigned comparison throughout, matching the main selection below
+                    # (and _wave_umax): these keys are the classic float->monotonic-
+                    # unsigned-int bit trick, so a signed max would misorder whichever
+                    # keys end up with the top bit set (i.e. positive-scoring experts).
+                    k = ks[i]
+                    m1 = k
+                    for off in (1, 2, 4, 8, 16):
+                        m1 = fx.Uint32(_xred(m1, off, fx.max))
+                    m2 = (k == m1).select(fx.Uint32(0), k)
+                    for off in (1, 2, 4, 8, 16):
+                        m2 = fx.Uint32(_xred(m2, off, fx.max))
+                    v = []
+                    for m in (m1, m2):
+                        e_m = 255 - (m & 255)
+                        src_m = (e_m % 64) * 4
+                        v.append(
+                            fx.Int32(rocdl.ds_bpermute(T.i32, src_m.ir_value(), biased[i].bitcast(fx.Int32).ir_value()))
+                            .bitcast(fx.Float32)
+                        )
+                    group_val.append(v[0] + v[1])
+                    other_val.append(_xshfl(group_val[i], 32))
+                all_scores = []
+                for i in range_constexpr(N_EXPERTS // 64):
+                    all_scores.append(lo_half.select(group_val[i], other_val[i]))  # group 2 * i
+                    all_scores.append(lo_half.select(other_val[i], group_val[i]))  # group 2 * i + 1
+                kept = []
+                for g in range_constexpr(NG):
+                    rank = fx.Int32(0)
+                    for gp in range_constexpr(NG):
+                        if gp != g:
+                            better = (all_scores[gp] > all_scores[g]) | (
+                                (all_scores[gp] == all_scores[g]) & fx.Boolean(gp < g)
+                            )
+                            rank = rank + better.select(fx.Int32(1), fx.Int32(0))
+                    kept.append(rank < TG)
+                for i in range_constexpr(N_EXPERTS // 64):
+                    my_kept = lo_half.select(kept[2 * i], kept[2 * i + 1])
+                    ks[i] = my_kept.select(ks[i], fx.Uint32(0))
             # sort this lane's 4 keys descending; each round then takes the wave max of
             # the lane heads and shifts the winning lane's list (0 is below every key)
             for a, b in ((0, 1), (2, 3), (0, 2), (1, 3), (1, 2)):
