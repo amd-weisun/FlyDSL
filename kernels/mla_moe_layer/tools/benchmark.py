@@ -79,6 +79,8 @@ def _worker(rank, args, port):
                 npes=args.npes,
                 timeline=args.trace,
                 moe_mode=args.moe_mode,
+                n_groups=args.n_groups,
+                topk_groups=args.topk_groups,
             )
 
             def run(epoch):
@@ -211,6 +213,8 @@ def _worker(rank, args, port):
                 samples=samples,
                 pos=args.pos,
                 heads_per_rank=args.heads,
+                n_groups=args.n_groups,
+                topk_groups=args.topk_groups,
                 inter_per_rank=256,
                 seed=args.seed,
                 layers=args.layers,
@@ -239,6 +243,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("flydsl", "tilert"), required=True)
     parser.add_argument("--heads", type=int, choices=(8, 16), default=8)
+    parser.add_argument("--n-groups", type=int, default=None)
+    parser.add_argument("--topk-groups", type=int, default=None)
     parser.add_argument("--moe-mode", choices=tuple(mode.value for mode in MoeMode), default=MoeMode.W8A8.value)
     parser.add_argument("--npes", choices=(1, 2, 4, 8), type=int, required=True)
     parser.add_argument("--samples", type=int, nargs="+", choices=(1, 2, 4, 8), default=[1, 2, 4])
@@ -255,6 +261,10 @@ if __name__ == "__main__":
         parser.error("TileRT's released whole-layer kernel only supports 1 or 8 peers")
     if args.backend == "tilert" and args.heads != 8:
         parser.error("the TileRT comparison adapter only supports 8 local heads")
+    if (args.n_groups is None) != (args.topk_groups is None):
+        parser.error("--n-groups and --topk-groups must be set together")
+    if args.backend == "tilert" and args.n_groups is not None:
+        parser.error("the TileRT comparison adapter does not support group-limited routing")
     if args.backend == "tilert" and args.moe_mode not in (MoeMode.W8A8.value, MoeMode.W8A16.value):
         parser.error("the TileRT comparison adapter supports only w8a8 and w8a16 expert weights")
     if args.backend == "tilert" and any(samples == 8 for samples in args.samples):

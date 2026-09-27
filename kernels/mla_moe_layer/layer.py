@@ -50,6 +50,8 @@ class SharedReuseMlaMoeLayer:
         topk: int = 2048,
         timeline: bool = False,
         moe_mode: MoeMode | str = MoeMode.W8A8,
+        n_groups: int | None = None,
+        topk_groups: int | None = None,
     ):
         validate_shard(samples, W.heads, rank, npes, topk)
         self.moe_mode = as_moe_mode(moe_mode)
@@ -69,6 +71,8 @@ class SharedReuseMlaMoeLayer:
             topk,
             timeline=timeline,
             moe_mode=self.moe_mode,
+            n_groups=n_groups,
+            topk_groups=topk_groups,
         )
         self.stages = stage_tasks(samples, W.heads, topk)
         n_tasks = sum(n for _, n in self.stages)
