@@ -94,6 +94,9 @@ SOFTMAX_SCALE = (NOPE_DIM + PE_DIM) ** -0.5
 SUPPORTED_SAMPLES = (1, 2, 4, 8)
 SUPPORTED_PEERS = (1, 2, 4, 8)
 LOCAL_HEADS = 8
+# 16 is a spike for the DeepSeek V3/R1 port at TP8 (128 total heads / 8 ranks);
+# mirrors the split-attention kernel's own `heads % WAVES == 0 and heads <= 16`.
+SUPPORTED_HEADS = (8, 16)
 MAX_LAYERS_PER_STEP = 128
 
 
@@ -102,8 +105,8 @@ def validate_shard(samples: int, heads: int, rank: int, npes: int, topk: int) ->
 
     if samples not in SUPPORTED_SAMPLES:
         raise ValueError(f"samples must be one of {SUPPORTED_SAMPLES}, got {samples}")
-    if heads != LOCAL_HEADS:
-        raise ValueError(f"this kernel requires {LOCAL_HEADS} local heads, got {heads}")
+    if heads not in SUPPORTED_HEADS:
+        raise ValueError(f"heads must be one of {SUPPORTED_HEADS}, got {heads}")
     if npes not in SUPPORTED_PEERS:
         raise ValueError(f"npes must be one of {SUPPORTED_PEERS}, got {npes}")
     if not 0 <= rank < npes:

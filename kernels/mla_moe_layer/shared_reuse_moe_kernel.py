@@ -319,7 +319,12 @@ def build_shared_reuse_kernel(
     int64 ``[sum(task counts), TL_COLS]`` (start, hint seen, inputs staged, compute
     done, end, then free debug marks) in ``stage_tasks`` order.
     """
-    assert heads == 8, "the split-attention mapping uses one wave per local head"
+    # The split-attention score MFMA's N width is the hardware 16 (hn clamps to
+    # heads - 1 below it); heads > 16 would need a wider MFMA tiling, not just more
+    # head-groups per wave, so this only covers heads in (8, 16) today.
+    assert heads % WAVES == 0 and heads <= 16, (
+        "the split-attention mapping needs a whole number of wave-groups per head, heads <= 16"
+    )
     assert topk % SPLIT_KEYS == 0 and 1 <= S <= 8
     fmt = moe_format(moe_mode)
     use_fp8_block128 = fmt.activation is ExpertActivation.FP8_BLOCK128
@@ -1258,7 +1263,6 @@ def build_shared_reuse_kernel(
             stamp("split", tt, 0)
             s = tt // N_SPLIT  # sample
             t = tt % N_SPLIT  # 64-key chunk
-            h = wave
             nkeys, sparse = split_keys(t, s)
             gpu.barrier()
             gather_old_kv()  # before waiting for q: these rows are from earlier launches
@@ -1325,21 +1329,30 @@ def build_shared_reuse_kernel(
             fx.ptr_store(c, red + (wave * 64 + lane) * 4)
             gpu.barrier()
             stamp("split", tt, 6)
-            # split-local softmax: wave h, lane = key j (score = sum of the two K halves)
-            kidx = t * SPLIT_KEYS + lane
-            valid = kidx < nkeys
-            r16 = lane % 16
-            cl = h + 16 * (r16 // 4)
-            raw = lds_ld(red, ((lane // 16) * 64 + cl) * 4 + r16 % 4) + lds_ld(
-                red, ((lane // 16 + 4) * 64 + cl) * 4 + r16 % 4
-            )
-            sc_v = valid.select(raw * scale, fx.Float32(NEG))
-            m = wave_max(sc_v)
-            p = valid.select(_exp(sc_v - m), fx.Float32(0.0))
-            lsum = wave_sum(p)
-            p_n = _xshfl(p, 1)
-            if lane % 2 == 0:  # P^T bf16 [h][64 keys] (words h * 32 + j / 2)
-                lds_st(pl, h * (SPLIT_KEYS // 2) + lane // 2, bf16_pair(p, p_n))
+            # split-local softmax: wave h, lane = key j (score = sum of the two K halves).
+            # H may exceed WAVES (e.g. 16 heads on 8 waves): the score MFMA above already
+            # computed every head's score in one shot (its N width is the hardware 16, only
+            # clamped to H - 1 when H < 16), so recovering every head just means re-reading
+            # `red` once per wave-group instead of widening the MFMA or the wave count.
+            for hg in range_constexpr(H // WAVES):
+                h = wave + hg * WAVES
+                kidx = t * SPLIT_KEYS + lane
+                valid = kidx < nkeys
+                r16 = lane % 16
+                cl = h + 16 * (r16 // 4)
+                raw = lds_ld(red, ((lane // 16) * 64 + cl) * 4 + r16 % 4) + lds_ld(
+                    red, ((lane // 16 + 4) * 64 + cl) * 4 + r16 % 4
+                )
+                sc_v = valid.select(raw * scale, fx.Float32(NEG))
+                m = wave_max(sc_v)
+                p = valid.select(_exp(sc_v - m), fx.Float32(0.0))
+                lsum = wave_sum(p)
+                p_n = _xshfl(p, 1)
+                if lane % 2 == 0:  # P^T bf16 [h][64 keys] (words h * 32 + j / 2)
+                    lds_st(pl, h * (SPLIT_KEYS // 2) + lane // 2, bf16_pair(p, p_n))
+                if lane == 0:  # written last: the merge's readiness hint
+                    put(mb("sp_m"), (s * N_SPLIT + t) * H + h, m)
+                    put(mb("sp_l"), (s * N_SPLIT + t) * H + h, lsum)
             gpu.barrier()
             stamp("split", tt, 3)
             # O = P V on MFMA: heads M, keys K (2 steps), latent dims N.  Each V word holds
@@ -1363,13 +1376,11 @@ def build_shared_reuse_kernel(
                     b1 = fx.Vector.from_elements(w_hi, fx.Int32).bitcast(fx.BFloat16)
                     c0 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b0, c0]))
                     c1 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b1, c1]))
-                if lane < 32:  # rows (heads) 4 * (lane // 16) + e < 8
+                if lane < 16 * (H // 4):  # rows (heads) 4 * (lane // 16) + e < H
                     for e in range_constexpr(4):
                         hh = (lane // 16) * 4 + e
                         put_bf(mb("sp_acc"), ((s * N_SPLIT + t) * H + hh) * KV_LORA + dw * 2, [c0[e], c1[e]])
-            if lane == 0:  # written last: the merge's readiness hint
-                put(mb("sp_m"), (s * N_SPLIT + t) * H + h, m)
-                put(mb("sp_l"), (s * N_SPLIT + t) * H + h, lsum)
+            # sp_m / sp_l were already published per head-group above, alongside pl.
             stamp("split", tt, 4)
 
         # ========================== 6. split merge + W_UV: o = W_UV (softmax . KV)

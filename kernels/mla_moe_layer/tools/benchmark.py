@@ -49,7 +49,7 @@ def _worker(rank, args, port):
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=args.npes)
-    weights = make_weights(rank, heads=8, device=device, seed=args.seed, moe_mode=args.moe_mode)
+    weights = make_weights(rank, heads=args.heads, device=device, seed=args.seed, moe_mode=args.moe_mode)
     native = make_native_glm5_baseline(weights, device, args.moe_mode) if args.backend == "tilert" else None
     cos, sin = rope_table(4096, device=device)
 
@@ -210,7 +210,7 @@ def _worker(rank, args, port):
                 npes=args.npes,
                 samples=samples,
                 pos=args.pos,
-                heads_per_rank=8,
+                heads_per_rank=args.heads,
                 inter_per_rank=256,
                 seed=args.seed,
                 layers=args.layers,
@@ -238,6 +238,7 @@ def _worker(rank, args, port):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("flydsl", "tilert"), required=True)
+    parser.add_argument("--heads", type=int, choices=(8, 16), default=8)
     parser.add_argument("--moe-mode", choices=tuple(mode.value for mode in MoeMode), default=MoeMode.W8A8.value)
     parser.add_argument("--npes", choices=(1, 2, 4, 8), type=int, required=True)
     parser.add_argument("--samples", type=int, nargs="+", choices=(1, 2, 4, 8), default=[1, 2, 4])
@@ -252,6 +253,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.backend == "tilert" and args.npes not in (1, 8):
         parser.error("TileRT's released whole-layer kernel only supports 1 or 8 peers")
+    if args.backend == "tilert" and args.heads != 8:
+        parser.error("the TileRT comparison adapter only supports 8 local heads")
     if args.backend == "tilert" and args.moe_mode not in (MoeMode.W8A8.value, MoeMode.W8A16.value):
         parser.error("the TileRT comparison adapter supports only w8a8 and w8a16 expert weights")
     if args.backend == "tilert" and any(samples == 8 for samples in args.samples):
