@@ -24,7 +24,16 @@ import torch.multiprocessing as mp
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 
-from kernels.mla_moe_layer.config import KV_LORA, MAX_LAYERS_PER_STEP, PE_DIM, MoeMode  # noqa: E402
+from kernels.mla_moe_layer.config import (  # noqa: E402
+    HIDDEN,
+    KV_LORA,
+    MAX_LAYERS_PER_STEP,
+    NOPE_DIM,
+    PE_DIM,
+    Q_LORA,
+    V_DIM,
+    MoeMode,
+)
 from kernels.mla_moe_layer.layer import SharedReuseMlaMoeLayer  # noqa: E402
 from kernels.mla_moe_layer.native_baseline import make_native_glm5_baseline  # noqa: E402
 from kernels.mla_moe_layer.reference import make_weights, rope_table  # noqa: E402
@@ -49,7 +58,17 @@ def _worker(rank, args, port):
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
     dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=args.npes)
-    weights = make_weights(rank, heads=args.heads, device=device, seed=args.seed, moe_mode=args.moe_mode)
+    weights = make_weights(
+        rank,
+        heads=args.heads,
+        device=device,
+        seed=args.seed,
+        moe_mode=args.moe_mode,
+        hidden=args.hidden,
+        q_lora=args.q_lora,
+        nope_dim=args.nope_dim,
+        v_dim=args.v_dim,
+    )
     native = make_native_glm5_baseline(weights, device, args.moe_mode) if args.backend == "tilert" else None
     cos, sin = rope_table(4096, device=device)
 
@@ -67,7 +86,7 @@ def _worker(rank, args, port):
         ).int()
         if args.pos >= 2048:
             indices[:, -1] = torch.arange(args.pos, args.pos + samples, device=device)
-        hidden = torch.randn(samples, 6144, generator=generator, device=device).bfloat16()
+        hidden = torch.randn(samples, args.hidden, generator=generator, device=device).bfloat16()
         output = torch.empty_like(hidden)
         pos = torch.tensor([args.pos], dtype=torch.int32, device=device)
 
@@ -215,6 +234,10 @@ def _worker(rank, args, port):
                 heads_per_rank=args.heads,
                 n_groups=args.n_groups,
                 topk_groups=args.topk_groups,
+                hidden=args.hidden,
+                q_lora=args.q_lora,
+                nope_dim=args.nope_dim,
+                v_dim=args.v_dim,
                 inter_per_rank=256,
                 seed=args.seed,
                 layers=args.layers,
@@ -245,6 +268,10 @@ if __name__ == "__main__":
     parser.add_argument("--heads", type=int, choices=(8, 16), default=8)
     parser.add_argument("--n-groups", type=int, default=None)
     parser.add_argument("--topk-groups", type=int, default=None)
+    parser.add_argument("--hidden", type=int, default=HIDDEN)
+    parser.add_argument("--q-lora", type=int, default=Q_LORA)
+    parser.add_argument("--nope-dim", type=int, default=NOPE_DIM)
+    parser.add_argument("--v-dim", type=int, default=V_DIM)
     parser.add_argument("--moe-mode", choices=tuple(mode.value for mode in MoeMode), default=MoeMode.W8A8.value)
     parser.add_argument("--npes", choices=(1, 2, 4, 8), type=int, required=True)
     parser.add_argument("--samples", type=int, nargs="+", choices=(1, 2, 4, 8), default=[1, 2, 4])
@@ -261,6 +288,10 @@ if __name__ == "__main__":
         parser.error("TileRT's released whole-layer kernel only supports 1 or 8 peers")
     if args.backend == "tilert" and args.heads != 8:
         parser.error("the TileRT comparison adapter only supports 8 local heads")
+    if args.backend == "tilert" and (
+        args.hidden != HIDDEN or args.q_lora != Q_LORA or args.nope_dim != NOPE_DIM or args.v_dim != V_DIM
+    ):
+        parser.error("the TileRT comparison adapter only supports GLM-5's fixed hidden/q_lora/nope_dim/v_dim")
     if (args.n_groups is None) != (args.topk_groups is None):
         parser.error("--n-groups and --topk-groups must be set together")
     if args.backend == "tilert" and args.n_groups is not None:
