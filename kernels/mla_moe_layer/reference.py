@@ -26,7 +26,6 @@ from kernels.mla_moe_layer.config import (
     NOPE_DIM,
     PE_DIM,
     Q_LORA,
-    QKV_A_ROWS,
     ROUTE_SCALE,
     SCALE_BM,
     SHARED_EXPERT,
@@ -42,13 +41,14 @@ from kernels.mla_moe_layer.config import (
 
 
 # (name, rows, K, BK) of every FP8 matrix, rows given per local head count H.
-def fp8_mats(heads: int):
+def fp8_mats(heads: int, hidden: int = HIDDEN, q_lora: int = Q_LORA, nope_dim: int = NOPE_DIM, v_dim: int = V_DIM):
+    qkv_a_rows = q_lora + KV_LORA + PE_DIM
     return {
-        "qkv_a": (QKV_A_ROWS, HIDDEN, 128),
-        "q_b": (heads * (NOPE_DIM + PE_DIM), Q_LORA, 128),
-        "uk": (heads * KV_LORA, NOPE_DIM, 64),
-        "uv": (heads * V_DIM, KV_LORA, 128),
-        "o": (HIDDEN, heads * V_DIM, 128),
+        "qkv_a": (qkv_a_rows, hidden, 128),
+        "q_b": (heads * (nope_dim + PE_DIM), q_lora, 128),
+        "uk": (heads * KV_LORA, nope_dim, 64),
+        "uv": (heads * v_dim, KV_LORA, 128),
+        "o": (hidden, heads * v_dim, 128),
     }
 
 
@@ -74,6 +74,10 @@ def dequant(q: torch.Tensor, s: torch.Tensor, bk: int) -> torch.Tensor:
 class LayerWeights:
     heads: int
     t: dict  # name -> tensor
+    hidden: int = HIDDEN
+    q_lora: int = Q_LORA
+    nope_dim: int = NOPE_DIM
+    v_dim: int = V_DIM
 
 
 def make_weights(
@@ -82,6 +86,10 @@ def make_weights(
     device="cuda",
     seed: int = 1234,
     moe_mode: MoeMode | str = MoeMode.W8A8,
+    hidden: int = HIDDEN,
+    q_lora: int = Q_LORA,
+    nope_dim: int = NOPE_DIM,
+    v_dim: int = V_DIM,
 ) -> LayerWeights:
     """Replicated tensors share ``seed``; TP shards add ``rank`` to it."""
     expert_weight = moe_format(moe_mode).weight
@@ -89,35 +97,35 @@ def make_weights(
     shd = torch.Generator(device=device).manual_seed(seed + 1 + rank)
     t = {}
     bf = torch.bfloat16
-    t["g_in"] = (1 + 0.1 * torch.randn(HIDDEN, generator=rep, device=device)).to(bf)
-    t["g_q"] = (1 + 0.1 * torch.randn(Q_LORA, generator=rep, device=device)).to(bf)
+    t["g_in"] = (1 + 0.1 * torch.randn(hidden, generator=rep, device=device)).to(bf)
+    t["g_q"] = (1 + 0.1 * torch.randn(q_lora, generator=rep, device=device)).to(bf)
     t["g_kv"] = (1 + 0.1 * torch.randn(KV_LORA, generator=rep, device=device)).to(bf)
-    t["g_post"] = (1 + 0.1 * torch.randn(HIDDEN, generator=rep, device=device)).to(bf)
-    for name, (rows, k, bk) in fp8_mats(heads).items():
+    t["g_post"] = (1 + 0.1 * torch.randn(hidden, generator=rep, device=device)).to(bf)
+    for name, (rows, k, bk) in fp8_mats(heads, hidden, q_lora, nope_dim, v_dim).items():
         gen = rep if name == "qkv_a" else shd
         t[f"w_{name}"], t[f"s_{name}"] = _rand_fp8(rows, k, bk, gen, device)
-    t["w_r"] = (torch.randn(N_EXPERTS, HIDDEN, generator=rep, device=device) / HIDDEN**0.5 * 4).to(bf)
+    t["w_r"] = (torch.randn(N_EXPERTS, hidden, generator=rep, device=device) / hidden**0.5 * 4).to(bf)
     t["bias"] = torch.randn(N_EXPERTS, generator=rep, device=device) * 0.1
     if expert_weight is ExpertWeight.FP8_BLOCK128:
-        ug_q = torch.empty(N_EXPERTS + 1, 2 * INTER, HIDDEN, dtype=torch.float8_e4m3fn, device=device)
-        ug_s = torch.empty(N_EXPERTS + 1, *scale_shape(2 * INTER, HIDDEN, 128), device=device)
-        dn_q = torch.empty(N_EXPERTS + 1, HIDDEN, INTER, dtype=torch.float8_e4m3fn, device=device)
-        dn_s = torch.empty(N_EXPERTS + 1, *scale_shape(HIDDEN, INTER, 128), device=device)
+        ug_q = torch.empty(N_EXPERTS + 1, 2 * INTER, hidden, dtype=torch.float8_e4m3fn, device=device)
+        ug_s = torch.empty(N_EXPERTS + 1, *scale_shape(2 * INTER, hidden, 128), device=device)
+        dn_q = torch.empty(N_EXPERTS + 1, hidden, INTER, dtype=torch.float8_e4m3fn, device=device)
+        dn_s = torch.empty(N_EXPERTS + 1, *scale_shape(hidden, INTER, 128), device=device)
         for e in range(N_EXPERTS + 1):
-            ug_q[e], ug_s[e] = _rand_fp8(2 * INTER, HIDDEN, 128, shd, device)
-            dn_q[e], dn_s[e] = _rand_fp8(HIDDEN, INTER, 128, shd, device)
+            ug_q[e], ug_s[e] = _rand_fp8(2 * INTER, hidden, 128, shd, device)
+            dn_q[e], dn_s[e] = _rand_fp8(hidden, INTER, 128, shd, device)
     else:
-        ug_q = torch.empty(N_EXPERTS + 1, 2 * INTER, HIDDEN // 2, dtype=torch.uint8, device=device)
-        ug_s = torch.empty(N_EXPERTS + 1, 2 * INTER, HIDDEN // 32, dtype=torch.uint8, device=device)
-        dn_q = torch.empty(N_EXPERTS + 1, HIDDEN, INTER // 2, dtype=torch.uint8, device=device)
-        dn_s = torch.empty(N_EXPERTS + 1, HIDDEN, INTER // 32, dtype=torch.uint8, device=device)
+        ug_q = torch.empty(N_EXPERTS + 1, 2 * INTER, hidden // 2, dtype=torch.uint8, device=device)
+        ug_s = torch.empty(N_EXPERTS + 1, 2 * INTER, hidden // 32, dtype=torch.uint8, device=device)
+        dn_q = torch.empty(N_EXPERTS + 1, hidden, INTER // 2, dtype=torch.uint8, device=device)
+        dn_s = torch.empty(N_EXPERTS + 1, hidden, INTER // 32, dtype=torch.uint8, device=device)
         for e in range(N_EXPERTS + 1):
-            ug = torch.randn(2 * INTER, HIDDEN, generator=shd, device=device) / HIDDEN**0.5
-            dn = torch.randn(HIDDEN, INTER, generator=shd, device=device) / INTER**0.5
+            ug = torch.randn(2 * INTER, hidden, generator=shd, device=device) / hidden**0.5
+            dn = torch.randn(hidden, INTER, generator=shd, device=device) / INTER**0.5
             ug_q[e], ug_s[e] = quantize_mxfp4(ug)
             dn_q[e], dn_s[e] = quantize_mxfp4(dn)
     t["w_ug"], t["s_ug"], t["w_dn"], t["s_dn"] = ug_q, ug_s, dn_q, dn_s
-    return LayerWeights(heads, t)
+    return LayerWeights(heads, t, hidden=hidden, q_lora=q_lora, nope_dim=nope_dim, v_dim=v_dim)
 
 
 def dequant_expert(q: torch.Tensor, scale: torch.Tensor, weight: ExpertWeight) -> torch.Tensor:
@@ -212,17 +220,21 @@ def golden_layer(
     Returns a dict of intermediates keyed like the kernel's debug scratch.
     """
     t, H = W.t, W.heads
+    q_lora, nope_dim, v_dim = W.q_lora, W.nope_dim, W.v_dim
     S = h.shape[0]
-    dq = {n: dequant(t[f"w_{n}"], t[f"s_{n}"], bk) for n, (_, _, bk) in fp8_mats(H).items()}
+    dq = {
+        n: dequant(t[f"w_{n}"], t[f"s_{n}"], bk)
+        for n, (_, _, bk) in fp8_mats(H, W.hidden, q_lora, nope_dim, v_dim).items()
+    }
     # GEMV activations are bf16 (MFMA inputs); weights are exact block-scaled FP8
     x = bf(rmsnorm(h, t["g_in"]))
     qkv = x @ dq["qkv_a"].T
-    q_a, kv_a = qkv[:, :Q_LORA], qkv[:, Q_LORA:]
-    qb = (bf(rmsnorm(q_a, t["g_q"])) @ dq["q_b"].T).view(S, H, NOPE_DIM + PE_DIM)
-    q_nope = qb[..., :NOPE_DIM]
+    q_a, kv_a = qkv[:, :q_lora], qkv[:, q_lora:]
+    qb = (bf(rmsnorm(q_a, t["g_q"])) @ dq["q_b"].T).view(S, H, nope_dim + PE_DIM)
+    q_nope = qb[..., :nope_dim]
     pos = [cur_pos + s for s in range(S)]
-    q_pe = torch.stack([rope(qb[s, :, NOPE_DIM:], cos[pos[s]], sin[pos[s]]) for s in range(S)])
-    q_lat = torch.einsum("hkd,shd->shk", dq["uk"].view(H, KV_LORA, NOPE_DIM), bf(q_nope))
+    q_pe = torch.stack([rope(qb[s, :, nope_dim:], cos[pos[s]], sin[pos[s]]) for s in range(S)])
+    q_lat = torch.einsum("hkd,shd->shk", dq["uk"].view(H, KV_LORA, nope_dim), bf(q_nope))
     for s in range(S):
         kv_cache[pos[s]] = rmsnorm(kv_a[s, :KV_LORA], t["g_kv"]).to(torch.bfloat16)
         pe_cache[pos[s]] = rope(kv_a[s, KV_LORA:], cos[pos[s]], sin[pos[s]]).to(torch.bfloat16)
@@ -244,7 +256,7 @@ def golden_layer(
         mx = torch.stack(ms).amax(0)
         w = [torch.exp(m - mx) for m in ms]
         o_lat[s] = sum(a * wi for a, wi in zip(accs, w)) / sum(li * wi for li, wi in zip(ls, w))
-    o = torch.einsum("hvk,shk->shv", dq["uv"].view(H, V_DIM, KV_LORA), bf(o_lat)).reshape(S, H * V_DIM)
+    o = torch.einsum("hvk,shk->shv", dq["uv"].view(H, v_dim, KV_LORA), bf(o_lat)).reshape(S, H * v_dim)
     a = (h.float() + allreduce(bf(o) @ dq["o"].T)).to(torch.bfloat16)
     moe = golden_moe(W, a, allreduce, moe_mode=moe_mode)
     res = dict(q_a=q_a, kv_a=kv_a, q_nope=q_nope, q_pe=q_pe, q_lat=q_lat, o=o, a=a)
@@ -285,7 +297,7 @@ def golden_moe(
     else:
         xq_ref = bf(x2)
     xq = xq_ref if xq is None else xq.float()
-    y = torch.zeros(S, HIDDEN, device=a.device)
+    y = torch.zeros(S, W.hidden, device=a.device)
     for s in range(S):
         idx, p = route(scores[s], t["bias"], n_groups=n_groups, topk_groups=topk_groups)
         experts = [SHARED_EXPERT] + idx.tolist()

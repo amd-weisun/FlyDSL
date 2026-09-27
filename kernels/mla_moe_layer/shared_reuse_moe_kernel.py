@@ -91,12 +91,12 @@ N_QKV_A = QKV_A_ROWS // QKV_A_TILE
 N_ROW_TILES = HIDDEN // ROW_TILE
 
 
-def dn_tile(S: int) -> int:
+def dn_tile(S: int, hidden: int = HIDDEN) -> int:
     """Hidden rows per expert-down / FFN peer-reduce task: 32 at S = 1 (192 tasks,
     placed off the router CTAs, whose up/gate task finishes last, so every down task
     streams its weights during the mid wait); 24 above (one task per CTA), where
     each down task already streams S x 9 experts."""
-    return 32 if S == 1 else HIDDEN // BLOCKS
+    return 32 if S == 1 else hidden // BLOCKS
 
 
 N_ROUTER = N_EXPERTS // ROUTER_TILE
@@ -116,43 +116,53 @@ def _align(n, a=256):
     return (n + a - 1) // a * a
 
 
-def layout(S: int, heads: int, npes: int, topk: int, moe_mode: MoeMode | str = MoeMode.W8A8):
+def layout(
+    S: int,
+    heads: int,
+    npes: int,
+    topk: int,
+    moe_mode: MoeMode | str = MoeMode.W8A8,
+    hidden: int = HIDDEN,
+    q_lora: int = Q_LORA,
+    nope_dim: int = NOPE_DIM,
+    v_dim: int = V_DIM,
+):
     """Byte offsets of the per-rank scratch and of the symmetric buffer.
 
     Every mailbox holds ``(value, tag)`` int32 pairs (8 bytes per element)."""
     fmt = moe_format(moe_mode)
     quant_group = fmt.activation_group
-    xq_blocks = 0 if quant_group is None else HIDDEN // quant_group
+    xq_blocks = 0 if quant_group is None else hidden // quant_group
     n_split = topk // SPLIT_KEYS
     pr = 8
     items = [
-        ("q_a", S * Q_LORA * pr),
+        ("q_a", S * q_lora * pr),
         ("kv_a", S * (KV_LORA + PE_DIM) * pr),
         ("kvnew", S * KV_LORA * pr),  # this launch's KV cache rows (bf16 values)
         ("penew", S * PE_DIM * pr),
-        ("q_nope", S * heads * NOPE_DIM * pr),
+        ("q_nope", S * heads * nope_dim * pr),
         ("q_pe", S * heads * PE_DIM * pr),
         ("q_lat", S * heads * KV_LORA * pr),
         ("sp_acc", S * n_split * heads * KV_LORA * pr),
         ("sp_m", S * n_split * heads * pr),
         ("sp_l", S * n_split * heads * pr),
-        ("o", S * heads * V_DIM * pr),
-        ("a", S * HIDDEN * pr),  # post-attention hidden (bf16 values)
+        ("o", S * heads * v_dim * pr),
+        ("a", S * hidden * pr),  # post-attention hidden (bf16 values)
         ("scores", S * N_EXPERTS * pr),
-        ("xq", S * HIDDEN // (4 if quant_group is not None else 2) * pr),
+        ("xq", S * hidden // (4 if quant_group is not None else 2) * pr),
         ("xqs", S * xq_blocks * pr),
         ("sel", S * MOE_SLOTS * pr),
         ("prob", S * MOE_SLOTS * pr),
         ("mid", S * MOE_SLOTS * INTER * pr),
         ("ugp", BLOCKS * S * 2 * UG_TILE * pr),  # up/gate K-segment partial sums
-        ("xqd", S * HIDDEN * 4),  # debug: dequantized MoE activation (plain f32)
+        ("xqd", S * hidden * 4),  # debug: dequantized MoE activation (plain f32)
     ]
     off, scratch = 0, {}
     for name, size in items:
         scratch[name] = off
         off += _align(size)
     scratch["_bytes"] = off
-    part = npes * S * HIDDEN * pr
+    part = npes * S * hidden * pr
     sym = {"attn": 0, "ffn": part, "_bytes": 2 * part}
     return scratch, sym
 
@@ -284,22 +294,33 @@ def _mxfp4_to_bf16x8(word, scale):
     return fx.Vector.from_elements(parts, fx.BFloat16)
 
 
-def stage_tasks(S: int, heads: int, topk: int):
+def stage_tasks(
+    S: int,
+    heads: int,
+    topk: int,
+    hidden: int = HIDDEN,
+    q_lora: int = Q_LORA,
+    nope_dim: int = NOPE_DIM,
+    v_dim: int = V_DIM,
+):
     """[(stage name, task count)] in execution order."""
+    qkv_a_rows = q_lora + KV_LORA + PE_DIM
+    n_qkv_a = qkv_a_rows // QKV_A_TILE
+    n_row_tiles = hidden // ROW_TILE
     return [
-        ("qkv_a", N_QKV_A),
+        ("qkv_a", n_qkv_a),
         ("cache", 1),
-        ("q_b", heads * (NOPE_DIM + PE_DIM) // Q_B_TILE),
+        ("q_b", heads * (nope_dim + PE_DIM) // Q_B_TILE),
         ("uk", heads * KV_LORA // UK_TILE),
         ("split", S * (topk // SPLIT_KEYS)),
-        ("uv", S * (heads * V_DIM // UV_TILE)),
-        ("o", N_ROW_TILES),
+        ("uv", S * (heads * v_dim // UV_TILE)),
+        ("o", n_row_tiles),
         ("router", S * N_ROUTER),
         (
             "ug",
             (BLOCKS if S == 1 else S * BLOCKS),
         ),
-        ("down", HIDDEN // dn_tile(S)),
+        ("down", hidden // dn_tile(S, hidden)),
     ]
 
 
@@ -313,6 +334,10 @@ def build_shared_reuse_kernel(
     moe_mode: MoeMode | str = MoeMode.W8A8,
     n_groups: int | None = None,
     topk_groups: int | None = None,
+    hidden: int = HIDDEN,
+    q_lora: int = Q_LORA,
+    nope_dim: int = NOPE_DIM,
+    v_dim: int = V_DIM,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer.
 
@@ -322,6 +347,15 @@ def build_shared_reuse_kernel(
     unchanged. The group top-2 reduction is scoped to exactly one 32-lane wave-half
     per group, so only ``N_EXPERTS // n_groups == 32`` is implemented today (matches
     DeepSeek V3/R1's own ``n_group=8`` for ``N_EXPERTS=256``).
+
+    ``hidden``/``q_lora``/``nope_dim``/``v_dim`` default to GLM-5's own fixed shard
+    and override the module constants of the same name for this build only (a
+    DeepSeek-V3/R1-at-TP8 spike: hidden=7168, q_lora=1536, nope_dim=128, v_dim=128 —
+    kv_lora_rank/qk_rope_head_dim already match GLM-5's KV_LORA/PE_DIM exactly, so
+    those two stay fixed). Every tile constant (``UK_TILE``, ``UV_TILE``,
+    ``Q_B_TILE``, ``ROW_TILE``, ...) must still divide the corresponding overridden
+    dimension; this is checked only by the asserts already present per stage, not
+    exhaustively re-verified for arbitrary overrides.
 
     ``timeline=True`` records ``s_memrealtime`` (100 MHz) at the start and end of
     every task, and once its inputs have arrived, into the ``timeline`` buffer:
@@ -340,6 +374,22 @@ def build_shared_reuse_kernel(
         "only N_EXPERTS // n_groups == 32 is implemented (one wave-half per group)"
     )
     assert topk_groups is None or 1 <= topk_groups <= n_groups
+    # Shadow the module-level fixed-shard constants of the same name with this
+    # build's overrides (see the DeepSeek-shape note above) before anything else in
+    # this function reads them; every later reference to the bare names
+    # HIDDEN/Q_LORA/NOPE_DIM/V_DIM in this function (including inside
+    # shared_reuse_kernel and its nested helpers below) resolves to these, not the
+    # GLM-5 module constants, because Python treats a name assigned anywhere in a
+    # function as local to the whole function (so this block must run first, or
+    # any earlier read raises UnboundLocalError instead of silently using the
+    # module default).
+    HIDDEN = hidden
+    Q_LORA = q_lora
+    NOPE_DIM = nope_dim
+    V_DIM = v_dim
+    QKV_A_ROWS = Q_LORA + KV_LORA + PE_DIM
+    N_QKV_A = QKV_A_ROWS // QKV_A_TILE
+    N_ROW_TILES = HIDDEN // ROW_TILE
     fmt = moe_format(moe_mode)
     use_fp8_block128 = fmt.activation is ExpertActivation.FP8_BLOCK128
     use_mxfp8_block32 = fmt.activation is ExpertActivation.MXFP8_BLOCK32
@@ -359,7 +409,7 @@ def build_shared_reuse_kernel(
     G = BLOCKS
     NG = n_groups
     TG = topk_groups
-    SC, SY = layout(S, H, W, topk, moe_mode)
+    SC, SY = layout(S, H, W, topk, moe_mode, hidden=HIDDEN, q_lora=Q_LORA, nope_dim=NOPE_DIM, v_dim=V_DIM)
     N_SPLIT = topk // SPLIT_KEYS
     QB_ROWS = H * (NOPE_DIM + PE_DIM)
     N_QB = QB_ROWS // Q_B_TILE
@@ -379,16 +429,16 @@ def build_shared_reuse_kernel(
     PT_OFF = KT_OFF + SPLIT_KEYS * KS
     XN = max(S * HIDDEN // 2, PT_OFF + SPLIT_KEYS * PS)
     ON = S * UK_TILE
-    DN_TILE = dn_tile(S)
+    DN_TILE = dn_tile(S, HIDDEN)
     N_DN_TILES = HIDDEN // DN_TILE
 
     base, first, acc = {}, {}, 0
-    for name, n in stage_tasks(S, H, topk):
+    for name, n in stage_tasks(S, H, topk, hidden=HIDDEN, q_lora=Q_LORA, nope_dim=NOPE_DIM, v_dim=V_DIM):
         first[name] = acc
         acc += n
     # CTA placement: split before uk, so every split tile lands on a CTA freed by
     # qkv_a (uk shares the q_b CTAs it waits on anyway)
-    tasks = dict(stage_tasks(S, H, topk))
+    tasks = dict(stage_tasks(S, H, topk, hidden=HIDDEN, q_lora=Q_LORA, nope_dim=NOPE_DIM, v_dim=V_DIM))
     acc = 0
     for name in ("qkv_a", "cache", "q_b", "split", "uk", "uv", "o", "router", "ug", "down"):
         base[name] = acc % G
@@ -776,19 +826,42 @@ def build_shared_reuse_kernel(
 
             return f
 
+        def _rmsnorm_tail_ks(n):
+            """This thread's n // 4 group-of-4 starting element indices.
+
+            n need only be a multiple of 4 (not 4 * THREADS): when n // 4 isn't a
+            multiple of THREADS, the last entry is clamped to the final real group
+            instead of running out of bounds, so threads past the end redundantly
+            reread/rewrite that group (idempotent: same k, same value, everywhere).
+            ``active`` masks that lane's contribution to a cross-lane sum (writes
+            need no mask since the redundant write is idempotent); None when n // 4
+            is an exact multiple of THREADS (no tail)."""
+            nq = n // 4
+            full = nq // THREADS
+            ks = [(tid + i * THREADS) * 4 for i in range(full)]
+            active = None
+            if const_expr(nq % THREADS):
+                w = tid + full * THREADS
+                active = w < nq
+                ks.append(fx.min(w, nq - 1) * 4)
+            return ks, active
+
         def stage_x_rmsnorm(ld4s, n, gamma, mark=None, loaded=None, count=S):
             """LDS bf16 X[s][0:n] = bf16(rmsnorm(x_s) * gamma) for every sample s, where
             ld4s([(s, k)]) -> [(x_s[k], .., x_s[k+3])] (one batched load); returns the rstds.
             ``loaded``: the (gamma, x) loads already issued by load_x_rmsnorm."""
-            per = n // (4 * THREADS)
-            ks = [(tid + i * THREADS) * 4 for i in range(per)]
+            ks, active = _rmsnorm_tail_ks(n)
+            per = len(ks)
             gs, vals = loaded if loaded is not None else load_x_rmsnorm(ld4s, n, gamma, count)
             sss = []
             for s in range_constexpr(count):
                 ss = fx.Float32(0.0)
                 for i in range_constexpr(per):
                     for a in vals[s * per + i]:
-                        ss = ss + a * a
+                        term = a * a
+                        if const_expr(active is not None and i == per - 1):
+                            term = active.select(term, fx.Float32(0.0))
+                        ss = ss + term
                 sss.append(ss)
             if const_expr(mark is not None):
                 stamp(mark[0], mark[1], 6)
@@ -809,7 +882,7 @@ def build_shared_reuse_kernel(
         def load_x_rmsnorm(ld4s, n, gamma, count=S):
             """The gamma loads (issued ahead of the wait), then ld4s -> (gammas, x values)."""
             rg_ = _rsrc(gamma)
-            ks = [(tid + i * THREADS) * 4 for i in range(n // (4 * THREADS))]
+            ks, _ = _rmsnorm_tail_ks(n)
             gs = []
             for k in ks:
                 g = fx.Vector(bo.buffer_load(rg_, k // 2, vec_width=2, dtype=T.i32)).bitcast(fx.BFloat16).to(fx.Float32)
@@ -870,15 +943,23 @@ def build_shared_reuse_kernel(
         def stage_moe_input(samples):
             """Stage normalized expert inputs published by the router into LDS."""
             if const_expr(use_fp8_block128):
-                nxw = HIDDEN // 4 // THREADS
+                # HIDDEN // 4 slots (one poll pair each, 4 packed FP8 bytes per slot);
+                # when that isn't a multiple of THREADS the last slot is clamped
+                # (redundant, idempotent re-read/rewrite -- see _rmsnorm_tail_ks).
+                nq = HIDDEN // 4
+                full = nq // THREADS
+                xk = [tid + i * THREADS for i in range(full)]
+                if const_expr(nq % THREADS):
+                    xk.append(fx.min(tid + full * THREADS, nq - 1))
+                nxw = len(xk)
                 got = poll(
-                    [(mb("xq"), sx * (HIDDEN // 4) + tid + i * THREADS, 1) for sx in samples for i in range(nxw)]
+                    [(mb("xq"), sx * nq + k, 1) for sx in samples for k in xk]
                     + [(mb("xqs"), sx * XQ_BLOCKS + fx.min(tid, XQ_BLOCKS - 1), 1) for sx in samples]
                 )
                 for j in range_constexpr(len(samples)):
                     for i in range_constexpr(nxw):
-                        wd = f8_word((tid + i * THREADS) * 4)
-                        lds_st(xs, j * (HIDDEN // 4) + wd, got[j * nxw + i][0].bitcast(fx.Float32))
+                        wd = f8_word(xk[i] * 4)
+                        lds_st(xs, j * nq + wd, got[j * nxw + i][0].bitcast(fx.Float32))
                     if tid < XQ_BLOCKS:
                         lds_st(
                             misc,
@@ -1755,17 +1836,22 @@ def build_shared_reuse_kernel(
                 pre = [u_ug8(cc, fx.Int32(SHARED_EXPERT), has_sh) for cc in range(UG8_UNITS)]
                 hint_wait(N_ROW_TILES, lambda k: (mb("a"), s_u * HIDDEN + k * ROW_TILE + ROW_TILE - 1), mark=("ug", u))
                 # the sum of squares takes the router's element partition and order
-                # (stage_x_rmsnorm), so rstd -- and every FP8 rounding -- is bit-identical
-                NQ4 = HIDDEN // (4 * THREADS)
+                # (stage_x_rmsnorm, via the same _rmsnorm_tail_ks), so rstd -- and
+                # every FP8 rounding -- is bit-identical
+                nq4_ks, nq4_active = _rmsnorm_tail_ks(HIDDEN)
+                NQ4 = len(nq4_ks)
                 got = poll(
-                    [(mb("a"), (s_u * HIDDEN + (tid + i * THREADS) * 4) // 2, 2) for i in range(NQ4)]
+                    [(mb("a"), (s_u * HIDDEN + k) // 2, 2) for k in nq4_ks]
                     + [(mb("a"), (s_u * HIDDEN + k) // 2, 1) for k in ks_]
                 )
                 av = [bf2_f32(w[0]) for w in got[NQ4:]]
                 ss = fx.Float32(0.0)
-                for w in got[:NQ4]:
-                    for a in list(bf2_f32(w[0])) + list(bf2_f32(w[1])):
-                        ss = ss + a * a
+                for i in range_constexpr(NQ4):
+                    for a in list(bf2_f32(got[i][0])) + list(bf2_f32(got[i][1])):
+                        term = a * a
+                        if const_expr(nq4_active is not None and i == NQ4 - 1):
+                            term = nq4_active.select(term, fx.Float32(0.0))
+                        ss = ss + term
                 rstd = _rsq(block_sum(ss) * (1.0 / HIDDEN) + EPS)
                 for j in range_constexpr(NB):
                     v0, v1 = av[j][0] * rstd * gps[j][0], av[j][1] * rstd * gps[j][1]

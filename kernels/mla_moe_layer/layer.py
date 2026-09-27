@@ -8,7 +8,6 @@ from __future__ import annotations
 import torch
 
 from kernels.mla_moe_layer.config import (
-    HIDDEN,
     INTER,
     MAX_LAYERS_PER_STEP,
     MOE_SLOTS,
@@ -57,7 +56,8 @@ class SharedReuseMlaMoeLayer:
         self.moe_mode = as_moe_mode(moe_mode)
         self.W, self.S, self.rank, self.npes, self.topk = W, samples, rank, npes, topk
         self.packed = pack_layer_weights(W.t, self.moe_mode)
-        self.scr_layout, self.sym_layout = layout(samples, W.heads, npes, topk, self.moe_mode)
+        dims = dict(hidden=W.hidden, q_lora=W.q_lora, nope_dim=W.nope_dim, v_dim=W.v_dim)
+        self.scr_layout, self.sym_layout = layout(samples, W.heads, npes, topk, self.moe_mode, **dims)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
         self.peer_buffer = SymmetricPeerBuffer(self.sym_layout["_bytes"], rank=rank, npes=npes, group=group)
@@ -73,8 +73,9 @@ class SharedReuseMlaMoeLayer:
             moe_mode=self.moe_mode,
             n_groups=n_groups,
             topk_groups=topk_groups,
+            **dims,
         )
-        self.stages = stage_tasks(samples, W.heads, topk)
+        self.stages = stage_tasks(samples, W.heads, topk, **dims)
         n_tasks = sum(n for _, n in self.stages)
         self.timeline = torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev) if timeline else None
         self.step = torch.zeros(1, dtype=torch.int32, device=dev)  # decode-step counter
@@ -103,7 +104,7 @@ class SharedReuseMlaMoeLayer:
             raise ValueError(f"layer must be in [0, {MAX_LAYERS_PER_STEP}), got {layer}")
         t = dict(self.W.t, **self.packed)
         if x_out is None:
-            x_out = torch.empty(self.S, HIDDEN, dtype=torch.bfloat16, device=h.device)
+            x_out = torch.empty(self.S, self.W.hidden, dtype=torch.bfloat16, device=h.device)
         p = lambda x: x.data_ptr()  # noqa: E731
         self.launch(
             p(h),
@@ -184,22 +185,23 @@ class SharedReuseMlaMoeLayer:
 
     def intermediates(self):
         S, H = self.S, self.W.heads
-        from kernels.mla_moe_layer.config import KV_LORA, NOPE_DIM, PE_DIM, Q_LORA, V_DIM
+        from kernels.mla_moe_layer.config import KV_LORA, PE_DIM
 
+        hidden, q_lora, nope_dim, v_dim = self.W.hidden, self.W.q_lora, self.W.nope_dim, self.W.v_dim
         mid = self.debug("mid", (S, MOE_SLOTS, INTER))
         if moe_format(self.moe_mode).activation is ExpertActivation.BF16:
             mid = mid.to(torch.bfloat16).float()
         return dict(
-            q_a=self.debug("q_a", (S, Q_LORA)),
+            q_a=self.debug("q_a", (S, q_lora)),
             kv_a=self.debug("kv_a", (S, KV_LORA + PE_DIM)),
-            q_nope=self.debug("q_nope", (S, H, NOPE_DIM), bf2=True),
+            q_nope=self.debug("q_nope", (S, H, nope_dim), bf2=True),
             q_pe=self.debug("q_pe", (S, H, PE_DIM), bf2=True),
             q_lat=self.debug("q_lat", (S, H, KV_LORA), bf2=True),
-            o=self.debug("o", (S, H * V_DIM), bf2=True),
-            a=self.debug("a", (S, HIDDEN), bf2=True).to(torch.bfloat16),
+            o=self.debug("o", (S, H * v_dim), bf2=True),
+            a=self.debug("a", (S, hidden), bf2=True).to(torch.bfloat16),
             scores=self.debug("scores", (S, N_EXPERTS)),
             sel=self.debug("sel", (S, MOE_SLOTS), torch.int32),
             prob=self.debug("prob", (S, MOE_SLOTS)),
             mid=mid,
-            xq=self.debug("xqd", (S, HIDDEN), pairs=False),
+            xq=self.debug("xqd", (S, hidden), pairs=False),
         )
