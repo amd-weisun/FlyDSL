@@ -159,6 +159,9 @@ def _worker(rank, args, port):
         run(0)
         torch.cuda.synchronize()
         reference = output.clone()
+        # Without this, the graph's first captured iteration reuses this call's
+        # (step, layer=0) mailbox tag on its first replay, deadlocking npes=8.
+        advance()
         if args.dump_outputs:
             target = Path(args.dump_outputs)
             target.mkdir(parents=True, exist_ok=True)
