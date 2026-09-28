@@ -30,6 +30,9 @@ import torch
 from kernels.common.mx_formats import quant_dequant_mxfp8, quantize_mxfp4
 from kernels.dsv4_moe_layer.config import (
     EPS,
+    HC_EPS,
+    HC_MULT,
+    HC_SINKHORN_ITERS,
     HEAD_DIM,
     HIDDEN,
     INTER,
@@ -78,6 +81,13 @@ class V4Config:
     swiglu_limit: float = SWIGLU_LIMIT
     eps: float = EPS
     rope_theta: float = 1.0e4
+    hc_mult: int = HC_MULT  # 1 = plain residual
+    hc_sinkhorn_iters: int = HC_SINKHORN_ITERS
+    hc_eps: float = HC_EPS
+
+    @property
+    def hc_mix(self) -> int:
+        return (2 + self.hc_mult) * self.hc_mult
 
     @property
     def nope_dim(self) -> int:
@@ -151,6 +161,17 @@ def make_weights(
         gen = rep if name == "qkv_a" else shd
         t[f"w_{name}"], t[f"s_{name}"] = _rand_fp8(rows, k, bk, gen, device)
 
+    if cfg.hc_mult > 1:
+        # hyper-connection mixers, fp32 in the checkpoint. Replicated: every rank
+        # must derive the same pre/post/comb or the residual streams diverge.
+        for side in ("attn", "ffn"):
+            t[f"hc_{side}_fn"] = (
+                torch.randn(cfg.hc_mix, cfg.hc_mult * cfg.hidden, generator=rep, device=device)
+                / (cfg.hc_mult * cfg.hidden) ** 0.5
+            )
+            t[f"hc_{side}_base"] = torch.randn(cfg.hc_mix, generator=rep, device=device) * 0.5
+            t[f"hc_{side}_scale"] = torch.rand(3, generator=rep, device=device) + 0.5
+
     t["w_r"] = (torch.randn(cfg.n_experts, cfg.hidden, generator=rep, device=device) / cfg.hidden**0.5 * 4).to(bfl)
     t["bias"] = torch.randn(cfg.n_experts, generator=rep, device=device) * 0.1
 
@@ -182,6 +203,49 @@ def rmsnorm(x: torch.Tensor, g: torch.Tensor | None, eps: float) -> torch.Tensor
     x = x.float()
     y = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
     return y if g is None else y * g.float()
+
+
+def hc_split_sinkhorn(mixes: torch.Tensor, scale, base, cfg: V4Config):
+    """Split the mix vector into hyper-connection coefficients.
+
+    ``mixes`` [..., (2 + hc) * hc], packed pre | post | comb. ``comb`` is
+    row-softmaxed then Sinkhorn-normalised towards doubly stochastic, which is
+    the "manifold constraint" in mHC.
+    """
+    hc, eps = cfg.hc_mult, cfg.hc_eps
+    pre = torch.sigmoid(mixes[..., :hc] * scale[0] + base[:hc]) + eps
+    post = 2 * torch.sigmoid(mixes[..., hc : 2 * hc] * scale[1] + base[hc : 2 * hc])
+    comb = (mixes[..., 2 * hc :] * scale[2] + base[2 * hc :]).unflatten(-1, (hc, hc))
+    comb = comb.softmax(-1) + eps
+    comb = comb / (comb.sum(-2, keepdim=True) + eps)
+    for _ in range(cfg.hc_sinkhorn_iters - 1):
+        comb = comb / (comb.sum(-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(-2, keepdim=True) + eps)
+    return pre, post, comb
+
+
+def hc_pre(x: torch.Tensor, fn: torch.Tensor, scale, base, cfg: V4Config):
+    """[S, hc, hidden] -> ([S, hidden], post [S, hc], comb [S, hc, hc]).
+
+    The mixes come from a weightless RMS scale over the *whole* hc*hidden stream,
+    so this is a reduction over 4x the layer width before anything else runs.
+    """
+    shape, dtype = x.size(), x.dtype
+    xf = x.flatten(-2).float()
+    rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + cfg.eps)
+    mixes = torch.nn.functional.linear(xf, fn.float()) * rsqrt
+    pre, post, comb = hc_split_sinkhorn(mixes, scale, base, cfg)
+    y = (pre.unsqueeze(-1) * xf.view(shape)).sum(dim=-2)
+    return y.to(dtype), post, comb
+
+
+def hc_post(x: torch.Tensor, residual: torch.Tensor, post, comb):
+    """([S, hidden], residual [S, hc, hidden]) -> [S, hc, hidden].
+
+    out[k] = post[k] * x + sum_j comb[j, k] * residual[j]
+    """
+    mixed = (comb.unsqueeze(-1) * residual.unsqueeze(-2).float()).sum(dim=-3)
+    return (post.unsqueeze(-1) * x.unsqueeze(-2).float() + mixed).type_as(x)
 
 
 def window_idxs(cur_pos: int, samples: int, window: int, device) -> torch.Tensor:
@@ -237,6 +301,9 @@ def golden_layer(
 ):
     """One rank's view of a sliding-window-only V4 layer. Mutates ``kv_cache``.
 
+    ``h`` is [S, hidden] when ``cfg.hc_mult == 1`` (plain residual) and
+    [S, hc_mult, hidden] otherwise -- V4 carries hc_mult parallel residual
+    streams, contracted to one by ``hc_pre`` and re-expanded by ``hc_post``.
     ``kv_cache`` is a ring of ``cfg.window`` rows of ``head_dim`` (K and V both).
     ``indices`` [S, n_keys] are ring slots, -1 meaning "not yet written".
     Returns a dict of intermediates keyed like the kernel's debug scratch.
@@ -246,7 +313,11 @@ def golden_layer(
     rd, hd = cfg.rope_dim, cfg.head_dim
     dq = {n: dequant(t[f"w_{n}"], t[f"s_{n}"], bk) for n, (_, _, bk) in fp8_mats(cfg).items()}
 
-    x = bf(rmsnorm(h, t["g_in"], cfg.eps))
+    if cfg.hc_mult > 1:
+        xin, post_a, comb_a = hc_pre(h, t["hc_attn_fn"], t["hc_attn_scale"], t["hc_attn_base"], cfg)
+    else:
+        xin, post_a, comb_a = h, None, None
+    x = bf(rmsnorm(xin, t["g_in"], cfg.eps))
     qkv = x @ dq["qkv_a"].T
     q_a, kv = qkv[:, : cfg.q_lora], qkv[:, cfg.q_lora :]
 
@@ -298,10 +369,14 @@ def golden_layer(
     og = bf(o).reshape(S, cfg.o_groups, cfg.group_dim)
     wa = dq["o_a"].view(cfg.o_groups, cfg.o_lora, cfg.group_dim)
     o_lora = torch.einsum("sgd,grd->sgr", og, wa).reshape(S, cfg.o_groups * cfg.o_lora)
-    a = (h.float() + allreduce(bf(o_lora) @ dq["o_b"].T)).to(torch.bfloat16)
+    attn_out = allreduce(bf(o_lora) @ dq["o_b"].T)
+    if cfg.hc_mult > 1:
+        a = hc_post(attn_out.to(torch.bfloat16), h, post_a, comb_a)
+    else:
+        a = (h.float() + attn_out).to(torch.bfloat16)
 
     moe = golden_moe(W, a, allreduce, moe_mode=moe_mode)
-    res = dict(q_a=q_a, kv=kv, q=q, o=o, o_lora=o_lora, a=a)
+    res = dict(q_a=q_a, kv=kv, q=q, o=o, o_lora=o_lora, a=a, xin=xin)
     res.update(moe)
     return res
 
@@ -330,7 +405,11 @@ def golden_moe(
     S = a.shape[0]
     out = {k: [] for k in ("sel", "prob", "mid")}
 
-    x2 = rmsnorm(a, t["g_post"], cfg.eps)
+    if cfg.hc_mult > 1:
+        ain, post_f, comb_f = hc_pre(a, t["hc_ffn_fn"], t["hc_ffn_scale"], t["hc_ffn_base"], cfg)
+    else:
+        ain, post_f, comb_f = a, None, None
+    x2 = rmsnorm(ain, t["g_post"], cfg.eps)
     # V4 scores with sqrt(softplus(.)) instead of V3/GLM-5's sigmoid
     scores = torch.nn.functional.softplus(bf(x2) @ t["w_r"].float().T).sqrt()
 
@@ -380,7 +459,11 @@ def golden_moe(
                 activation = bf(m)
             y[s] += wgt * (dequant_expert(t["w_dn"][e], t["s_dn"][e], fmt.weight) @ activation)
 
-    x_out = (a.float() + allreduce(y)).to(torch.bfloat16)
+    ffn_out = allreduce(y)
+    if cfg.hc_mult > 1:
+        x_out = hc_post(ffn_out.to(torch.bfloat16), a, post_f, comb_f)
+    else:
+        x_out = (a.float() + ffn_out).to(torch.bfloat16)
     return dict(
         scores=scores,
         xq=xq_ref,

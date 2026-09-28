@@ -48,6 +48,12 @@ class Dsv4MoeLayer:
     ):
         cfg = W.cfg
         validate_shard(samples, cfg.heads, rank, npes, cfg.window)
+        if cfg.hc_mult != 1:
+            raise NotImplementedError(
+                f"the kernel implements a plain residual (hc_mult == 1), got {cfg.hc_mult}; "
+                "hyper-connections change the layer's I/O contract to [S, hc_mult, hidden] "
+                "and are modelled in the golden only"
+            )
         self.moe_mode = as_moe_mode(moe_mode)
         self.W, self.S, self.rank, self.npes = W, samples, rank, npes
         self.window = cfg.window

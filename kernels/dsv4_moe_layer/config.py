@@ -42,6 +42,14 @@ INTER = 384  # local; 3072 global / 8 ranks
 ROUTE_SCALE = 2.5
 SWIGLU_LIMIT = 10.0
 
+# Manifold-Constrained Hyper-Connections: the residual stream carries HC_MULT
+# parallel copies instead of one, mixed per token through a Sinkhorn-normalised
+# HC_MULT x HC_MULT matrix. HC_MULT == 1 means a plain residual.
+HC_MULT = 4
+HC_SINKHORN_ITERS = 20
+HC_EPS = 1e-6
+HC_MIX = (2 + HC_MULT) * HC_MULT  # pre | post | comb, packed in that order
+
 EPS = 1e-6
 SCALE_BM = 128
 FP8_MAX = 448.0

@@ -62,6 +62,7 @@ def _cfg():
         top_k=6,
         inter=128,
         window=128,
+        hc_mult=1,  # the kernel does a plain residual; mHC lives in the golden for now
     )
 
 
@@ -114,7 +115,7 @@ def test_dsv4_layer_matches_golden_at_real_dims():
     from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
 
     torch.manual_seed(0)
-    cfg = V4Config()  # defaults are DeepSeek-V4-Pro at TP8
+    cfg = V4Config(hc_mult=1)  # defaults are DeepSeek-V4-Pro at TP8
     cfg.validate()
     dev, S, mode = "cuda", 1, MoeMode.A8W4
     W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
@@ -175,7 +176,7 @@ TP_SEED = 1234
 
 
 def _tp_cfg(real: bool):
-    return V4Config() if real else _cfg()
+    return V4Config(hc_mult=1) if real else _cfg()
 
 
 def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4):
