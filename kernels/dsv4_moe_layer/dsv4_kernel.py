@@ -185,6 +185,11 @@ def layout(
         # two sides (attention, ffn) of hyper-connection coefficients per sample
         ("hc_d", S * 2 * max(hc_tasks, 1) * max(hc_vals, 1) * pr),
         ("hc_c", S * 2 * max(hc_coef, 1) * pr),
+        # hc_pre's output: the hc_mult streams contracted by `pre` to one. An
+        # explicit mailbox rather than contracting at each consumer -- `a` alone is
+        # read in six places and inline contraction would quadruple that traffic.
+        ("xin", S * hidden * pr if hc_mult > 1 else pr),
+        ("ain", S * hidden * pr if hc_mult > 1 else pr),
         ("q_a", S * q_lora * pr),
         ("kv_a", S * head_dim * pr),  # the single shared KV row, pre-norm
         ("kvnew", S * head_dim * pr),  # this launch's KV ring rows (bf16 values)
@@ -195,7 +200,7 @@ def layout(
         ("sp_l", S * n_split * heads * pr),
         ("o", S * heads * head_dim * pr),  # merged, de-rotated attention output
         ("o_lora", S * o_groups * o_lora * pr),
-        ("a", S * hidden * pr),  # post-attention hidden (bf16 values)
+        ("a", S * max(hc_mult, 1) * hidden * pr),  # post-attention residual stream (bf16)
         ("scores", S * N_EXPERTS * pr),
         ("xq", S * hidden // (4 if quant_group is not None else 2) * pr),
         ("xqs", S * xq_blocks * pr),
@@ -393,6 +398,7 @@ def stage_tasks(
         # the (hc_mult-wide) residual stream
         ("hcd_a", S * hc_tasks),
         ("hcm_a", hc_one),
+        ("hcc_a", (hidden // ROW_TILE) if hc_mult > 1 else 0),
         ("qkv_a", n_qkv_a),
         ("cache", 1),
         ("q_b", heads * head_dim // Q_B_TILE),
@@ -404,6 +410,7 @@ def stage_tasks(
         # ... and for the ffn side, once o_b has produced the new residual stream
         ("hcd_f", S * hc_tasks),
         ("hcm_f", hc_one),
+        ("hcc_f", (hidden // ROW_TILE) if hc_mult > 1 else 0),
         ("router", S * N_ROUTER),
         # one tile per (routed slot, 8 intermediates); tasks below INTER / UG8 also
         # carry the shared expert.  GLM-5/V3 happened to make this exactly BLOCKS
@@ -511,11 +518,6 @@ def build_dsv4_kernel(
         else (PUBLISH_BLOCKS + N_ROUTER - 1) // N_ROUTER
     )
     assert XQ_WAVES <= WAVES
-    down_scale_words = 0 if fmt.activation_group is None else S * MOE_SLOTS * INTER // fmt.activation_group
-    misc_words = 8 + max(S * XQ_BLOCKS, down_scale_words)
-    H = heads
-    W = npes
-    G = BLOCKS
     # --- hyper-connections. HC == 1 is a plain residual and compiles all of this out.
     HC = hc_mult
     HC_TASKS, HC_KSLICE, HC_ROWS, HC_VALS = hc_shape(HC, HIDDEN)
@@ -534,6 +536,12 @@ def build_dsv4_kernel(
         assert HC * HC <= 64, "the Sinkhorn matrix must fit one wave"
         assert HC_NKC % HC_WPR == 0, "hc_pre chunks must divide over the waves of a row group"
 
+    down_scale_words = 0 if fmt.activation_group is None else S * MOE_SLOTS * INTER // fmt.activation_group
+    HC_MISC = 8 + max(S * XQ_BLOCKS, down_scale_words)
+    misc_words = HC_MISC + S * max(HC_COEF, 1)
+    H = heads
+    W = npes
+    G = BLOCKS
     SC, SY = layout(
         S,
         H,
@@ -606,6 +614,7 @@ def build_dsv4_kernel(
     for name in (
         "hcd_a",
         "hcm_a",
+        "hcc_a",
         "qkv_a",
         "cache",
         "split",
@@ -616,6 +625,7 @@ def build_dsv4_kernel(
         "o_b",
         "hcd_f",
         "hcm_f",
+        "hcc_f",
         "router",
         "ug",
         "down",
@@ -1258,8 +1268,9 @@ def build_dsv4_kernel(
         def peer_reduce(region, t, residual, out_fn, tile=ROW_TILE):
             """Push BF16 partials in tagged pairs to every peer, then sum all
             ranks' pairs from the own symmetric buffer in rank order (W = 1: no exchange).  ``residual`` is
-            either fn(s, row) -> (r0, r1) (plain loads, issued first) or a mailbox base
-            (pairs s * HIDDEN + row, polled in the same batch as the peers)."""
+            either fn(s, row) -> (r0, r1) (plain loads, issued first), a mailbox base
+            (pairs s * HIDDEN + row, polled in the same batch as the peers), or None
+            when the caller adds its own -- hyper-connection hc_post does."""
             if const_expr(W > 1):
                 # One wave per destination: peer pointers are wave-uniform, and the
                 # destinations progress concurrently instead of eight serial stores
@@ -1282,6 +1293,8 @@ def build_dsv4_kernel(
                 s = tid // (tile // 2)
                 r = (tid % (tile // 2)) * 2
                 row = t * tile + r
+                r0 = fx.Float32(0.0)
+                r1 = fx.Float32(0.0)
                 if const_expr(callable(residual)):
                     r0, r1 = residual(s, row)
                 v0 = lds_ld(outs, s * tile + r)
@@ -1289,17 +1302,17 @@ def build_dsv4_kernel(
                 if const_expr(W == 1):  # no TP peers: the sum is the local value
                     parts = [(v0, v1)]
                     got = []
-                    if const_expr(not callable(residual)):
+                    if const_expr(residual is not None and not callable(residual)):
                         got = poll([(residual, (s * HIDDEN + row) // 2, 1)])
                 else:
                     own = sym + fx.Int64(SY[region])
                     specs = [(own, ((src * S + s) * HIDDEN + row) // 2, 1) for src in range(W)]
-                    if const_expr(not callable(residual)):  # packed bf16 pair
+                    if const_expr(residual is not None and not callable(residual)):  # packed bf16 pair
                         specs.append((residual, (s * HIDDEN + row) // 2, 1))
                     got = poll(specs, "one-as")
                     parts = [bf2_f32(v[0]) for v in got[:W]]
                     got = got[W:]
-                if const_expr(not callable(residual)):
+                if const_expr(residual is not None and not callable(residual)):
                     r0, r1 = bf2_f32(got[0][0])
                 t0 = fx.Float32(0.0)
                 t1 = fx.Float32(0.0)
@@ -1332,7 +1345,15 @@ def build_dsv4_kernel(
         # Only 24 rows but K = hc*hidden, so K is split across tasks; each task also
         # carries a partial sum of squares for hc_pre's weightless RMS, published as
         # one extra row so the reduce below is a single poll per row.
-        def hc_pre_stages(side, sd, fn_ptr, sb_ptr, src_word):
+        def hc_stage_coef(sd):
+            """This sample's pre | post | comb into LDS, so the row loops below read
+            coefficients from LDS instead of re-polling the mailbox per row."""
+            if tid < S * HC_COEF:
+                s_ = tid // HC_COEF
+                lds_st(misc, HC_MISC + tid, getf(mb("hc_c"), (s_ * 2 + sd) * HC_COEF + tid % HC_COEF))
+            gpu.barrier()
+
+        def hc_pre_stages(side, sd, fn_ptr, sb_ptr, src_word, out_name):
             r_fn = _rsrc(fn_ptr)
             r_sb = _rsrc(sb_ptr)  # [3 scales | HC_MIX bases]
             for tt in range(start(f"hcd_{side}"), S * HC_TASKS, G):
@@ -1422,6 +1443,26 @@ def build_dsv4_kernel(
                         put(mb("hc_c"), (s * 2 + sd) * HC_COEF + 2 * HC + lane, c)
                 stamp(f"hcm_{side}", s, 4)
 
+            # --- contract the hc_mult streams by `pre` into the single-width input
+            for t in range(start(f"hcc_{side}"), N_ROW_TILES, G):
+                t = fx.Int32(t)
+                stamp(f"hcc_{side}", t, 0)
+                hc_stage_coef(sd)
+                stamp(f"hcc_{side}", t, 2)
+                if tid < S * ROW_TILE // 2:
+                    s_ = tid // (ROW_TILE // 2)
+                    r = (tid % (ROW_TILE // 2)) * 2
+                    row = t * ROW_TILE + r
+                    a0 = fx.Float32(0.0)
+                    a1 = fx.Float32(0.0)
+                    for j in range_constexpr(HC):
+                        pj = lds_ld(misc, HC_MISC + s_ * HC_COEF + j)
+                        x0, x1 = bf2_f32(src_word(s_, j * HIDDEN + row))
+                        a0 = a0 + pj * x0
+                        a1 = a1 + pj * x1
+                    put_bf(mb(out_name), s_ * HIDDEN + row, [a0, a1])
+                stamp(f"hcc_{side}", t, 4)
+
         if const_expr(HC > 1):
             hc_pre_stages(
                 "a",
@@ -1429,6 +1470,7 @@ def build_dsv4_kernel(
                 hc_attn_fn,
                 hc_attn_sb,
                 lambda s, k: fx.Int32(bo.buffer_load(r_h, (s * HC * HIDDEN + k) // 2, vec_width=1, dtype=T.i32)),
+                "xin",
             )
 
         # ================================================= 1. q_a / kv GEMV
@@ -2452,4 +2494,7 @@ def build_dsv4_kernel(
             timeline_buf,
             step,
             rank,
-   
+            layer,
+        ).launch(grid=(G,), block=(THREADS,), stream=stream)
+
+    return launch_dsv4
