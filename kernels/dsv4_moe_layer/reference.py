@@ -11,7 +11,7 @@ grouped low-rank (``o_a`` per group, then a row-parallel ``o_b``).
 
 This module currently covers the **sliding-window-only** layer (``compress_ratio
 == 0``): the attention rewrite plus the V4 MoE, without the KV compressor or the
-lightning indexer. Those extend :func:`golden_layer_v4` for the HCA (ratio 128)
+lightning indexer. Those extend :func:`golden_layer` for the HCA (ratio 128)
 and CSA (ratio 4) variants respectively; hyper-connections replace the plain
 residual at that point too (``hc_mult`` > 1).
 
@@ -28,7 +28,20 @@ from dataclasses import dataclass
 import torch
 
 from kernels.common.mx_formats import quant_dequant_mxfp8, quantize_mxfp4
-from kernels.mla_moe_layer.config import (
+from kernels.dsv4_moe_layer.config import (
+    EPS,
+    HEAD_DIM,
+    HIDDEN,
+    INTER,
+    N_EXPERTS,
+    O_GROUPS,
+    O_LORA,
+    Q_LORA,
+    ROPE_DIM,
+    ROUTE_SCALE,
+    SWIGLU_LIMIT,
+    TOP_K,
+    WINDOW,
     ExpertActivation,
     ExpertWeight,
     MoeMode,
@@ -51,19 +64,19 @@ class V4Config:
     """One rank's shard of a DeepSeek-V4 layer. Defaults are V4-Pro at TP8."""
 
     heads: int = 16  # local; 128 global / 8 ranks
-    hidden: int = 7168
-    q_lora: int = 1536
-    head_dim: int = 512  # K and V share this; rope lives in its tail
-    rope_dim: int = 64
-    o_groups: int = 2  # local; 16 global / 8 ranks
-    o_lora: int = 1024
-    n_experts: int = 384
-    top_k: int = 6
-    inter: int = 384  # local; 3072 global / 8 ranks
-    window: int = 128
-    route_scale: float = 2.5
-    swiglu_limit: float = 10.0
-    eps: float = 1e-6
+    hidden: int = HIDDEN
+    q_lora: int = Q_LORA
+    head_dim: int = HEAD_DIM  # K and V share this; rope lives in its tail
+    rope_dim: int = ROPE_DIM
+    o_groups: int = O_GROUPS  # local; 16 global / 8 ranks
+    o_lora: int = O_LORA
+    n_experts: int = N_EXPERTS
+    top_k: int = TOP_K
+    inter: int = INTER  # local; 3072 global / 8 ranks
+    window: int = WINDOW
+    route_scale: float = ROUTE_SCALE
+    swiglu_limit: float = SWIGLU_LIMIT
+    eps: float = EPS
     rope_theta: float = 1.0e4
 
     @property
@@ -90,7 +103,7 @@ class V4Config:
         assert self.head_dim % 2 == 0 and self.rope_dim % 2 == 0
 
 
-def fp8_mats_v4(cfg: V4Config):
+def fp8_mats(cfg: V4Config):
     """(rows, K, BK) of every FP8 attention matrix in one rank's shard."""
     return {
         # wq_a and wkv fuse into one GEMV off the same normed input
@@ -102,18 +115,18 @@ def fp8_mats_v4(cfg: V4Config):
 
 
 @dataclass
-class V4LayerWeights:
+class LayerWeights:
     cfg: V4Config
     t: dict  # name -> tensor
 
 
-def make_weights_v4(
+def make_weights(
     rank: int,
     cfg: V4Config | None = None,
     device="cuda",
     seed: int = 1234,
     moe_mode: MoeMode | str = MoeMode.A8W4,
-) -> V4LayerWeights:
+) -> LayerWeights:
     """Replicated tensors share ``seed``; TP shards add ``rank`` to it.
 
     ``moe_mode`` defaults to A8W4 because V4 ships native MXFP4 expert weights.
@@ -133,7 +146,7 @@ def make_weights_v4(
     # per-head learnable softmax sink, fp32
     t["attn_sink"] = 0.5 * torch.randn(cfg.heads, generator=shd, device=device)
 
-    for name, (rows, k, bk) in fp8_mats_v4(cfg).items():
+    for name, (rows, k, bk) in fp8_mats(cfg).items():
         # qkv_a is replicated (wkv is not TP-sharded in V4); the rest are shards
         gen = rep if name == "qkv_a" else shd
         t[f"w_{name}"], t[f"s_{name}"] = _rand_fp8(rows, k, bk, gen, device)
@@ -161,10 +174,10 @@ def make_weights_v4(
             ug_q[e], ug_s[e] = quantize_mxfp4(ug)
             dn_q[e], dn_s[e] = quantize_mxfp4(dn)
     t["w_ug"], t["s_ug"], t["w_dn"], t["s_dn"] = ug_q, ug_s, dn_q, dn_s
-    return V4LayerWeights(cfg, t)
+    return LayerWeights(cfg, t)
 
 
-def rmsnorm_v4(x: torch.Tensor, g: torch.Tensor | None, eps: float) -> torch.Tensor:
+def rmsnorm(x: torch.Tensor, g: torch.Tensor | None, eps: float) -> torch.Tensor:
     """RMSNorm; ``g=None`` is the weightless per-head scale applied to the query."""
     x = x.float()
     y = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
@@ -189,7 +202,7 @@ def window_idxs(cur_pos: int, samples: int, window: int, device) -> torch.Tensor
     return torch.tensor(rows, dtype=torch.int32, device=device)
 
 
-def route_v4(scores: torch.Tensor, bias: torch.Tensor, cfg: V4Config):
+def route(scores: torch.Tensor, bias: torch.Tensor, cfg: V4Config):
     """sqrt-softplus scores [E] -> (indices [top_k], probs [top_k]) in score order.
 
     Flat top-k over all experts: V4 drops V3's group-limited routing. As in the
@@ -207,8 +220,8 @@ def route_v4(scores: torch.Tensor, bias: torch.Tensor, cfg: V4Config):
     return idx, p / p.sum() * cfg.route_scale
 
 
-def golden_layer_v4(
-    W: V4LayerWeights,
+def golden_layer(
+    W: LayerWeights,
     h,
     cur_pos: int,
     kv_cache,
@@ -227,15 +240,15 @@ def golden_layer_v4(
     cfg, t = W.cfg, W.t
     H, S = cfg.heads, h.shape[0]
     rd, hd = cfg.rope_dim, cfg.head_dim
-    dq = {n: dequant(t[f"w_{n}"], t[f"s_{n}"], bk) for n, (_, _, bk) in fp8_mats_v4(cfg).items()}
+    dq = {n: dequant(t[f"w_{n}"], t[f"s_{n}"], bk) for n, (_, _, bk) in fp8_mats(cfg).items()}
 
-    x = bf(rmsnorm_v4(h, t["g_in"], cfg.eps))
+    x = bf(rmsnorm(h, t["g_in"], cfg.eps))
     qkv = x @ dq["qkv_a"].T
     q_a, kv = qkv[:, : cfg.q_lora], qkv[:, cfg.q_lora :]
 
     # query: lora -> per-head, then a weightless RMS over the whole head, then rope
-    q = (bf(rmsnorm_v4(q_a, t["g_q"], cfg.eps)) @ dq["q_b"].T).view(S, H, hd)
-    q = rmsnorm_v4(q, None, cfg.eps)
+    q = (bf(rmsnorm(q_a, t["g_q"], cfg.eps)) @ dq["q_b"].T).view(S, H, hd)
+    q = rmsnorm(q, None, cfg.eps)
     pos = [cur_pos + s for s in range(S)]
     q = torch.stack(
         [torch.cat([q[s, :, :-rd], rope(q[s, :, -rd:], cos[pos[s]], sin[pos[s]])], dim=-1) for s in range(S)]
@@ -243,7 +256,7 @@ def golden_layer_v4(
 
     # shared KV: one row per token, rope in the tail, nope part FP8 round-tripped
     for s in range(S):
-        v = rmsnorm_v4(kv[s], t["g_kv"], cfg.eps)
+        v = rmsnorm(kv[s], t["g_kv"], cfg.eps)
         v = torch.cat([quant_dequant(v[:-rd], 64), rope(v[-rd:], cos[pos[s]], sin[pos[s]])])
         kv_cache[pos[s] % cfg.window] = v.to(torch.bfloat16)
     kvf = kv_cache.float()
@@ -283,14 +296,14 @@ def golden_layer_v4(
     o_lora = torch.einsum("sgd,grd->sgr", og, wa).reshape(S, cfg.o_groups * cfg.o_lora)
     a = (h.float() + allreduce(bf(o_lora) @ dq["o_b"].T)).to(torch.bfloat16)
 
-    moe = golden_moe_v4(W, a, allreduce, moe_mode=moe_mode)
+    moe = golden_moe(W, a, allreduce, moe_mode=moe_mode)
     res = dict(q_a=q_a, kv=kv, q=q, o=o, o_lora=o_lora, a=a)
     res.update(moe)
     return res
 
 
-def golden_moe_v4(
-    W: V4LayerWeights,
+def golden_moe(
+    W: LayerWeights,
     a,
     allreduce,
     mid=None,
@@ -313,7 +326,7 @@ def golden_moe_v4(
     S = a.shape[0]
     out = {k: [] for k in ("sel", "prob", "mid")}
 
-    x2 = rmsnorm_v4(a, t["g_post"], cfg.eps)
+    x2 = rmsnorm(a, t["g_post"], cfg.eps)
     # V4 scores with sqrt(softplus(.)) instead of V3/GLM-5's sigmoid
     scores = torch.nn.functional.softplus(bf(x2) @ t["w_r"].float().T).sqrt()
 
@@ -329,7 +342,7 @@ def golden_moe_v4(
     y = torch.zeros(S, cfg.hidden, device=a.device)
     for s in range(S):
         if hash_ids is None:
-            idx, p = route_v4(scores[s], t["bias"], cfg)
+            idx, p = route(scores[s], t["bias"], cfg)
         else:
             idx = hash_ids[s].long()
             raw = scores[s][idx]

@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Check :mod:`kernels.mla_moe_layer.reference_v4` against DeepSeek's own reference.
+"""Check :mod:`kernels.dsv4_moe_layer.reference` against DeepSeek's own reference.
 
 The oracle is the unmodified ``inference/model.py`` from the DeepSeek-V4-Pro
 Hugging Face repo, driven through a pure-torch stand-in for its tilelang kernels.
 It is not vendored here; point ``DSV4_ORACLE_DIR`` at a checkout containing
 ``model.py``, ``kernel.py`` and ``fast_hadamard_transform.py``, or the tests skip.
 
-Only the sliding-window layer is covered, matching ``reference_v4``'s current
+Only the sliding-window layer is covered, matching the golden's current
 scope: the oracle's ``Attention``/``MoE`` submodules are driven directly so the
 comparison excludes hyper-connections (which land with the mHC work).
 """
@@ -21,16 +21,16 @@ import sys
 import pytest
 import torch
 
-from kernels.mla_moe_layer.config import MoeMode, moe_format
-from kernels.mla_moe_layer.reference import bf, dequant, dequant_expert, rope_table
-from kernels.mla_moe_layer.reference_v4 import (
+from kernels.dsv4_moe_layer.config import MoeMode, moe_format
+from kernels.dsv4_moe_layer.reference import (
     V4Config,
-    fp8_mats_v4,
-    golden_layer_v4,
-    make_weights_v4,
-    rmsnorm_v4,
+    fp8_mats,
+    golden_layer,
+    make_weights,
+    rmsnorm,
     window_idxs,
 )
+from kernels.mla_moe_layer.reference import bf, dequant, dequant_expert, rope_table
 
 ORACLE_DIR = os.environ.get("DSV4_ORACLE_DIR", "/home/weisu/dsv4_oracle")
 
@@ -105,7 +105,7 @@ def _oracle_modules(om, cfg, device):
 @torch.no_grad()
 def _load_oracle_weights(attn, moe, W, cfg, weight_fmt):
     t = W.t
-    dq = {n: dequant(t[f"w_{n}"], t[f"s_{n}"], bk) for n, (_, _, bk) in fp8_mats_v4(cfg).items()}
+    dq = {n: dequant(t[f"w_{n}"], t[f"s_{n}"], bk) for n, (_, _, bk) in fp8_mats(cfg).items()}
     bf16 = torch.bfloat16
 
     attn.wq_a.weight.copy_(dq["qkv_a"][: cfg.q_lora].to(bf16))
@@ -130,14 +130,14 @@ def _load_oracle_weights(attn, moe, W, cfg, weight_fmt):
 
 @torch.no_grad()
 def _oracle_step(om, attn, moe, h, pos, g_in, g_post, eps):
-    """One layer of the oracle, with the plain residual reference_v4 currently models."""
+    """One layer of the oracle, with the plain residual the golden currently models."""
     # the oracle builds its window/compress index tensors with a bare
     # torch.arange, so it needs the default device pointed at the GPU
     with torch.device(h.device):
-        x = bf(rmsnorm_v4(h, g_in, eps)).to(torch.bfloat16)
+        x = bf(rmsnorm(h, g_in, eps)).to(torch.bfloat16)
         o = attn(x.unsqueeze(0), pos).squeeze(0)
         a = (h.float() + o.float()).to(torch.bfloat16)
-        x2 = bf(rmsnorm_v4(a, g_post, eps)).to(torch.bfloat16)
+        x2 = bf(rmsnorm(a, g_post, eps)).to(torch.bfloat16)
         ids = torch.zeros(1, x2.shape[0], dtype=torch.long, device=h.device)
         y = moe(x2.unsqueeze(0), ids).squeeze(0)
     return a, (a.float() + y.float()).to(torch.bfloat16)
@@ -152,7 +152,7 @@ def test_v4_layer_matches_deepseek_reference(steps):
 
     # BF16 expert activations so both sides feed the experts the same tensor;
     # the weights are FP8 block-scaled here and dequantized into the oracle.
-    W = make_weights_v4(rank=0, cfg=cfg, device=device, seed=7, moe_mode=MoeMode.W8A16)
+    W = make_weights(rank=0, cfg=cfg, device=device, seed=7, moe_mode=MoeMode.W8A16)
     attn, moe = _oracle_modules(om, cfg, device)
     _load_oracle_weights(attn, moe, W, cfg, moe_format(MoeMode.W8A16).weight)
 
@@ -162,7 +162,7 @@ def test_v4_layer_matches_deepseek_reference(steps):
     for pos in range(steps):
         h = (0.5 * torch.randn(1, cfg.hidden, device=device)).to(torch.bfloat16)
         idx = window_idxs(pos, 1, cfg.window, device)
-        res = golden_layer_v4(W, h, pos, kv_cache, idx, cos, sin, lambda z: z, moe_mode=MoeMode.W8A16)
+        res = golden_layer(W, h, pos, kv_cache, idx, cos, sin, lambda z: z, moe_mode=MoeMode.W8A16)
         a_ref, out_ref = _oracle_step(om, attn, moe, h, pos, W.t["g_in"], W.t["g_post"], cfg.eps)
 
         da = (res["a"].float() - a_ref.float()).abs().max().item()
