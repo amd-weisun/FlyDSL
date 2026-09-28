@@ -38,6 +38,10 @@ from kernels.dsv4_moe_layer.config import (
     HC_SINKHORN_ITERS,
     HEAD_DIM,
     HIDDEN,
+    INDEX_HEAD_DIM,
+    INDEX_HEADS,
+    INDEX_HEADS_TOTAL,
+    INDEX_TOPK,
     INTER,
     KEY_BLOCK,
     N_EXPERTS,
@@ -86,6 +90,10 @@ class V4Config:
     eps: float = EPS
     rope_theta: float = 1.0e4
     compress_ratio: int = COMPRESS_SWA  # 0 = sliding window only, 128 = HCA
+    index_heads: int = INDEX_HEADS  # local; 64 global / 8 ranks
+    index_heads_total: int = INDEX_HEADS_TOTAL  # global; the score scale uses it
+    index_head_dim: int = INDEX_HEAD_DIM
+    index_topk: int = INDEX_TOPK
     compress_rope_theta: float = COMPRESS_ROPE_THETA
     max_seq: int = 4096  # sizes the compressed half of the KV cache
     hc_mult: int = HC_MULT  # 1 = plain residual
@@ -115,6 +123,20 @@ class V4Config:
         return self.compress_ratio == COMPRESS_CSA
 
     @property
+    def indexed(self) -> bool:
+        """CSA selects its compressed entries with the lightning indexer; HCA takes
+        a deterministic prefix. DeepSeek ties both to the ratio, as with overlap."""
+        return self.compress_ratio == COMPRESS_CSA
+
+    @property
+    def n_index(self) -> int:
+        """Compressed entries the attention can reach in one step. HCA gathers every
+        one of them; CSA gathers only the indexer's pick, which caps the list."""
+        if not self.compress_ratio:
+            return 0
+        return min(self.index_topk, self.n_compressed) if self.indexed else self.n_compressed
+
+    @property
     def c_coff(self) -> int:
         """Channel multiplier on the compressor's projections: overlapping windows
         carry two halves, one for the previous window and one for the current."""
@@ -141,7 +163,7 @@ class V4Config:
         """Length of the attention's index list, padded to the key tile. The split
         stage walks this, NOT the window: with compression the gather has to reach
         past the window into the compressed half of the cache."""
-        rows = self.cache_rows
+        rows = self.window + self.n_index
         return (rows + KEY_BLOCK - 1) // KEY_BLOCK * KEY_BLOCK
 
     @property
@@ -177,18 +199,44 @@ class V4Config:
         assert self.head_dim % 2 == 0 and self.rope_dim % 2 == 0
 
 
+def qkv_a_tail(cfg: V4Config) -> int:
+    """Rows of the fused qkv_a GEMV past q_a and kv.
+
+    Everything that reads the same normed layer input rides in this one GEMV
+    rather than costing another weight stream: the attention compressor's wkv and
+    wgate, and -- on a CSA layer -- the indexer's compressor's pair as well.
+    """
+    if not cfg.compress_ratio:
+        return 0
+    rows = 2 * cfg.c_coff * cfg.head_dim
+    if cfg.indexed:
+        rows += 2 * cfg.c_coff * cfg.index_head_dim
+    return rows
+
+
+def qkv_a_split(cfg: V4Config):
+    """Column ranges of the fused qkv_a output, in the order it is laid out."""
+    hd, cw = cfg.head_dim, cfg.c_coff * cfg.head_dim
+    iw = cfg.c_coff * cfg.index_head_dim
+    o = {"q_a": (0, cfg.q_lora), "kv": (cfg.q_lora, cfg.q_lora + hd)}
+    p = cfg.q_lora + hd
+    if cfg.compress_ratio:
+        o["c_kv"], o["c_gate"] = (p, p + cw), (p + cw, p + 2 * cw)
+        p += 2 * cw
+        if cfg.indexed:
+            o["i_kv"], o["i_gate"] = (p, p + iw), (p + iw, p + 2 * iw)
+    return o
+
+
 def fp8_mats(cfg: V4Config):
     """(rows, K, BK) of every FP8 attention matrix in one rank's shard."""
     return {
         # wq_a, wkv and -- when the layer compresses -- the compressor's own wkv and
         # wgate all read the same normed input, so they fuse into one GEMV rather
         # than costing a second weight stream and another dependency
-        "qkv_a": (
-            cfg.q_lora + cfg.head_dim + (2 * cfg.c_coff * cfg.head_dim if cfg.compress_ratio else 0),
-            cfg.hidden,
-            128,
-        ),
+        "qkv_a": (cfg.q_lora + cfg.head_dim + qkv_a_tail(cfg), cfg.hidden, 128),
         "q_b": (cfg.heads * cfg.head_dim, cfg.q_lora, 128),
+        **({"i_q_b": (cfg.index_heads * cfg.index_head_dim, cfg.q_lora, 128)} if cfg.indexed else {}),
         "o_a": (cfg.o_groups * cfg.o_lora, cfg.group_dim, 128),
         "o_b": (cfg.hidden, cfg.o_groups * cfg.o_lora, 128),
     }
@@ -237,6 +285,15 @@ def make_weights(
         r = cfg.compress_ratio
         t["ape"] = 0.5 * torch.randn(r, cfg.c_coff * cfg.head_dim, generator=rep, device=device)
         t["g_ckv"] = (1 + 0.1 * torch.randn(cfg.head_dim, generator=rep, device=device)).to(bfl)
+        if cfg.indexed:
+            ihd = cfg.index_head_dim
+            # the indexer's compressor is replicated for the same reason
+            t["i_ape"] = 0.5 * torch.randn(r, cfg.c_coff * ihd, generator=rep, device=device)
+            t["g_ickv"] = (1 + 0.1 * torch.randn(ihd, generator=rep, device=device)).to(bfl)
+            # weights_proj is bf16 in the checkpoint, and its heads are sharded
+            t["i_w"] = (torch.randn(cfg.index_heads, cfg.hidden, generator=shd, device=device) / cfg.hidden**0.5).to(
+                bfl
+            )
 
     if cfg.hc_mult > 1:
         # hyper-connection mixers, fp32 in the checkpoint. Replicated: every rank
@@ -456,19 +513,71 @@ def compress_step(
     return v
 
 
+def indexer_step(x, q_a_n, i_kv, i_gate, cur_pos, cfg, t, i_state, i_score_state, i_cache, cos, sin, allreduce):
+    """One decode step of the lightning indexer -- which compressed entries CSA
+    attends to. Returns cache slots, padded with -1 to ``cfg.n_index``.
+
+    The indexer keeps a second, cheaper view of the same tokens: its own
+    compressor at ``index_head_dim``, Hadamard-rotated and FP4-quantized, scored
+    against its own per-head queries. ReLU drops the negatives, a learned
+    per-head weight mixes the heads, and the top ``index_topk`` survive.
+
+    The heads are TP-sharded, so **no rank holds the whole sum** -- the score has
+    to be all-reduced before the top-k, or the ranks would pick different keys and
+    silently attend to different things.
+    """
+    ih, ihd, rd, r = cfg.index_heads, cfg.index_head_dim, cfg.rope_dim, cfg.compress_ratio
+    compress_step(
+        i_kv,
+        i_gate,
+        cur_pos,
+        cfg,
+        t,
+        i_state,
+        i_score_state,
+        i_cache,
+        cos,
+        sin,
+        head_dim=ihd,
+        ape=t["i_ape"],
+        gamma=t["g_ickv"],
+        base=0,
+        rotate=True,
+    )
+    dq = dequant(t["w_i_q_b"], t["s_i_q_b"], 128)
+    q = (q_a_n.float() @ dq.T).view(ih, ihd)
+    q = torch.stack([torch.cat([q[h, :-rd], rope(q[h, -rd:], cos[cur_pos], sin[cur_pos])]) for h in range(ih)])
+    # the queries take the same rotation and FP4 round trip the keys do
+    q = quant_dequant_fp4(bf(hadamard(q)))
+    # scaled by the GLOBAL head count: the sum below is completed by the all-reduce
+    w = bf(x.float() @ t["i_w"].float().T) * (ihd**-0.5 * cfg.index_heads_total**-0.5)
+
+    n = (cur_pos + 1) // r  # compressed entries written so far
+    out = torch.full((cfg.n_index,), -1, dtype=torch.int32, device=x.device)
+    if n:
+        score = torch.einsum("hd,td->ht", q, i_cache[:n].float())
+        score = allreduce((score.relu() * w.view(ih, 1)).sum(dim=0))
+        k = min(cfg.index_topk, n)
+        out[:k] = (cfg.window + score.topk(k)[1]).to(torch.int32)
+    return out
+
+
 def layer_idxs(cur_pos: int, samples: int, cfg: V4Config, device) -> torch.Tensor:
     """Ring slots for the sliding window, then the compressed entries so far.
 
     Both live in one cache -- window first, compressed after -- which is what lets
     the attention gather span both from a single index list. Unwritten slots are -1.
+
+    On a CSA layer the compressed half is left empty: the indexer picks it inside
+    the layer, from scores that do not exist until the layer runs.
     """
     win = window_idxs(cur_pos, samples, cfg.window, device)
     if not cfg.compress_ratio:
         return win
     rows = []
     for s in range(samples):
-        n = (cur_pos + s + 1) // cfg.compress_ratio
-        rows.append([cfg.window + i for i in range(n)] + [-1] * (cfg.n_compressed - n))
+        n = 0 if cfg.indexed else (cur_pos + s + 1) // cfg.compress_ratio
+        rows.append([cfg.window + i for i in range(n)] + [-1] * (cfg.n_index - n))
     comp = torch.tensor(rows, dtype=torch.int32, device=device)
     idx = torch.cat([win, comp], dim=1)
     pad = cfg.n_keys - idx.shape[1]
@@ -531,6 +640,9 @@ def golden_layer(
     score_state=None,
     cos_c=None,
     sin_c=None,
+    i_state=None,
+    i_score_state=None,
+    i_cache=None,
 ):
     """One rank's view of a V4 layer. Mutates ``kv_cache`` (and the compressor state).
 
@@ -538,7 +650,9 @@ def golden_layer(
     [S, hc_mult, hidden] otherwise -- V4 carries hc_mult parallel residual
     streams, contracted to one by ``hc_pre`` and re-expanded by ``hc_post``.
     ``kv_cache`` is a ring of ``cfg.window`` rows of ``head_dim`` (K and V both).
-    ``indices`` [S, n_keys] are ring slots, -1 meaning "not yet written".
+    ``indices`` [S, n_keys] are ring slots, -1 meaning "not yet written". On a CSA
+    layer only its window half is used: the compressed half is chosen here, by the
+    indexer, because the scores it ranks are computed inside the layer.
     Returns a dict of intermediates keyed like the kernel's debug scratch.
     """
     cfg, t = W.cfg, W.t
@@ -553,13 +667,18 @@ def golden_layer(
     x = bf(rmsnorm(xin, t["g_in"], cfg.eps))
     qkv = x @ dq["qkv_a"].T
     hd = cfg.head_dim
-    q_a = qkv[:, : cfg.q_lora]
-    kv = qkv[:, cfg.q_lora : cfg.q_lora + hd]
-    c_kv = qkv[:, cfg.q_lora + hd : cfg.q_lora + 2 * hd] if cfg.compress_ratio else None
-    c_gate = qkv[:, cfg.q_lora + 2 * hd :] if cfg.compress_ratio else None
+    # sliced by name: the compressor's projections are c_coff-wide, and CSA adds
+    # the indexer's pair after them
+    cut = qkv_a_split(cfg)
+    part = lambda n: qkv[:, slice(*cut[n])] if n in cut else None  # noqa: E731
+    q_a, kv = part("q_a"), part("kv")
+    c_kv, c_gate = part("c_kv"), part("c_gate")
+    i_kv, i_gate = part("i_kv"), part("i_gate")
 
     # query: lora -> per-head, then a weightless RMS over the whole head, then rope
-    q = (bf(rmsnorm(q_a, t["g_q"], cfg.eps)) @ dq["q_b"].T).view(S, H, hd)
+    # the normed q_lora: both this layer's wq_b and the indexer's read it
+    q_an = bf(rmsnorm(q_a, t["g_q"], cfg.eps))
+    q = (q_an @ dq["q_b"].T).view(S, H, hd)
     q = rmsnorm(q, None, cfg.eps)
     pos = [cur_pos + s for s in range(S)]
     q = torch.stack(
@@ -576,6 +695,33 @@ def golden_layer(
             # writes into the compressed half of the same cache
             compress_step(c_kv[s], c_gate[s], pos[s], cfg, t, kv_state, score_state, kv_cache, cos_c, sin_c)
     kvf = kv_cache.float()
+
+    if cfg.indexed:
+        # CSA picks its compressed entries rather than taking a prefix, so the
+        # index list is only half given: keep the window, replace the rest.
+        picks = torch.stack(
+            [
+                indexer_step(
+                    x[s],
+                    q_an[s],
+                    i_kv[s],
+                    i_gate[s],
+                    pos[s],
+                    cfg,
+                    t,
+                    i_state,
+                    i_score_state,
+                    i_cache,
+                    cos_c,
+                    sin_c,
+                    allreduce,
+                )
+                for s in range(S)
+            ]
+        )
+        indices = indices.clone()
+        indices[:, cfg.window : cfg.window + cfg.n_index] = picks
+        indices[:, cfg.window + cfg.n_index :] = -1
 
     # gather-sparse attention with a per-head sink in the denominator
     sink = t["attn_sink"].float()

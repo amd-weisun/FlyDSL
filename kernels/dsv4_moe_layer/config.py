@@ -72,6 +72,13 @@ COMPRESS_HCA = 128  # heavily compressed attention, dense over compressed
 # (and the compressor in its overlapping form), which is not implemented.
 SUPPORTED_COMPRESS = (COMPRESS_SWA, COMPRESS_HCA)  # informational; see V4Config.validate
 COMPRESS_ROPE_THETA = 1.6e5  # compressed layers use their own rope base
+# Lightning indexer (CSA only). 64 global index heads / 8 ranks; each scores the
+# compressed entries with its own 128-dim query, and the weighted head-sum picks
+# the top INDEX_TOPK for the attention to gather.
+INDEX_HEADS = 8
+INDEX_HEADS_TOTAL = 64  # the score normalisation uses the GLOBAL head count
+INDEX_HEAD_DIM = 128
+INDEX_TOPK = 1024
 KEY_BLOCK = 64  # the split-attention key tile; the index list is padded to it
 
 

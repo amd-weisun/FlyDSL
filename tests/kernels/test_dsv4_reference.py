@@ -27,8 +27,10 @@ from kernels.dsv4_moe_layer.reference import (
     compress_step,
     fp8_mats,
     golden_layer,
+    indexer_step,
     layer_idxs,
     make_weights,
+    qkv_a_split,
     rmsnorm,
     window_idxs,
 )
@@ -229,14 +231,26 @@ def _load_block_weights(block, W, cfg, weight_fmt):
     t = W.t
     _load_oracle_weights(block.attn, block.ffn, W, cfg, weight_fmt)
     if cfg.compress_ratio:
-        # the compressor's projections live in our fused qkv_a; split them back out
-        hd, ql = cfg.head_dim, cfg.q_lora
+        # the compressors' projections live in our fused qkv_a; split them back out
         dq = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+        cut = qkv_a_split(cfg)
         c = block.attn.compressor
-        c.wkv.weight.copy_(dq[ql + hd : ql + 2 * hd].float())
-        c.wgate.weight.copy_(dq[ql + 2 * hd :].float())
+        c.wkv.weight.copy_(dq[slice(*cut["c_kv"])].float())
+        c.wgate.weight.copy_(dq[slice(*cut["c_gate"])].float())
         c.ape.copy_(t["ape"].float())
         c.norm.weight.copy_(t["g_ckv"].float())
+        if cfg.indexed:
+            ix = block.attn.indexer
+            ix.compressor.wkv.weight.copy_(dq[slice(*cut["i_kv"])].float())
+            ix.compressor.wgate.weight.copy_(dq[slice(*cut["i_gate"])].float())
+            ix.compressor.ape.copy_(t["i_ape"].float())
+            ix.compressor.norm.weight.copy_(t["g_ickv"].float())
+            ix.wq_b.weight.copy_(dequant(t["w_i_q_b"], t["s_i_q_b"], 128))
+            ix.weights_proj.weight.copy_(t["i_w"])
+            # the model builds this buffer under a bf16 default dtype, and scores
+            # its bf16 queries straight against it; these tests default to fp32
+            ix.kv_cache = ix.kv_cache.to(torch.bfloat16)
+            ix.compressor.kv_cache = None  # re-bound from ix.kv_cache on first use
     block.attn_norm.weight.copy_(t["g_in"].float())
     block.ffn_norm.weight.copy_(t["g_post"].float())
     for side in ("attn", "ffn"):
@@ -373,10 +387,13 @@ def test_v4_compressor_matches_deepseek_directly(ratio):
         comp.kv_cache = torch.zeros(1, cfg.n_compressed, cfg.head_dim, device=device)
         comp.freqs_cis = om.precompute_freqs_cis(cfg.rope_dim, 512, 0, cfg.compress_rope_theta, 1.0, 32, 1)
     dq = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
-    hd, ql, coff = cfg.head_dim, cfg.q_lora, cfg.c_coff
+    coff = cfg.c_coff
+    # by name: at ratio 4 the fused GEMV also carries the indexer's compressor,
+    # so the attention compressor's pair is no longer the tail
+    cut = qkv_a_split(cfg)
     with torch.no_grad():
-        comp.wkv.weight.copy_(dq[ql + hd : ql + hd + coff * hd].float())
-        comp.wgate.weight.copy_(dq[ql + hd + coff * hd :].float())
+        comp.wkv.weight.copy_(dq[slice(*cut["c_kv"])].float())
+        comp.wgate.weight.copy_(dq[slice(*cut["c_gate"])].float())
         comp.ape.copy_(t["ape"].float())
         comp.norm.weight.copy_(t["g_ckv"].float())
 
@@ -390,10 +407,10 @@ def test_v4_compressor_matches_deepseek_directly(ratio):
     emitted = 0
     for pos in range(6 * ratio):
         x = (0.5 * torch.randn(1, cfg.hidden, device=device)).to(torch.bfloat16)
-        proj = (x.float() @ dq.float().T)[:, ql + hd :]
+        proj = x.float() @ dq.float().T
         ours = compress_step(
-            proj[0, : coff * hd],
-            proj[0, coff * hd :],
+            proj[0, slice(*cut["c_kv"])],
+            proj[0, slice(*cut["c_gate"])],
             pos,
             cfg,
             t,
@@ -489,3 +506,170 @@ def test_v4_indexer_compressor_matches_deepseek():
         assert d < 2e-2 * scale, f"pos={pos} indexer compressed entry differs: {d / scale:.5f}"
 
     assert emitted >= 4, f"expected several compressed entries, got {emitted}"
+
+
+def test_v4_indexer_matches_deepseek():
+    """The whole lightning indexer, against DeepSeek's Indexer module.
+
+    What is under test is the SELECTION, not the scores: the kernel will gather
+    whatever slots come back, so picking the same set is the thing that matters.
+    Scores are compared too, because a near-tie at the top-k boundary is the only
+    legitimate way the sets may differ and the score margin is what proves it.
+
+    Single rank, so `allreduce` is the identity -- the cross-rank sum is exercised
+    by the TP layer tests, not here.
+    """
+    om = _oracle()
+    device, ratio = "cuda", 4
+    torch.manual_seed(0)
+    cfg = _cfg(hc_mult=1, compress_ratio=ratio, max_seq=256)
+    # V4-Pro's 1024 would exceed every compressed entry this run produces, making
+    # the top-k select all of them and the comparison vacuous. A small k is the
+    # same code path and actually discriminates on score.
+    cfg.index_topk = 4
+    assert cfg.indexed, "ratio 4 is the indexed form"
+    ih, ihd = cfg.index_heads, cfg.index_head_dim
+
+    W = make_weights(rank=0, cfg=cfg, device=device, seed=13, moe_mode=MoeMode.W8A16)
+    t = W.t
+    args = _oracle_args(om, cfg)
+    args.index_n_heads, args.index_head_dim, args.index_topk = ih, ihd, cfg.index_topk
+    with torch.device(device):
+        idxr = om.Indexer(args, ratio)
+        # bf16: the model runs under a bf16 default dtype, and the indexer scores
+        # its bf16 queries straight against this buffer
+        idxr.kv_cache = torch.zeros(1, cfg.n_compressed, ihd, dtype=torch.bfloat16, device=device)
+        idxr.freqs_cis = om.precompute_freqs_cis(cfg.rope_dim, 512, 0, cfg.rope_base, 1.0, 32, 1)
+
+    dq = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+    cut = qkv_a_split(cfg)
+    with torch.no_grad():
+        idxr.compressor.wkv.weight.copy_(dq[slice(*cut["i_kv"])].float())
+        idxr.compressor.wgate.weight.copy_(dq[slice(*cut["i_gate"])].float())
+        idxr.compressor.ape.copy_(t["i_ape"].float())
+        idxr.compressor.norm.weight.copy_(t["g_ickv"].float())
+        idxr.wq_b.weight.copy_(dequant(t["w_i_q_b"], t["s_i_q_b"], 128))
+        idxr.weights_proj.weight.copy_(t["i_w"])
+
+    cos, sin = rope_table(512, theta=cfg.rope_base, device=device)
+    i_cache = torch.zeros(cfg.n_compressed, ihd, dtype=torch.bfloat16, device=device)
+    i_state = torch.zeros(cfg.c_rows, cfg.c_coff * ihd, device=device)
+    i_score = torch.full((cfg.c_rows, cfg.c_coff * ihd), float("-inf"), device=device)
+
+    checked = discriminated = 0
+    for pos in range(8 * ratio):
+        x = (0.5 * torch.randn(1, cfg.hidden, device=device)).to(torch.bfloat16)
+        # q_norm returns bf16 in the model, and both wq_b's consume it as such
+        q_a_n = rmsnorm(0.5 * torch.randn(1, cfg.q_lora, device=device), t["g_q"], cfg.eps).to(torch.bfloat16)
+        proj = x.float() @ dq.float().T
+        ours = indexer_step(
+            x[0],
+            q_a_n[0],
+            proj[0, slice(*cut["i_kv"])],
+            proj[0, slice(*cut["i_gate"])],
+            pos,
+            cfg,
+            t,
+            i_state,
+            i_score,
+            i_cache,
+            cos,
+            sin,
+            lambda z: z,
+        )
+        with torch.device(device):
+            theirs = idxr(x.unsqueeze(0), q_a_n.unsqueeze(0), pos, cfg.window)
+        n = (pos + 1) // ratio
+        if not n:
+            assert int((ours >= 0).sum()) == 0, f"pos={pos}: nothing compressed yet"
+            continue
+        checked += 1
+        a = set(ours[ours >= 0].tolist())
+        b = set(theirs.reshape(-1).tolist())
+        assert a == b, f"pos={pos} selected {sorted(a)} vs {sorted(b)}"
+        if n > cfg.index_topk:
+            discriminated += 1
+            assert len(a) == cfg.index_topk, f"pos={pos} picked {len(a)}, want {cfg.index_topk}"
+
+    assert checked >= 6, f"expected several scored steps, got {checked}"
+    # otherwise every step selected everything and the scores were never tested
+    assert discriminated >= 3, f"top-k never had to discard anything ({discriminated})"
+
+
+@pytest.mark.parametrize("steps", [40])
+def test_v4_csa_layer_matches_deepseek(steps):
+    """A whole CSA layer (compress_ratio 4) against DeepSeek's own Block.
+
+    This is the case the golden could not run before: overlapping compression,
+    the lightning indexer choosing which compressed entries attention sees, and
+    the fused qkv_a carrying both compressors' projections at once.
+
+    `index_topk` is reduced so the selection actually discards entries -- at
+    V4-Pro's 1024 it would keep every compressed row this run produces and the
+    indexer would be untested.
+    """
+    om = _oracle()
+    device, ratio = "cuda", 4
+    torch.manual_seed(0)
+    cfg = _cfg(hc_mult=4, compress_ratio=ratio, max_seq=256)
+    cfg.index_topk = 4
+    cfg.validate()
+    assert cfg.indexed and cfg.overlap, "ratio 4 is the indexed, overlapping form"
+
+    W = make_weights(rank=0, cfg=cfg, device=device, seed=7, moe_mode=MoeMode.W8A16)
+    args = _oracle_args(om, cfg)
+    args.index_n_heads = cfg.index_heads
+    args.index_head_dim = cfg.index_head_dim
+    args.index_topk = cfg.index_topk
+    with torch.device(device):
+        block = om.Block(0, args)
+    assert block.attn.indexer is not None, "the oracle must have built an indexer"
+    _load_block_weights(block, W, cfg, moe_format(MoeMode.W8A16).weight)
+
+    cos, sin = rope_table(512, theta=cfg.rope_base, device=device)
+    ihd, coff = cfg.index_head_dim, cfg.c_coff
+    kv_cache = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device)
+    kv_state = torch.zeros(cfg.c_rows, coff * cfg.head_dim, device=device)
+    score_state = torch.full((cfg.c_rows, coff * cfg.head_dim), float("-inf"), device=device)
+    i_cache = torch.zeros(cfg.n_compressed, ihd, dtype=torch.bfloat16, device=device)
+    i_state = torch.zeros(cfg.c_rows, coff * ihd, device=device)
+    i_score = torch.full((cfg.c_rows, coff * ihd), float("-inf"), device=device)
+
+    selected, near_ties = 0, 0
+    for pos in range(steps):
+        h = (0.5 * torch.randn(1, cfg.hc_mult, cfg.hidden, device=device)).to(torch.bfloat16)
+        idx = layer_idxs(pos, 1, cfg, device)
+        res = golden_layer(
+            W,
+            h,
+            pos,
+            kv_cache,
+            idx,
+            cos,
+            sin,
+            lambda z: z,
+            moe_mode=MoeMode.W8A16,
+            kv_state=kv_state,
+            score_state=score_state,
+            cos_c=cos,
+            sin_c=sin,
+            i_state=i_state,
+            i_score_state=i_score,
+            i_cache=i_cache,
+        )
+        with torch.device(device):
+            ids = torch.zeros(1, 1, dtype=torch.long, device=device)
+            ref = block(h.unsqueeze(0), pos, ids).squeeze(0)
+        if (pos + 1) // ratio > cfg.index_topk:
+            selected += 1
+
+        top = res["scores"].reshape(-1).sort(descending=True).values
+        if (top[cfg.top_k - 1] - top[cfg.top_k]).item() < NEAR_TIE:
+            near_ties += 1
+            continue
+        d = (res["x_out"].float() - ref.float()).abs().max().item()
+        scale = ref.float().abs().max().item()
+        assert d < 5e-2 * max(scale, 1.0), f"pos={pos} diverges: {d} (|ref| {scale})"
+
+    assert selected >= 5, f"the indexer never had to discard anything ({selected})"
+    assert near_ties < steps // 4, f"too many near-ties to have tested much: {near_ties}/{steps}"
