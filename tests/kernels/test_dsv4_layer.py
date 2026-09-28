@@ -197,28 +197,41 @@ def test_dsv4_rejects_head_dim_that_would_deadlock():
 TP_SEED = 1234
 
 
-def _tp_cfg(real: bool, hc_mult: int = 1):
+def _tp_cfg(real: bool, hc_mult: int = 1, compress_ratio: int = 0):
     # NOT a module global: mp.spawn re-imports this module in each child, so
     # anything set under __main__ never reaches the workers
-    return V4Config(hc_mult=hc_mult) if real else _cfg(hc_mult)
+    cfg = V4Config(hc_mult=hc_mult) if real else _cfg(hc_mult)
+    if compress_ratio:
+        cfg.compress_ratio, cfg.max_seq = compress_ratio, 256
+    return cfg
 
 
-def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4, hc_mult=1):
+def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4, hc_mult=1, compress_ratio=0):
     import torch.distributed as dist
 
     from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
 
     dev = torch.device("cuda", rank)
     torch.cuda.set_device(dev)
-    cfg = _tp_cfg(real, hc_mult)
+    cfg = _tp_cfg(real, hc_mult, compress_ratio)
     cfg.validate()
     W = make_weights(rank, cfg=cfg, device=dev, seed=TP_SEED, moe_mode=moe_mode)
     layer = Dsv4MoeLayer(W, samples=1, rank=rank, npes=npes, group=group, moe_mode=moe_mode)
     cos, sin = rope_table(4096, theta=cfg.rope_theta, device=dev)
+    cos_c, sin_c = rope_table(4096, theta=cfg.compress_rope_theta, device=dev)
     gen = torch.Generator(device=dev).manual_seed(TP_SEED + 99)  # identical inputs everywhere
+    # Without compression each step is independent, so the cache is re-seeded from
+    # kv0 every iteration. The compressor carries state across steps, so its run has
+    # to be a real sequential decode: one cache, one rolling state, advancing pos.
     kv0 = torch.randn(cfg.window, cfg.head_dim, generator=gen, device=dev).to(torch.bfloat16)
     pos = cfg.window
     idx = window_idxs(pos, 1, cfg.window, dev)
+    if compress_ratio:
+        pos = 0
+        kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+        kv_r = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+        ks = torch.zeros(cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev)
+        ss = torch.full((cfg.c_rows, cfg.c_coff * cfg.head_dim), float("-inf"), device=dev)
 
     if npes == 1:
         allreduce = lambda x: x  # noqa: E731
@@ -234,11 +247,17 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4,
             return sum(parts[1:], parts[0]).to(x.device)
 
     ok = True
-    for _ in range(iters):
+    boundaries = 0
+    for it in range(iters):
         hshape = (1, cfg.hidden) if cfg.hc_mult == 1 else (1, cfg.hc_mult, cfg.hidden)
         h = torch.randn(*hshape, generator=gen, device=dev).to(torch.bfloat16)
+        if compress_ratio:
+            pos = it
+            idx = layer_idxs(pos, 1, cfg, dev)
+            boundaries += (pos + 1) % compress_ratio == 0
         cur = torch.tensor([pos], dtype=torch.int32, device=dev)
-        out = layer.forward(h, cur, kv0.clone(), idx, cos, sin)
+        kv_in = kv_k if compress_ratio else kv0.clone()
+        out = layer.forward(h, cur, kv_in, idx, cos, sin, cos_c=cos_c, sin_c=sin_c)
         torch.cuda.synchronize()
         got = layer.intermediates()
 
@@ -253,7 +272,26 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4,
             for other in sels[1:]:
                 torch.testing.assert_close(other, sels[0], atol=0, rtol=0)
 
-        ref = golden_layer(W, h, pos, kv0.clone(), idx, cos, sin, allreduce, moe_mode=moe_mode)
+        gkw = dict(kv_state=ks, score_state=ss, cos_c=cos_c, sin_c=sin_c) if compress_ratio else {}
+        ref = golden_layer(
+            W,
+            h,
+            pos,
+            kv_r if compress_ratio else kv0.clone(),
+            idx,
+            cos,
+            sin,
+            allreduce,
+            moe_mode=moe_mode,
+            **gkw,
+        )
+        if compress_ratio and (pos + 1) % compress_ratio == 0:
+            slot = cfg.window + pos // compress_ratio
+            a_c, b_c = kv_k[slot].float(), kv_r[slot].float()
+            c_rel = (a_c - b_c).abs().max().item() / max(b_c.abs().max().item(), 1e-6)
+            if c_rel >= 2e-2:
+                print(f"rank {rank}: compressed row at {slot} rel {c_rel:.5f}", flush=True)
+                ok = False
         # Routing is a discrete top-k over scores derived from `a`, so a 1-ulp
         # difference there can move a near-tied expert. That makes an end-to-end
         # comparison meaningless -- a different expert gives a different `mid`. So
@@ -300,26 +338,29 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4,
         if rel_l2 >= out_tol and not flipped:  # end to end only when routing agrees
             ok = False
     layer.close()
+    if compress_ratio and boundaries < 2:
+        print(f"rank {rank}: only crossed {boundaries} compression boundaries", flush=True)
+        ok = False
     return ok
 
 
-def _worker(rank, npes, real, iters, hc_mult, results):
+def _worker(rank, npes, real, iters, hc_mult, compress_ratio, results):
     import torch.distributed as dist
 
     dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29551", rank=rank, world_size=npes)
     try:
-        results[rank] = run_rank(rank, npes, real=real, iters=iters, hc_mult=hc_mult)
+        results[rank] = run_rank(rank, npes, real=real, iters=iters, hc_mult=hc_mult, compress_ratio=compress_ratio)
     finally:
         dist.destroy_process_group()
 
 
-def run_tp(npes, real=False, iters=2, hc_mult=1):
+def run_tp(npes, real=False, iters=2, hc_mult=1, compress_ratio=0):
     if npes == 1:
-        return run_rank(0, 1, real=real, iters=iters, hc_mult=hc_mult)
+        return run_rank(0, 1, real=real, iters=iters, hc_mult=hc_mult, compress_ratio=compress_ratio)
     import torch.multiprocessing as mp
 
     results = mp.Manager().dict()
-    mp.spawn(_worker, args=(npes, real, iters, hc_mult, results), nprocs=npes)
+    mp.spawn(_worker, args=(npes, real, iters, hc_mult, compress_ratio, results), nprocs=npes)
     return all(results[r] for r in range(npes))
 
 
@@ -331,6 +372,19 @@ def test_dsv4_layer_tp8(hc_mult):
     if torch.cuda.device_count() < 8:
         pytest.skip("needs 8 GPUs")
     assert run_tp(8, hc_mult=hc_mult)
+
+
+@pytest.mark.multi_gpu
+def test_dsv4_hca_layer_tp8():
+    """HCA across ranks: a real sequential decode over two compression boundaries.
+
+    The compressor is replicated (wkv is not TP-sharded), so every rank has to
+    produce the same compressed row from the same rolling state -- and the ranks
+    still have to agree bit-for-bit on routing with those rows in the gather.
+    """
+    if torch.cuda.device_count() < 8:
+        pytest.skip("needs 8 GPUs")
+    assert run_tp(8, iters=20, compress_ratio=8)
 
 
 # ------------------------------------------------------------------ benchmark
