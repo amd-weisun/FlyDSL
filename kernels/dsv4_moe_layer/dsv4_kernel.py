@@ -175,6 +175,8 @@ def layout(
     c_coff: int = 1,
     index_head_dim: int = 0,
     index_heads: int = 0,
+    index_heads_total: int = 0,
+    max_seq: int = 0,
 ):
     """Byte offsets of the per-rank scratch and of the symmetric buffer.
 
@@ -212,6 +214,12 @@ def layout(
         # the indexer's query, raw then rotated/rotated-into-Hadamard/FP4
         ("i_q_raw", S * index_heads * index_head_dim * pr if index_head_dim else pr),
         ("i_q", S * index_heads * index_head_dim * pr if index_head_dim else pr),
+        ("i_wp", S * index_heads * pr if index_head_dim else pr),
+        # the row this launch just compressed, for the same reason cnew exists:
+        # the scorer cannot rely on seeing our own global store
+        ("i_cnew", S * index_head_dim * pr if index_head_dim else pr),
+        # one score per compressed entry; entries not yet written score NEG
+        ("i_score", S * max(n_compressed(max_seq, compress_ratio), 1) * pr),
         ("q", S * heads * head_dim * pr),  # full per-head query: rope is inside it
         ("sp_acc", S * n_split * heads * head_dim * pr),
         ("sp_m", S * n_split * heads * pr),
@@ -422,6 +430,26 @@ def _mxfp4_to_bf16x8(word, scale):
     return fx.Vector.from_elements(parts, fx.BFloat16)
 
 
+SCORE_TILE = 512  # one candidate per thread
+
+
+def n_compressed(max_seq: int, compress_ratio: int) -> int:
+    return max_seq // compress_ratio if compress_ratio else 0
+
+
+def n_score_tiles(max_seq: int, compress_ratio: int, index_head_dim: int) -> int:
+    """Tiles of compressed entries the indexer scores, sized for the WHOLE cache.
+
+    The count that matters at runtime is how many entries exist so far, which
+    grows with position; a monokernel stage cannot be sized from that, so it is
+    sized for the maximum and entries past the end score NEG.
+    """
+    if not index_head_dim:
+        return 0
+    n = n_compressed(max_seq, compress_ratio)
+    return (n + SCORE_TILE - 1) // SCORE_TILE
+
+
 def qkv_a_rows(q_lora: int, head_dim: int, compress_ratio: int, c_coff: int, index_head_dim: int = 0) -> int:
     """Rows of the fused qkv_a GEMV.
 
@@ -453,6 +481,8 @@ def stage_tasks(
     c_coff: int = 1,
     index_head_dim: int = 0,
     index_heads: int = 0,
+    index_heads_total: int = 0,
+    max_seq: int = 0,
 ):
     """[(stage name, task count)] in execution order.
 
@@ -476,6 +506,9 @@ def stage_tasks(
         # the indexer's query, and its rope / rotation / FP4 tail
         ("i_q_b", index_heads * index_head_dim // Q_B_TILE if index_head_dim else 0),
         ("i_q", S if index_head_dim else 0),
+        # the per-head score weights, then the score of every compressed entry
+        ("i_wp", S if index_head_dim else 0),
+        ("i_score", S * n_score_tiles(max_seq, compress_ratio, index_head_dim)),
         ("split", S * ((window if n_keys is None else n_keys) // SPLIT_KEYS)),
         ("uv", S * (heads * head_dim // UV_TILE)),
         ("o_a", S * o_groups * o_lora // ROW_TILE),
@@ -518,6 +551,8 @@ def build_dsv4_kernel(
     c_coff: int = 1,
     index_head_dim: int = 0,
     index_heads: int = 0,
+    index_heads_total: int = 0,
+    max_seq: int = 0,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole V4 layer.
 
@@ -664,6 +699,7 @@ def build_dsv4_kernel(
         c_coff=C_COFF,
         index_head_dim=IHD,
         index_heads=index_heads,
+        max_seq=max_seq,
     )
     assert N_KEYS % SPLIT_KEYS == 0, "the index list must be a whole number of key tiles"
     N_SPLIT = N_KEYS // SPLIT_KEYS
@@ -673,7 +709,11 @@ def build_dsv4_kernel(
     IH = index_heads if IHD else 0
     N_IQB = IH * IHD // Q_B_TILE
     IQB_PER_HEAD = IHD // Q_B_TILE if IHD else 0
+    IH_TOTAL = index_heads_total or index_heads
+    N_COMP = (max_seq // CR) if (IHD and CR) else 0
+    N_ISCORE = n_score_tiles(max_seq, compress_ratio, index_head_dim)
     if IHD:
+        assert IHD % 8 == 0 and N_COMP > 0
         assert IHD == 128, "the indexer's Hadamard is written for a 128-wide head"
         assert IH % WAVES == 0, "one wave takes a whole index head"
         assert IHD - ROPE_DIM == 64, "rope must fall entirely in the head's second half"
@@ -726,6 +766,7 @@ def build_dsv4_kernel(
         c_coff=C_COFF,
         index_head_dim=IHD,
         index_heads=index_heads,
+        max_seq=max_seq,
     )
     base, first, acc = {}, {}, 0
     for name, n in stage_tasks(S, H, **st_args):
@@ -747,6 +788,8 @@ def build_dsv4_kernel(
         "q_norm",
         "i_q_b",
         "i_q",
+        "i_wp",
+        "i_score",
         "uv",
         "o_a",
         "o_b",
@@ -802,6 +845,7 @@ def build_dsv4_kernel(
         s_q_b: Int64,
         w_i_q_b: Int64,
         s_i_q_b: Int64,
+        i_w: Int64,
         w_o_a: Int64,
         s_o_a: Int64,
         w_o_b: Int64,
@@ -1948,6 +1992,8 @@ def build_dsv4_kernel(
                         row = (p // CR) * IHD
                         bo.buffer_store(bf16_round(o0).to(fx.BFloat16), r_ic, row + ln)
                         bo.buffer_store(bf16_round(o1).to(fx.BFloat16), r_ic, row + ln + 64)
+                        put(mb("i_cnew"), tt * IHD + ln, bf16_round(o0))
+                        put(mb("i_cnew"), tt * IHD + ln + 64, bf16_round(o1))
                     if const_expr(OVERLAP):
                         # retire the window, as the attention compressor does
                         for i in range_constexpr(CR):
@@ -2063,6 +2109,124 @@ def build_dsv4_kernel(
                     put(mb("i_q"), base_i + chs[0], o0)
                     put(mb("i_q"), base_i + chs[1], o1)
                 stamp("i_q", tt, 4)
+
+        # ===== 3c. weights_proj: the per-head weight the score's head-sum uses
+        # bf16 and tiny (IH outputs), so no MFMA: wave w accumulates head w over
+        # this thread's slice of the normed layer input, then one block reduction.
+        # Scaled by the GLOBAL head count -- the sum is finished by the all-reduce.
+        if const_expr(IHD):
+            for tt in range(start("i_wp"), S, G):
+                tt = fx.Int32(tt)
+                stamp("i_wp", tt, 0)
+                r_iw = _rsrc(i_w)
+
+                def ld_hw(sks):
+                    if const_expr(HC > 1):
+                        vals = poll([(mb("xin"), (s * HIDDEN + k) // 2, 2) for s, k in sks])
+                        res = []
+                        for i in range_constexpr(len(sks)):
+                            a0, a1 = bf2_f32(vals[i][0])
+                            b0, b1 = bf2_f32(vals[i][1])
+                            res.append([a0, a1, b0, b1])
+                        return res
+                    res = []
+                    for s, k in sks:
+                        w = fx.Vector(bo.buffer_load(r_h, (s * HIDDEN + k) // 2, vec_width=2, dtype=T.i32))
+                        v = w.bitcast(fx.BFloat16).to(fx.Float32)
+                        res.append([v[j] for j in range(4)])
+                    return res
+
+                # the same normed input qkv_a reads, recomputed rather than
+                # republished: one extra pass over HIDDEN is cheaper than the traffic
+                ks, act = _rmsnorm_tail_ks(HIDDEN)
+                gs, xv = load_x_rmsnorm(ld_hw, HIDDEN, g_in, count=1)
+                ssq = fx.Float32(0.0)
+                for i in range_constexpr(len(ks)):
+                    for a in xv[i]:
+                        term = a * a
+                        if const_expr(act is not None and i == len(ks) - 1):
+                            term = act.select(term, fx.Float32(0.0))
+                        ssq = ssq + term
+                rstd = _rsq(block_sums([ssq])[0] * (1.0 / HIDDEN) + EPS)
+                stamp("i_wp", tt, 2)
+                parts = []
+                for hh in range_constexpr(IH):
+                    acc = fx.Float32(0.0)
+                    for i in range_constexpr(len(ks)):
+                        wv = (
+                            fx.Vector(bo.buffer_load(r_iw, (hh * HIDDEN + ks[i]) // 2, vec_width=2, dtype=T.i32))
+                            .bitcast(fx.BFloat16)
+                            .to(fx.Float32)
+                        )
+                        for j in range_constexpr(4):
+                            term = xv[i][j] * rstd * gs[i][j] * wv[j]
+                            if const_expr(act is not None and i == len(ks) - 1):
+                                term = act.select(term, fx.Float32(0.0))
+                            acc = acc + term
+                    parts.append(acc)
+                tots = block_sums(parts)
+                # the GLOBAL head count: this rank holds IH of them and the
+                # all-reduce finishes the sum, so the scale cannot be local
+                sc = float(IHD) ** -0.5 * float(IH_TOTAL) ** -0.5
+                for hh in range_constexpr(IH):
+                    if tid == 0:
+                        put(mb("i_wp"), tt * IH + hh, bf16_round(tots[hh]) * sc)
+                stamp("i_wp", tt, 4)
+
+            # ===== 3d. score every compressed entry against the indexer's queries
+            # score[c] = sum_h relu(q[h] . k[c]) * w[h]. One candidate per thread;
+            # the queries go to LDS once, where every thread reads the SAME element
+            # at a time, so those reads broadcast rather than conflict.
+            for tt in range(start("i_score"), S * N_ISCORE, G):
+                tt = fx.Int32(tt)
+                stamp("i_score", tt, 0)
+                s = tt // N_ISCORE
+                blk = tt % N_ISCORE
+                for i in range_constexpr((IH * IHD + THREADS - 1) // THREADS):
+                    w4 = tid + i * THREADS
+                    if w4 < IH * IHD:
+                        lds_st(xs, w4, getf(mb("i_q"), s * IH * IHD + w4))
+                wv = [getf(mb("i_wp"), s * IH + hh) for hh in range(IH)]
+                gpu.barrier()
+                stamp("i_score", tt, 2)
+                c = blk * SCORE_TILE + tid
+                # entries the compressor has not written yet must never be picked
+                n_live = (pos0 + s + 1) // CR
+                r_ic2 = _rsrc(i_cache)
+                accs = [fx.Float32(0.0) for _ in range(IH)]
+                # the entry this launch just wrote is not reliably visible in the
+                # cache yet, so take it from the mailbox instead. The outer test is
+                # CTA-uniform, so every thread reaches the poll; only the thread
+                # holding that candidate uses the value.
+                is_new = c == (pos0 + s) // CR
+                for d0 in range_constexpr(IHD // 8):
+                    kw = [
+                        v
+                        for v in fx.Vector(
+                            bo.buffer_load(
+                                r_ic2,
+                                fx.min(c, N_COMP - 1) * (IHD // 2) + d0 * 4,
+                                vec_width=4,
+                                dtype=T.i32,
+                            )
+                        )
+                        .bitcast(fx.BFloat16)
+                        .to(fx.Float32)
+                    ]
+                    if (pos0 + s + 1) % CR == 0:
+                        nv = [getf(mb("i_cnew"), s * IHD + d0 * 8 + e) for e in range(8)]
+                        kw = [is_new.select(nv[e], kw[e]) for e in range(8)]
+                    for e in range_constexpr(8):
+                        kv = kw[e]
+                        for hh in range_constexpr(IH):
+                            accs[hh] = accs[hh] + kv * lds_ld(xs, hh * IHD + d0 * 8 + e)
+                sc_t = fx.Float32(0.0)
+                for hh in range_constexpr(IH):
+                    sc_t = sc_t + fx.max(accs[hh], fx.Float32(0.0)) * wv[hh]
+                live = (c < n_live) & (c < N_COMP)
+                if c < N_COMP:
+                    put(mb("i_score"), s * N_COMP + c, live.select(sc_t, fx.Float32(NEG)))
+                stamp("i_score", tt, 4)
 
         # ============== 4. per-head query RMS (no weight) + RoPE -> bf16 query
         # V4 scales each head's whole HEAD_DIM query by rsqrt(mean(q^2) + eps) before
@@ -2978,6 +3142,7 @@ def build_dsv4_kernel(
         s_q_b: Int64,
         w_i_q_b: Int64,
         s_i_q_b: Int64,
+        i_w: Int64,
         w_o_a: Int64,
         s_o_a: Int64,
         w_o_b: Int64,
@@ -3029,6 +3194,7 @@ def build_dsv4_kernel(
             s_q_b,
             w_i_q_b,
             s_i_q_b,
+            i_w,
             w_o_a,
             s_o_a,
             w_o_b,

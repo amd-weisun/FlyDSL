@@ -937,3 +937,91 @@ def test_dsv4_indexer_query_in_kernel():
         rel_l2 = ((got - ref).norm() / max(ref.norm().item(), 1e-6)).item()
         assert n_diff <= 4, f"pos={pos}: {n_diff}/{ih * ihd} elements differ"
         assert rel_l2 < 1e-2, f"pos={pos} indexer query rel_l2 {rel_l2:.5f}"
+
+
+def test_dsv4_indexer_scoring_in_kernel():
+    """The indexer's SCORE for every compressed entry, against the golden.
+
+    score[c] = sum_h relu(q[h] . k[c]) * w[h], over entries the compressor has
+    actually written; the rest score NEG so a top-k can never pick them. Single
+    rank, so the cross-rank sum the real scale anticipates is the identity here.
+
+    The golden side is spelled out rather than calling indexer_step, because that
+    returns the selection and what is under test is the score behind it.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+    from kernels.dsv4_moe_layer.reference import (
+        compress_step,
+        dequant,
+        hadamard,
+        qkv_a_split,
+        quant_dequant_fp4,
+        rope,
+    )
+
+    torch.manual_seed(0)
+    ratio = COMPRESS_CSA
+    cfg = _cfg(hc_mult=1)
+    cfg.compress_ratio, cfg.max_seq = ratio, 256
+    ih, ihd, rd = cfg.index_heads, cfg.index_head_dim, cfg.rope_dim
+    dev, mode = "cuda", MoeMode.W8A8
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    t = W.t
+    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
+
+    cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    i_ks = torch.zeros(cfg.c_rows, cfg.c_coff * ihd, device=dev)
+    i_ss = torch.full((cfg.c_rows, cfg.c_coff * ihd), float("-inf"), device=dev)
+    i_ref = torch.zeros(cfg.n_compressed, ihd, dtype=torch.bfloat16, device=dev)
+    dq_qkv = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+    dq_iqb = dequant(t["w_i_q_b"], t["s_i_q_b"], 128)
+    cut = qkv_a_split(cfg)
+    scale = ihd**-0.5 * cfg.index_heads_total**-0.5
+
+    scored = 0
+    for pos in range(4 * ratio):
+        h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
+        cur = torch.tensor([pos], dtype=torch.int32, device=dev)
+        layer.forward(h, cur, kv_k, layer_idxs(pos, 1, cfg, dev), cos, sin)
+        torch.cuda.synchronize()
+
+        x = bf(rmsnorm(h.float(), t["g_in"], cfg.eps))
+        proj = x @ dq_qkv.float().T
+        compress_step(
+            proj[0, slice(*cut["i_kv"])],
+            proj[0, slice(*cut["i_gate"])],
+            pos,
+            cfg,
+            t,
+            i_ks,
+            i_ss,
+            i_ref,
+            cos,
+            sin,
+            head_dim=ihd,
+            ape=t["i_ape"],
+            gamma=t["g_ickv"],
+            base=0,
+            rotate=True,
+        )
+        q_an = bf(rmsnorm(proj[:, : cfg.q_lora], t["g_q"], cfg.eps))
+        q = (q_an @ dq_iqb.T).view(ih, ihd)
+        q = torch.stack([torch.cat([q[j, :-rd], bf(rope(q[j, -rd:], cos[pos], sin[pos]))]) for j in range(ih)])
+        q = quant_dequant_fp4(bf(hadamard(bf(q))))
+        w = bf(x @ t["i_w"].float().T)[0] * scale
+
+        n = (pos + 1) // ratio
+        got = layer.debug("i_score", (1, cfg.n_compressed))[0]
+        if not n:
+            assert bool((got < 0).all()), f"pos={pos}: nothing compressed, nothing scorable"
+            continue
+        scored += 1
+        ref = (torch.einsum("hd,td->ht", q, i_ref[:n].float()).relu() * w.view(ih, 1)).sum(0)
+        a, b = got[:n], ref
+        rel = ((a - b).norm() / max(b.norm().item(), 1e-6)).item()
+        assert rel < 2e-2, f"pos={pos} score rel_l2 {rel:.5f}"
+        # entries the compressor has not written must be unpickable
+        assert bool((got[n:] < 0).all()), f"pos={pos}: unwritten entries are scorable"
+
+    assert scored >= 3, f"expected several scored steps, got {scored}"
