@@ -116,7 +116,7 @@ def _load_oracle_weights(attn, moe, W, cfg, weight_fmt):
     bf16 = torch.bfloat16
 
     attn.wq_a.weight.copy_(dq["qkv_a"][: cfg.q_lora].to(bf16))
-    attn.wkv.weight.copy_(dq["qkv_a"][cfg.q_lora :].to(bf16))
+    attn.wkv.weight.copy_(dq["qkv_a"][cfg.q_lora : cfg.q_lora + cfg.head_dim].to(bf16))
     attn.wq_b.weight.copy_(dq["q_b"].to(bf16))
     attn.wo_a.weight.copy_(dq["o_a"].to(bf16))
     attn.wo_b.weight.copy_(dq["o_b"].to(bf16))
@@ -228,9 +228,12 @@ def _load_block_weights(block, W, cfg, weight_fmt):
     t = W.t
     _load_oracle_weights(block.attn, block.ffn, W, cfg, weight_fmt)
     if cfg.compress_ratio:
+        # the compressor's projections live in our fused qkv_a; split them back out
+        hd, ql = cfg.head_dim, cfg.q_lora
+        dq = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
         c = block.attn.compressor
-        c.wkv.weight.copy_(t["w_ckv"].float())
-        c.wgate.weight.copy_(t["w_cgate"].float())
+        c.wkv.weight.copy_(dq[ql + hd : ql + 2 * hd].float())
+        c.wgate.weight.copy_(dq[ql + 2 * hd :].float())
         c.ape.copy_(t["ape"].float())
         c.norm.weight.copy_(t["g_ckv"].float())
     block.attn_norm.weight.copy_(t["g_in"].float())

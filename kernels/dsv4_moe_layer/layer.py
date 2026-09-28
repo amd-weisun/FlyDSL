@@ -47,7 +47,7 @@ class Dsv4MoeLayer:
         moe_mode: MoeMode | str = MoeMode.A8W4,
     ):
         cfg = W.cfg
-        validate_shard(samples, cfg.heads, rank, npes, cfg.window)
+        validate_shard(samples, cfg.heads, rank, npes, cfg.window, cfg.compress_ratio)
         if cfg.hc_mult > 1 and cfg.hc_mult & (cfg.hc_mult - 1):
             raise ValueError(f"hc_mult must be 1 or a power of two, got {cfg.hc_mult}")
         self.moe_mode = as_moe_mode(moe_mode)
@@ -75,6 +75,7 @@ class Dsv4MoeLayer:
         # host derives scratch offsets and its size from one and the kernel from the
         # other, so any drift both misreads every mailbox and undersizes the buffer.
         dims["hc_mult"] = cfg.hc_mult
+        dims["compress_ratio"] = cfg.compress_ratio
         self.scr_layout, self.sym_layout = layout(samples, cfg.heads, npes, cfg.window, self.moe_mode, **dims)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
@@ -96,9 +97,19 @@ class Dsv4MoeLayer:
             swiglu_limit=cfg.swiglu_limit,
             hc_sinkhorn_iters=cfg.hc_sinkhorn_iters,
             hc_eps=cfg.hc_eps,
+            window_rows=cfg.cache_rows,
+            n_keys=cfg.n_keys,
             **dims,
         )
         self.stages = stage_tasks(samples, cfg.heads, window=cfg.window, top_k=cfg.top_k, inter=cfg.inter, **dims)
+        # the compressor carries a rolling window across decode steps, so its state
+        # lives here rather than being rebuilt per call
+        if cfg.compress_ratio:
+            shape = (cfg.compress_ratio, cfg.head_dim)
+            self.kv_state = torch.zeros(*shape, dtype=torch.float32, device=dev)
+            self.score_state = torch.zeros(*shape, dtype=torch.float32, device=dev)
+        else:
+            self.kv_state = self.score_state = torch.zeros(1, device=dev)
         n_tasks = sum(n for _, n in self.stages)
         self.timeline = torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev) if timeline else None
         self.step = torch.zeros(1, dtype=torch.int32, device=dev)  # decode-step counter
@@ -145,6 +156,10 @@ class Dsv4MoeLayer:
             p(t["g_kv"]),
             p(t["g_post"]),
             p(t["attn_sink"]),
+            p(t["ape"]) if "ape" in t else 0,
+            p(t["g_ckv"]) if "g_ckv" in t else 0,
+            p(self.kv_state),
+            p(self.score_state),
             p(t["hc_attn_fn"]) if "hc_attn_fn" in t else 0,
             p(self.hc_sb["attn"]),
             p(t["hc_ffn_fn"]) if "hc_ffn_fn" in t else 0,

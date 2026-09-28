@@ -39,6 +39,7 @@ from kernels.dsv4_moe_layer.config import (
     HEAD_DIM,
     HIDDEN,
     INTER,
+    KEY_BLOCK,
     N_EXPERTS,
     O_GROUPS,
     O_LORA,
@@ -107,6 +108,14 @@ class V4Config:
         return self.window + self.n_compressed
 
     @property
+    def n_keys(self) -> int:
+        """Length of the attention's index list, padded to the key tile. The split
+        stage walks this, NOT the window: with compression the gather has to reach
+        past the window into the compressed half of the cache."""
+        rows = self.cache_rows
+        return (rows + KEY_BLOCK - 1) // KEY_BLOCK * KEY_BLOCK
+
+    @property
     def hc_rows(self) -> int:
         """hc_mix padded to the MFMA row group (24 -> 32 at hc_mult 4)."""
         return (self.hc_mix + 15) // 16 * 16
@@ -147,8 +156,10 @@ class V4Config:
 def fp8_mats(cfg: V4Config):
     """(rows, K, BK) of every FP8 attention matrix in one rank's shard."""
     return {
-        # wq_a and wkv fuse into one GEMV off the same normed input
-        "qkv_a": (cfg.q_lora + cfg.head_dim, cfg.hidden, 128),
+        # wq_a, wkv and -- when the layer compresses -- the compressor's own wkv and
+        # wgate all read the same normed input, so they fuse into one GEMV rather
+        # than costing a second weight stream and another dependency
+        "qkv_a": (cfg.q_lora + cfg.head_dim * (3 if cfg.compress_ratio else 1), cfg.hidden, 128),
         "q_b": (cfg.heads * cfg.head_dim, cfg.q_lora, 128),
         "o_a": (cfg.o_groups * cfg.o_lora, cfg.group_dim, 128),
         "o_b": (cfg.hidden, cfg.o_groups * cfg.o_lora, 128),
@@ -196,8 +207,6 @@ def make_weights(
         # The compressor runs in fp32, and is replicated: it consumes the same
         # layer input on every rank.
         r = cfg.compress_ratio
-        t["w_ckv"] = torch.randn(cfg.head_dim, cfg.hidden, generator=rep, device=device) / cfg.hidden**0.5
-        t["w_cgate"] = torch.randn(cfg.head_dim, cfg.hidden, generator=rep, device=device) / cfg.hidden**0.5
         t["ape"] = 0.5 * torch.randn(r, cfg.head_dim, generator=rep, device=device)
         t["g_ckv"] = (1 + 0.1 * torch.randn(cfg.head_dim, generator=rep, device=device)).to(bfl)
 
@@ -293,19 +302,19 @@ def hc_post(x: torch.Tensor, residual: torch.Tensor, post, comb):
     return (post.unsqueeze(-1) * x.unsqueeze(-2).float() + mixed).type_as(x)
 
 
-def compress_step(x, cur_pos, cfg, t, kv_state, score_state, cache, cos_c, sin_c):
+def compress_step(kv, score, cur_pos, cfg, t, kv_state, score_state, cache, cos_c, sin_c):
     """One decode step of the KV compressor (HCA, non-overlapping).
 
     Every token feeds a rolling window of ``compress_ratio`` positions; only the
     last of each window emits a compressed entry. The pooling weight is a
     **per-channel** softmax over the window's positions -- not one scalar per
     token -- plus a learned absolute-position bias ``ape``. Mutates
-    ``kv_state`` / ``score_state`` / ``cache``, as the kernel does.
+    ``kv_state`` / ``score_state`` / ``cache``, as the kernel does. ``kv`` and
+    ``score`` come from the fused qkv_a projection.
     """
     r, rd = cfg.compress_ratio, cfg.rope_dim
-    xf = x.float()
-    kv = xf @ t["w_ckv"].T.float()
-    score = xf @ t["w_cgate"].T.float() + t["ape"][cur_pos % r]
+    kv = kv.float()
+    score = score.float() + t["ape"][cur_pos % r]
     kv_state[cur_pos % r] = kv
     score_state[cur_pos % r] = score
     if (cur_pos + 1) % r:
@@ -332,7 +341,11 @@ def layer_idxs(cur_pos: int, samples: int, cfg: V4Config, device) -> torch.Tenso
         n = (cur_pos + s + 1) // cfg.compress_ratio
         rows.append([cfg.window + i for i in range(n)] + [-1] * (cfg.n_compressed - n))
     comp = torch.tensor(rows, dtype=torch.int32, device=device)
-    return torch.cat([win, comp], dim=1)
+    idx = torch.cat([win, comp], dim=1)
+    pad = cfg.n_keys - idx.shape[1]
+    if pad:
+        idx = torch.cat([idx, torch.full((samples, pad), -1, dtype=torch.int32, device=device)], dim=1)
+    return idx
 
 
 def window_idxs(cur_pos: int, samples: int, window: int, device) -> torch.Tensor:
@@ -410,7 +423,11 @@ def golden_layer(
         xin, post_a, comb_a = h, None, None
     x = bf(rmsnorm(xin, t["g_in"], cfg.eps))
     qkv = x @ dq["qkv_a"].T
-    q_a, kv = qkv[:, : cfg.q_lora], qkv[:, cfg.q_lora :]
+    hd = cfg.head_dim
+    q_a = qkv[:, : cfg.q_lora]
+    kv = qkv[:, cfg.q_lora : cfg.q_lora + hd]
+    c_kv = qkv[:, cfg.q_lora + hd : cfg.q_lora + 2 * hd] if cfg.compress_ratio else None
+    c_gate = qkv[:, cfg.q_lora + 2 * hd :] if cfg.compress_ratio else None
 
     # query: lora -> per-head, then a weightless RMS over the whole head, then rope
     q = (bf(rmsnorm(q_a, t["g_q"], cfg.eps)) @ dq["q_b"].T).view(S, H, hd)
@@ -428,7 +445,7 @@ def golden_layer(
         if cfg.compress_ratio:
             # the compressor sees the same normed input the projections do, and
             # writes into the compressed half of the same cache
-            compress_step(x[s], pos[s], cfg, t, kv_state, score_state, kv_cache, cos_c, sin_c)
+            compress_step(c_kv[s], c_gate[s], pos[s], cfg, t, kv_state, score_state, kv_cache, cos_c, sin_c)
     kvf = kv_cache.float()
 
     # gather-sparse attention with a per-head sink in the denominator

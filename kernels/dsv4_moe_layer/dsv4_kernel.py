@@ -170,6 +170,7 @@ def layout(
     o_groups: int = O_GROUPS,
     o_lora: int = O_LORA,
     hc_mult: int = 1,
+    compress_ratio: int = 0,
 ):
     """Byte offsets of the per-rank scratch and of the symmetric buffer.
 
@@ -192,6 +193,12 @@ def layout(
         ("ain", S * hidden * pr if hc_mult > 1 else pr),
         ("q_a", S * q_lora * pr),
         ("kv_a", S * head_dim * pr),  # the single shared KV row, pre-norm
+        # the compressor's own kv / gate, split out of the same fused qkv_a GEMV
+        ("c_kv", S * head_dim * pr if compress_ratio else pr),
+        ("c_gate", S * head_dim * pr if compress_ratio else pr),
+        # the compressed row this launch just wrote, for the same reason kvnew
+        # exists: the gather cannot rely on seeing our own global store
+        ("cnew", S * head_dim * pr if compress_ratio else pr),
         ("kvnew", S * head_dim * pr),  # this launch's KV ring rows (bf16 values)
         ("q_raw", S * heads * head_dim * pr),  # q_b output, before the per-head RMS
         ("q", S * heads * head_dim * pr),  # full per-head query: rope is inside it
@@ -385,6 +392,7 @@ def stage_tasks(
     top_k: int = TOP_K,
     inter: int = INTER,
     hc_mult: int = 1,
+    compress_ratio: int = 0,
 ):
     """[(stage name, task count)] in execution order.
 
@@ -399,6 +407,8 @@ def stage_tasks(
         ("hcc_a", (hidden // ROW_TILE) if hc_mult > 1 else 0),
         ("qkv_a", n_qkv_a),
         ("cache", 1),
+        # the compressed entry has to land before the attention gathers it
+        ("cmp", S if compress_ratio else 0),
         ("q_b", heads * head_dim // Q_B_TILE),
         ("q_norm", S * heads),
         ("split", S * (window // SPLIT_KEYS)),
@@ -437,6 +447,9 @@ def build_dsv4_kernel(
     hc_mult: int = 1,
     hc_sinkhorn_iters: int = HC_SINKHORN_ITERS,
     hc_eps: float = HC_EPS,
+    compress_ratio: int = 0,
+    window_rows: int | None = None,
+    n_keys: int | None = None,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole V4 layer.
 
@@ -498,7 +511,7 @@ def build_dsv4_kernel(
     NOPE_DIM = HEAD_DIM - ROPE_DIM
     MOE_SLOTS = 1 + TOP_K
     SHARED_EXPERT = N_EXPERTS
-    QKV_A_ROWS = Q_LORA + HEAD_DIM
+    QKV_A_ROWS = Q_LORA + HEAD_DIM * (3 if compress_ratio else 1)
     N_QKV_A = QKV_A_ROWS // QKV_A_TILE
     N_ROW_TILES = HIDDEN // ROW_TILE
     N_ROUTER = N_EXPERTS // ROUTER_TILE
@@ -515,6 +528,19 @@ def build_dsv4_kernel(
         else (PUBLISH_BLOCKS + N_ROUTER - 1) // N_ROUTER
     )
     assert XQ_WAVES <= WAVES
+    # --- KV compression (HCA). CR == 0 is sliding-window only and compiles out.
+    CR = compress_ratio
+    # the window and the compressed entries share one cache, the compressed half
+    # starting at `window`, so the attention gathers both from one index list
+    CACHE_ROWS = window if window_rows is None else window_rows
+    # the split walks the whole index list, not just the window: with compression
+    # the gather reaches past the window into the compressed half of the cache
+    N_KEYS = window if n_keys is None else n_keys
+    if CR:
+        assert CR != 4, "CSA needs the overlapping compressor and the lightning indexer"
+        assert CACHE_ROWS > window, "a compressing layer needs cache rows past the window"
+        assert HEAD_DIM <= THREADS, "the compressor maps one thread per channel"
+
     # --- hyper-connections. HC == 1 is a plain residual and compiles all of this out.
     HC = hc_mult
     HC_TASKS, HC_KSLICE, HC_ROWS, HC_VALS = hc_shape(HC, HIDDEN)
@@ -554,8 +580,10 @@ def build_dsv4_kernel(
         o_groups=O_GROUPS,
         o_lora=O_LORA,
         hc_mult=HC,
+        compress_ratio=CR,
     )
-    N_SPLIT = window // SPLIT_KEYS
+    assert N_KEYS % SPLIT_KEYS == 0, "the index list must be a whole number of key tiles"
+    N_SPLIT = N_KEYS // SPLIT_KEYS
     N_QB = H * HEAD_DIM // Q_B_TILE
     QB_PER_HEAD = HEAD_DIM // Q_B_TILE
     N_UV = H * HEAD_DIM // UV_TILE
@@ -602,6 +630,7 @@ def build_dsv4_kernel(
         top_k=TOP_K,
         inter=INTER,
         hc_mult=HC,
+        compress_ratio=CR,
     )
     base, first, acc = {}, {}, 0
     for name, n in stage_tasks(S, H, **st_args):
@@ -616,6 +645,7 @@ def build_dsv4_kernel(
         "hcc_a",
         "qkv_a",
         "cache",
+        "cmp",
         "split",
         "q_b",
         "q_norm",
@@ -655,6 +685,10 @@ def build_dsv4_kernel(
         g_kv: Int64,
         g_post: Int64,
         attn_sink: Int64,
+        ape: Int64,
+        g_ckv: Int64,
+        kv_state: Int64,
+        score_state: Int64,
         hc_attn_fn: Int64,
         hc_attn_sb: Int64,
         hc_ffn_fn: Int64,
@@ -1562,8 +1596,12 @@ def build_dsv4_kernel(
                 v = lds_ld(outs, tid)
                 if row < Q_LORA:
                     put(mb("q_a"), s * Q_LORA + row, v)
-                else:
+                elif row < Q_LORA + HEAD_DIM:
                     put(mb("kv_a"), s * HEAD_DIM + row - Q_LORA, v)
+                elif row < Q_LORA + 2 * HEAD_DIM:
+                    put(mb("c_kv"), s * HEAD_DIM + row - Q_LORA - HEAD_DIM, v)
+                else:
+                    put(mb("c_gate"), s * HEAD_DIM + row - Q_LORA - 2 * HEAD_DIM, v)
             stamp("qkv_a", t, 4)
 
         # ====== 2. KV RMSNorm + RoPE + FP8 round trip -> sliding-window ring cache
@@ -1605,6 +1643,73 @@ def build_dsv4_kernel(
                     bo.buffer_store(kvn.to(fx.BFloat16), r_kv, slot * HEAD_DIM + tid)
                     put(mb("kvnew"), s * HEAD_DIM + tid, kvn)
             stamp("cache", t, 4)
+
+        # ============= 2b. KV compressor (HCA): rolling state, pooled on the boundary
+        # Every token feeds a window of CR positions; only the last of each window
+        # emits a compressed entry, pooled by a PER-CHANNEL softmax over the window's
+        # positions. The pooled row then gets the same norm / RoPE / FP8 round trip
+        # the window KV does, rotated at the window's FIRST position, and lands in
+        # the compressed half of the same cache.
+        if const_expr(CR):
+            r_kvst = _rsrc(kv_state)
+            r_scst = _rsrc(score_state)
+            for tt in range(start("cmp"), S, G):
+                tt = fx.Int32(tt)
+                stamp("cmp", tt, 0)
+                ch = fx.min(tid, HEAD_DIM - 1)
+                live = tid < HEAD_DIM
+                p = pos0 + tt
+                slot = p % CR
+                ap = ld_f32(_rsrc(ape), slot * HEAD_DIM + ch)
+                g = ld_bf16(_rsrc(g_ckv), ch)
+                # anchor: the window's FIRST position. Only read on boundary steps,
+                # but the load is unconditional, so clamp it.
+                anchor = fx.max(p + 1 - CR, fx.Int32(0))
+                ri = fx.max(tid - NOPE_DIM, fx.Int32(0)) // 2
+                rc = ld_f32(_rsrc(rope_cos), anchor * (ROPE_DIM // 2) + ri)
+                rs = ld_f32(_rsrc(rope_sin), anchor * (ROPE_DIM // 2) + ri)
+                kvv = getf(mb("c_kv"), tt * HEAD_DIM + ch)
+                gtv = getf(mb("c_gate"), tt * HEAD_DIM + ch)
+                stamp("cmp", tt, 2)
+                if live:
+                    bo.buffer_store(kvv, r_kvst, slot * HEAD_DIM + tid)
+                    bo.buffer_store(gtv + ap, r_scst, slot * HEAD_DIM + tid)
+                if (p + 1) % CR == 0:  # uniform across the CTA
+                    # online softmax over the window, one channel per thread, so the
+                    # CR positions are a loop rather than CR unrolled copies
+                    for _i, acc in range(
+                        0,
+                        CR,
+                        fx.Int32(1),
+                        init=[fx.Float32(NEG), fx.Float32(0.0), fx.Float32(0.0)],
+                    ):
+                        m = fx.Float32(acc[0])
+                        den = fx.Float32(acc[1])
+                        num = fx.Float32(acc[2])
+                        wi = fx.Int32(_i) * HEAD_DIM + ch
+                        sv = ld_f32(r_scst, wi)
+                        kv_i = ld_f32(r_kvst, wi)
+                        m_new = fx.max(m, sv)
+                        rescale = _exp(m - m_new)
+                        w = _exp(sv - m_new)
+                        res = yield [m_new, den * rescale + w, num * rescale + w * kv_i]
+                    pooled = fx.Float32(res[2]) * _rcp(fx.Float32(res[1]))
+                    pooled = bf16_round(pooled)
+                    ssq = block_sum(live.select(pooled * pooled, fx.Float32(0.0)))
+                    nv = pooled * _rsq(ssq * (1.0 / HEAD_DIM) + EPS) * g
+                    partner = _xshfl(nv, 1)
+                    even = tid % 2 == 0
+                    rot = even.select(nv * rc - partner * rs, partner * rs + nv * rc)
+                    amax = wave_max(fmath.absf(nv))
+                    nz = amax > 0.0
+                    qs = nz.select(amax * (1.0 / FP8_MAX), fx.Float32(1.0))
+                    inv = nz.select(_rcp(amax) * FP8_MAX, fx.Float32(1.0))
+                    d0, _ = _fp8_roundtrip(fx.min(fx.max(nv * inv, -FP8_MAX), FP8_MAX), fx.Float32(0.0))
+                    cv = bf16_round((tid < NOPE_DIM).select(d0 * qs, rot))
+                    if live:
+                        bo.buffer_store(cv.to(fx.BFloat16), _rsrc(kv_cache), (window + p // CR) * HEAD_DIM + tid)
+                        put(mb("cnew"), tt * HEAD_DIM + tid, cv)
+                stamp("cmp", tt, 4)
 
         # ==================================== 3. q_a RMSNorm -> q_b (raw f32 query)
         r_wqb, r_sqb = _rsrc(w_q_b), _rsrc(s_q_b)
@@ -1688,7 +1793,7 @@ def build_dsv4_kernel(
             """Wave 0 writes this split's 64 ring slots to LDS keys; -1 = not yet written."""
             if wave == 0:
                 k_pos = t * SPLIT_KEYS + lane
-                lds_st(keys, lane, fx.Int32(bo.buffer_load(r_idx, s * window + k_pos, vec_width=1, dtype=T.i32)))
+                lds_st(keys, lane, fx.Int32(bo.buffer_load(r_idx, s * N_KEYS + k_pos, vec_width=1, dtype=T.i32)))
 
         def gather_old_kv():
             """Each wave copies its KPW keys' shared KV row (HEAD_DIM bf16) into the tile.
@@ -1702,8 +1807,9 @@ def build_dsv4_kernel(
                 fx.ptr_store(kv8.bitcast(fx.Float32), ktile + (j * KS + lane * WPL))
 
         def patch_new_kv():
-            """Slots this launch just wrote come from the cache task's kvnew pairs, so the
-            split never has to wait on the ring's global store to land."""
+            """Rows this launch wrote come from mailboxes, not the cache: the split
+            cannot rely on seeing our own global store. That covers the window row
+            (kvnew) and, on a compression boundary, the compressed row (cnew)."""
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
                 kr = lds_ld(keys, j)
@@ -1712,6 +1818,13 @@ def build_dsv4_kernel(
                         kvp = get2_many([(mb("kvnew"), sn * HEAD_DIM + lane * EPL + m * 2) for m in range(WPL)])
                         w = [bf16_pair(a0, a1) for a0, a1 in kvp]
                         fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * WPL))
+                    if const_expr(CR):
+                        # only a boundary step writes one, and then it is the newest
+                        # compressed slot
+                        if ((pos0 + sn + 1) % CR == 0) & (kr == fx.Int32(window + (pos0 + sn) // CR)):
+                            cvp = get2_many([(mb("cnew"), sn * HEAD_DIM + lane * EPL + m * 2) for m in range(WPL)])
+                            w = [bf16_pair(a0, a1) for a0, a1 in cvp]
+                            fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * WPL))
 
         for tt in range(start("split"), S * N_SPLIT, G):
             tt = fx.Int32(tt)
@@ -2532,6 +2645,10 @@ def build_dsv4_kernel(
         g_kv: Int64,
         g_post: Int64,
         attn_sink: Int64,
+        ape: Int64,
+        g_ckv: Int64,
+        kv_state: Int64,
+        score_state: Int64,
         hc_attn_fn: Int64,
         hc_attn_sb: Int64,
         hc_ffn_fn: Int64,
@@ -2572,6 +2689,10 @@ def build_dsv4_kernel(
             g_kv,
             g_post,
             attn_sink,
+            ape,
+            g_ckv,
+            kv_state,
+            score_state,
             hc_attn_fn,
             hc_attn_sb,
             hc_ffn_fn,

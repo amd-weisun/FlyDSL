@@ -72,6 +72,7 @@ COMPRESS_HCA = 128  # heavily compressed attention, dense over compressed
 # (and the compressor in its overlapping form), which is not implemented.
 SUPPORTED_COMPRESS = (COMPRESS_SWA, COMPRESS_HCA)  # informational; see V4Config.validate
 COMPRESS_ROPE_THETA = 1.6e5  # compressed layers use their own rope base
+KEY_BLOCK = 64  # the split-attention key tile; the index list is padded to it
 
 
 def validate_shard(
@@ -94,8 +95,8 @@ def validate_shard(
         raise ValueError(f"rank must be in [0, {npes}), got {rank}")
     if window <= 0 or window % 64:
         raise ValueError(f"window must be a positive multiple of 64, got {window}")
-    if compress_ratio not in SUPPORTED_COMPRESS:
+    if compress_ratio == COMPRESS_CSA:
         raise ValueError(
-            f"compress_ratio must be one of {SUPPORTED_COMPRESS}, got {compress_ratio}; "
-            "the KV compressor (HCA) and lightning indexer (CSA) are not implemented yet"
+            "CSA (compress_ratio 4) needs the overlapping compressor and the lightning "
+            "indexer, neither of which is implemented"
         )

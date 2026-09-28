@@ -24,6 +24,7 @@ from kernels.dsv4_moe_layer.reference import (
     V4Config,
     golden_layer,
     golden_moe,
+    layer_idxs,
     make_weights,
     window_idxs,
 )
@@ -439,3 +440,82 @@ if __name__ == "__main__":
         )
     else:
         print("PASS" if run_tp(a.npes, a.real, a.iters, a.hc_mult) else "FAIL")
+
+
+@pytest.mark.parametrize("moe_mode", [MoeMode.W8A8, MoeMode.A8W4])
+def test_dsv4_hca_layer_matches_golden(moe_mode):
+    """The HCA layer end to end: rolling compressor state, compressed entries
+    gathered alongside the window, over several compression boundaries.
+
+    A short compress_ratio stands in for V4's 128 -- DeepSeek ties the overlapping
+    compressor to ratio 4 specifically, so any other value is the same code path
+    and this crosses boundaries in far fewer steps.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    torch.manual_seed(0)
+    ratio = 16
+    cfg = _cfg(hc_mult=1)
+    cfg.compress_ratio = ratio
+    cfg.max_seq = 512
+    cfg.validate()
+    dev = "cuda"
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=moe_mode)
+    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=moe_mode)
+
+    cos, sin = rope_table(2048, theta=cfg.compress_rope_theta, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    kv_r = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    ks = torch.zeros(ratio, cfg.head_dim, device=dev)
+    ss = torch.zeros(ratio, cfg.head_dim, device=dev)
+
+    boundaries = 0
+    for pos in range(3 * ratio + 2):
+        h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
+        cur = torch.tensor([pos], dtype=torch.int32, device=dev)
+        idx = layer_idxs(pos, 1, cfg, dev)
+        out = layer.forward(h, cur, kv_k, idx, cos, sin)
+        torch.cuda.synchronize()
+        ref = golden_layer(
+            W,
+            h,
+            pos,
+            kv_r,
+            idx,
+            cos,
+            sin,
+            lambda z: z,
+            moe_mode=moe_mode,
+            kv_state=ks,
+            score_state=ss,
+            cos_c=cos,
+            sin_c=sin,
+        )
+        if (pos + 1) % ratio == 0:
+            boundaries += 1
+            slot = cfg.window + pos // ratio
+            # the compressed row is the thing under test, and it should be exact
+            d = (kv_k[slot].float() - kv_r[slot].float()).abs().max().item()
+            assert d == 0.0, f"compressed row at slot {slot} differs by {d}"
+
+        # Over a long sequential run a near-tie will eventually flip an expert, and
+        # with 128 experts and top-6 the 6th/7th margin is crowded enough that
+        # skipping near-ties would skip most positions. So judge the layer against a
+        # golden rebuilt from the kernel's OWN routing, which is flip-immune by
+        # construction -- the same structure the multi-rank test uses.
+        got = layer.intermediates()
+        own = golden_moe(
+            W,
+            got["a"],
+            lambda z: z,
+            mid=got["mid"],
+            sel=got["sel"],
+            prob=got["prob"],
+            moe_mode=moe_mode,
+        )
+        b_out = own["x_out"].float()
+        rel_l2 = ((out.float() - b_out).norm() / b_out.norm()).item()
+        tol = _tol(OUT_REL_L2, cfg.hc_mult, 1)
+        assert rel_l2 < tol, f"pos={pos} x_out rel_l2 {rel_l2:.5f} >= {tol}"
+
+    assert boundaries >= 3, "must cross several compression boundaries"
