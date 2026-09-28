@@ -392,12 +392,10 @@ def stage_tasks(
     GEMV splits into the grouped low-rank pair ``o_a`` / ``o_b``."""
     n_qkv_a = (q_lora + head_dim) // QKV_A_TILE
     hc_tasks, _, _, _ = hc_shape(hc_mult, hidden)
-    hc_one = S if hc_mult > 1 else 0
     return [
         # hyper-connection pre-mix for the attention side, before anything reads
         # the (hc_mult-wide) residual stream
         ("hcd_a", S * hc_tasks),
-        ("hcm_a", hc_one),
         ("hcc_a", (hidden // ROW_TILE) if hc_mult > 1 else 0),
         ("qkv_a", n_qkv_a),
         ("cache", 1),
@@ -409,7 +407,6 @@ def stage_tasks(
         ("o_b", hidden // ROW_TILE),
         # ... and for the ffn side, once o_b has produced the new residual stream
         ("hcd_f", S * hc_tasks),
-        ("hcm_f", hc_one),
         ("hcc_f", (hidden // ROW_TILE) if hc_mult > 1 else 0),
         ("router", S * N_ROUTER),
         # one tile per (routed slot, 8 intermediates); tasks below INTER / UG8 also
@@ -616,7 +613,6 @@ def build_dsv4_kernel(
     acc = 0
     for name in (
         "hcd_a",
-        "hcm_a",
         "hcc_a",
         "qkv_a",
         "cache",
@@ -627,7 +623,6 @@ def build_dsv4_kernel(
         "o_a",
         "o_b",
         "hcd_f",
-        "hcm_f",
         "hcc_f",
         "router",
         "ug",
@@ -1402,71 +1397,93 @@ def build_dsv4_kernel(
                     put(mb("hc_d"), base_i + HC_ROWS, ssq)
                 stamp(f"hcd_{side}", tt, 4)
 
-            # --- reduce the partials, take the RMS scale, run the Sinkhorn
-            for s in range(start(f"hcm_{side}"), S, G):
-                s = fx.Int32(s)
-                stamp(f"hcm_{side}", s, 0)
+            # --- coefficients: reduce the partials, take the RMS scale, run the
+            # Sinkhorn.  Computed inside hcc rather than as its own stage: mHC's cost
+            # is dominated by the number of pipeline stages it adds (hc_mult=2 costs
+            # 84% of hc_mult=4 despite half the data), so paying this redundantly per
+            # hcc task -- they run concurrently, so it costs latency once -- is
+            # cheaper than an extra grid-wide dependency.  Task 0 publishes them for
+            # the hc_post epilogues, which need post / comb but no rows of their own.
+            def hc_coefficients(sd, publish):
+                """Reduce the hcd partials, take the RMS scale, run the Sinkhorn.
+
+                Computed inside hcc rather than as its own stage: mHC's cost is
+                dominated by how many pipeline stages it adds (hc_mult=2 costs 84% of
+                hc_mult=4 despite carrying half the data), so paying this redundantly
+                per hcc task -- they run concurrently, so it costs latency once -- is
+                cheaper than another grid-wide dependency. Task 0 also publishes the
+                coefficients for the hc_post epilogues, which need post / comb but
+                have no rows of their own.
+
+                comb must sit on lanes [0, HC * HC) so the Sinkhorn's XOR offsets stay
+                inside it -- the low bits walk a row, the high bits a column.
+                """
                 sc0 = ld_f32(r_sb, 0)
                 sc1 = ld_f32(r_sb, 1)
                 sc2 = ld_f32(r_sb, 2)
-                if wave == 0:
-                    j = fx.min(lane, fx.Int32(HC_ROWS))
-                    parts = poll(
-                        [(mb("hc_d"), ((s * 2 + sd) * HC_TASKS + i) * HC_VALS + j, 1) for i in range(HC_TASKS)]
-                    )
-                    tot = fx.Float32(0.0)
-                    for i in range_constexpr(HC_TASKS):
-                        tot = tot + parts[i][0].bitcast(fx.Float32)
-                    lds_st(misc, 8 + lane, tot)
-                stamp(f"hcm_{side}", s, 2)
-                gpu.barrier()
-                rstd = _rsq(lds_ld(misc, 8 + HC_ROWS) * (1.0 / (HC * HIDDEN)) + EPS)
-                if wave == 0:
-                    mix = lds_ld(misc, 8 + fx.min(lane, fx.Int32(HC_MIX - 1))) * rstd
-                    if lane < HC:  # pre and post ride the same lanes
-                        b0 = ld_f32(r_sb, 3 + lane)
-                        pre = _rcp(1.0 + _exp(-(mix * sc0 + b0))) + hc_eps
-                        put(mb("hc_c"), (s * 2 + sd) * HC_COEF + lane, pre)
-                    if lane >= HC and lane < 2 * HC:
-                        b1 = ld_f32(r_sb, 3 + lane)
-                        put(
-                            mb("hc_c"),
-                            (s * 2 + sd) * HC_COEF + lane,
-                            2.0 * _rcp(1.0 + _exp(-(mix * sc1 + b1))),
+                for blk in range_constexpr((S * HC_VALS + 63) // 64):
+                    idx = lane + blk * 64
+                    if wave == 0 and idx < S * HC_VALS:
+                        s_ = idx // HC_VALS
+                        j = idx % HC_VALS
+                        parts = poll(
+                            [(mb("hc_d"), ((s_ * 2 + sd) * HC_TASKS + i) * HC_VALS + j, 1) for i in range(HC_TASKS)]
                         )
-                    # comb: lane = j * HC + k, so a row is the lanes sharing lane // HC
-                    # and a column the lanes sharing lane % HC -- both reachable by XOR
-                    if lane < HC * HC:
-                        cb = lds_ld(misc, 8 + 2 * HC + lane) * rstd * sc2 + ld_f32(r_sb, 3 + 2 * HC + lane)
-                        rmax = cb
-                        for off in HC_ROW_OFFS:
-                            rmax = _xred(rmax, off, fx.max)
-                        c = _exp(cb - rmax)
-                        rsum = c
-                        for off in HC_ROW_OFFS:
-                            rsum = _xred(rsum, off, lambda a, b: a + b)
-                        c = c * _rcp(rsum) + hc_eps
-                        csum = c
-                        for off in HC_COL_OFFS:
-                            csum = _xred(csum, off, lambda a, b: a + b)
-                        c = c * _rcp(csum + hc_eps)
-                        for _ in range_constexpr(hc_sinkhorn_iters - 1):
+                        tot = fx.Float32(0.0)
+                        for i in range_constexpr(HC_TASKS):
+                            tot = tot + parts[i][0].bitcast(fx.Float32)
+                        lds_st(red, idx, tot)
+                gpu.barrier()
+                if wave == 0:
+                    for s_ in range_constexpr(S):
+                        rstd = _rsq(lds_ld(red, s_ * HC_VALS + HC_ROWS) * (1.0 / (HC * HIDDEN)) + EPS)
+
+                        def coef(i, s_=s_, rstd=rstd):
+                            return lds_ld(red, s_ * HC_VALS + i) * rstd
+
+                        if lane < 2 * HC:  # pre then post share these lanes
+                            m = coef(fx.min(lane, fx.Int32(HC_MIX - 1)))
+                            b = ld_f32(r_sb, 3 + lane)
+                            v = (lane < HC).select(
+                                _rcp(1.0 + _exp(-(m * sc0 + b))) + hc_eps,
+                                2.0 * _rcp(1.0 + _exp(-(m * sc1 + b))),
+                            )
+                            lds_st(misc, HC_MISC + s_ * HC_COEF + lane, v)
+                            if publish:
+                                put(mb("hc_c"), (s_ * 2 + sd) * HC_COEF + lane, v)
+                        if lane < HC * HC:
+                            cb = coef(2 * HC + lane) * sc2 + ld_f32(r_sb, 3 + 2 * HC + lane)
+                            rmax = cb
+                            for off in HC_ROW_OFFS:
+                                rmax = _xred(rmax, off, fx.max)
+                            c = _exp(cb - rmax)
                             rsum = c
                             for off in HC_ROW_OFFS:
                                 rsum = _xred(rsum, off, lambda a, b: a + b)
-                            c = c * _rcp(rsum + hc_eps)
+                            c = c * _rcp(rsum) + hc_eps
                             csum = c
                             for off in HC_COL_OFFS:
                                 csum = _xred(csum, off, lambda a, b: a + b)
                             c = c * _rcp(csum + hc_eps)
-                        put(mb("hc_c"), (s * 2 + sd) * HC_COEF + 2 * HC + lane, c)
-                stamp(f"hcm_{side}", s, 4)
+                            for _ in range_constexpr(hc_sinkhorn_iters - 1):
+                                rsum = c
+                                for off in HC_ROW_OFFS:
+                                    rsum = _xred(rsum, off, lambda a, b: a + b)
+                                c = c * _rcp(rsum + hc_eps)
+                                csum = c
+                                for off in HC_COL_OFFS:
+                                    csum = _xred(csum, off, lambda a, b: a + b)
+                                c = c * _rcp(csum + hc_eps)
+                            lds_st(misc, HC_MISC + s_ * HC_COEF + 2 * HC + lane, c)
+                            if publish:
+                                put(mb("hc_c"), (s_ * 2 + sd) * HC_COEF + 2 * HC + lane, c)
+                gpu.barrier()
 
             # --- contract the hc_mult streams by `pre` into the single-width input
             for t in range(start(f"hcc_{side}"), N_ROW_TILES, G):
                 t = fx.Int32(t)
                 stamp(f"hcc_{side}", t, 0)
-                hc_stage_coef(sd)
+                hc_coefficients(sd, t == 0)
                 stamp(f"hcc_{side}", t, 2)
                 if tid < S * ROW_TILE // 2:
                     s_ = tid // (ROW_TILE // 2)
