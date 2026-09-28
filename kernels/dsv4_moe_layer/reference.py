@@ -29,6 +29,9 @@ import torch
 
 from kernels.common.mx_formats import quant_dequant_mxfp8, quantize_mxfp4
 from kernels.dsv4_moe_layer.config import (
+    COMPRESS_CSA,
+    COMPRESS_ROPE_THETA,
+    COMPRESS_SWA,
     EPS,
     HC_EPS,
     HC_MULT,
@@ -81,6 +84,9 @@ class V4Config:
     swiglu_limit: float = SWIGLU_LIMIT
     eps: float = EPS
     rope_theta: float = 1.0e4
+    compress_ratio: int = COMPRESS_SWA  # 0 = sliding window only, 128 = HCA
+    compress_rope_theta: float = COMPRESS_ROPE_THETA
+    max_seq: int = 4096  # sizes the compressed half of the KV cache
     hc_mult: int = HC_MULT  # 1 = plain residual
     hc_sinkhorn_iters: int = HC_SINKHORN_ITERS
     hc_eps: float = HC_EPS
@@ -88,6 +94,17 @@ class V4Config:
     @property
     def hc_mix(self) -> int:
         return (2 + self.hc_mult) * self.hc_mult
+
+    @property
+    def n_compressed(self) -> int:
+        """Compressed cache slots. The window and the compressed entries share one
+        cache, the compressed half starting at ``window`` -- which is what lets the
+        attention gather span both from a single index list."""
+        return 0 if self.compress_ratio == 0 else self.max_seq // self.compress_ratio
+
+    @property
+    def cache_rows(self) -> int:
+        return self.window + self.n_compressed
 
     @property
     def hc_rows(self) -> int:
@@ -113,6 +130,15 @@ class V4Config:
         return self.head_dim**-0.5
 
     def validate(self) -> None:
+        # The unimplemented piece is CSA: DeepSeek ties the *overlapping* compressor
+        # to compress_ratio == 4 exactly, and that ratio is also the one carrying the
+        # lightning indexer. Any other non-zero ratio takes the same non-overlapping
+        # path as V4's 128, so smaller values are valid stand-ins in tests.
+        assert self.compress_ratio != COMPRESS_CSA, (
+            "CSA (compress_ratio 4) needs the overlapping compressor and the lightning "
+            "indexer, neither of which is implemented"
+        )
+        assert self.compress_ratio == 0 or self.window % self.compress_ratio == 0
         assert self.nope_dim % 64 == 0, "act_quant blocks the nope part by 64"
         assert self.heads % self.o_groups == 0
         assert self.head_dim % 2 == 0 and self.rope_dim % 2 == 0
@@ -165,6 +191,15 @@ def make_weights(
         # qkv_a is replicated (wkv is not TP-sharded in V4); the rest are shards
         gen = rep if name == "qkv_a" else shd
         t[f"w_{name}"], t[f"s_{name}"] = _rand_fp8(rows, k, bk, gen, device)
+
+    if cfg.compress_ratio:
+        # The compressor runs in fp32, and is replicated: it consumes the same
+        # layer input on every rank.
+        r = cfg.compress_ratio
+        t["w_ckv"] = torch.randn(cfg.head_dim, cfg.hidden, generator=rep, device=device) / cfg.hidden**0.5
+        t["w_cgate"] = torch.randn(cfg.head_dim, cfg.hidden, generator=rep, device=device) / cfg.hidden**0.5
+        t["ape"] = 0.5 * torch.randn(r, cfg.head_dim, generator=rep, device=device)
+        t["g_ckv"] = (1 + 0.1 * torch.randn(cfg.head_dim, generator=rep, device=device)).to(bfl)
 
     if cfg.hc_mult > 1:
         # hyper-connection mixers, fp32 in the checkpoint. Replicated: every rank
@@ -258,6 +293,48 @@ def hc_post(x: torch.Tensor, residual: torch.Tensor, post, comb):
     return (post.unsqueeze(-1) * x.unsqueeze(-2).float() + mixed).type_as(x)
 
 
+def compress_step(x, cur_pos, cfg, t, kv_state, score_state, cache, cos_c, sin_c):
+    """One decode step of the KV compressor (HCA, non-overlapping).
+
+    Every token feeds a rolling window of ``compress_ratio`` positions; only the
+    last of each window emits a compressed entry. The pooling weight is a
+    **per-channel** softmax over the window's positions -- not one scalar per
+    token -- plus a learned absolute-position bias ``ape``. Mutates
+    ``kv_state`` / ``score_state`` / ``cache``, as the kernel does.
+    """
+    r, rd = cfg.compress_ratio, cfg.rope_dim
+    xf = x.float()
+    kv = xf @ t["w_ckv"].T.float()
+    score = xf @ t["w_cgate"].T.float() + t["ape"][cur_pos % r]
+    kv_state[cur_pos % r] = kv
+    score_state[cur_pos % r] = score
+    if (cur_pos + 1) % r:
+        return None
+    pooled = (kv_state * score_state.softmax(dim=0)).sum(dim=0)
+    v = rmsnorm(pooled.to(torch.bfloat16), t["g_ckv"], cfg.eps)
+    anchor = cur_pos + 1 - r  # the window's FIRST position carries the rotation
+    v = torch.cat([quant_dequant(v[:-rd], 64), rope(v[-rd:], cos_c[anchor], sin_c[anchor])])
+    cache[cfg.window + cur_pos // r] = v.to(torch.bfloat16)
+    return v
+
+
+def layer_idxs(cur_pos: int, samples: int, cfg: V4Config, device) -> torch.Tensor:
+    """Ring slots for the sliding window, then the compressed entries so far.
+
+    Both live in one cache -- window first, compressed after -- which is what lets
+    the attention gather span both from a single index list. Unwritten slots are -1.
+    """
+    win = window_idxs(cur_pos, samples, cfg.window, device)
+    if not cfg.compress_ratio:
+        return win
+    rows = []
+    for s in range(samples):
+        n = (cur_pos + s + 1) // cfg.compress_ratio
+        rows.append([cfg.window + i for i in range(n)] + [-1] * (cfg.n_compressed - n))
+    comp = torch.tensor(rows, dtype=torch.int32, device=device)
+    return torch.cat([win, comp], dim=1)
+
+
 def window_idxs(cur_pos: int, samples: int, window: int, device) -> torch.Tensor:
     """Ring-buffer slots for the sliding window, oldest first, -1 where unfilled.
 
@@ -308,8 +385,12 @@ def golden_layer(
     sin,
     allreduce,
     moe_mode: MoeMode | str = MoeMode.A8W4,
+    kv_state=None,
+    score_state=None,
+    cos_c=None,
+    sin_c=None,
 ):
-    """One rank's view of a sliding-window-only V4 layer. Mutates ``kv_cache``.
+    """One rank's view of a V4 layer. Mutates ``kv_cache`` (and the compressor state).
 
     ``h`` is [S, hidden] when ``cfg.hc_mult == 1`` (plain residual) and
     [S, hc_mult, hidden] otherwise -- V4 carries hc_mult parallel residual
@@ -344,6 +425,10 @@ def golden_layer(
         v = rmsnorm(kv[s], t["g_kv"], cfg.eps)
         v = torch.cat([quant_dequant(v[:-rd], 64), rope(v[-rd:], cos[pos[s]], sin[pos[s]])])
         kv_cache[pos[s] % cfg.window] = v.to(torch.bfloat16)
+        if cfg.compress_ratio:
+            # the compressor sees the same normed input the projections do, and
+            # writes into the compressed half of the same cache
+            compress_step(x[s], pos[s], cfg, t, kv_state, score_state, kv_cache, cos_c, sin_c)
     kvf = kv_cache.float()
 
     # gather-sparse attention with a per-head sink in the denominator

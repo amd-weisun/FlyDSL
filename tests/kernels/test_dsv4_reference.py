@@ -26,6 +26,7 @@ from kernels.dsv4_moe_layer.reference import (
     V4Config,
     fp8_mats,
     golden_layer,
+    layer_idxs,
     make_weights,
     rmsnorm,
     window_idxs,
@@ -33,6 +34,9 @@ from kernels.dsv4_moe_layer.reference import (
 from kernels.mla_moe_layer.reference import bf, dequant, dequant_expert, rope_table
 
 ORACLE_DIR = os.environ.get("DSV4_ORACLE_DIR", "/home/weisu/dsv4_oracle")
+# top-k margin below which the two implementations may legitimately pick different
+# experts; see the note where it is used
+NEAR_TIE = 0.05
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
@@ -47,7 +51,7 @@ def _oracle():
     return oracle_model
 
 
-def _cfg(hc_mult=4):
+def _cfg(hc_mult=4, compress_ratio=0, max_seq=1024):
     # Small but structurally faithful: nope_dim stays a multiple of 64 and the
     # rope tail keeps V4's own 64 lanes.
     return V4Config(
@@ -63,6 +67,8 @@ def _cfg(hc_mult=4):
         inter=128,  # must be a multiple of the 128 FP8 block
         window=32,
         hc_mult=hc_mult,
+        compress_ratio=compress_ratio,
+        max_seq=max_seq,
     )
 
 
@@ -206,10 +212,11 @@ def _oracle_args(om, cfg):
         o_groups=cfg.o_groups,
         o_lora_rank=cfg.o_lora,
         window_size=cfg.window,
-        compress_ratios=(0,),
+        compress_ratios=(cfg.compress_ratio,),
         norm_eps=cfg.eps,
         rope_theta=cfg.rope_theta,
-        original_seq_len=0,
+        compress_rope_theta=cfg.compress_rope_theta,
+        original_seq_len=0,  # YaRN off: it is a host-side rope table, not kernel work
         hc_mult=cfg.hc_mult,
         hc_sinkhorn_iters=cfg.hc_sinkhorn_iters,
         hc_eps=cfg.hc_eps,
@@ -220,6 +227,12 @@ def _oracle_args(om, cfg):
 def _load_block_weights(block, W, cfg, weight_fmt):
     t = W.t
     _load_oracle_weights(block.attn, block.ffn, W, cfg, weight_fmt)
+    if cfg.compress_ratio:
+        c = block.attn.compressor
+        c.wkv.weight.copy_(t["w_ckv"].float())
+        c.wgate.weight.copy_(t["w_cgate"].float())
+        c.ape.copy_(t["ape"].float())
+        c.norm.weight.copy_(t["g_ckv"].float())
     block.attn_norm.weight.copy_(t["g_in"].float())
     block.ffn_norm.weight.copy_(t["g_post"].float())
     for side in ("attn", "ffn"):
@@ -258,3 +271,75 @@ def test_v4_block_with_hyper_connections_matches_deepseek(steps):
         d = (res["x_out"].float() - ref.float()).abs().max().item()
         scale = ref.float().abs().max().item()
         assert d < 5e-2 * max(scale, 1.0), f"pos={pos} block output diverges: {d} (|ref| {scale})"
+
+
+@pytest.mark.parametrize("steps", [40])
+def test_v4_hca_compressor_matches_deepseek(steps):
+    """The HCA layer (compress_ratio 128) against DeepSeek's own Block.
+
+    Needs enough steps to cross a compression boundary: only every
+    ``compress_ratio``-th token emits a compressed entry, and the attention only
+    starts gathering compressed rows once one exists.
+    """
+    om = _oracle()
+    device = "cuda"
+    torch.manual_seed(0)
+    ratio = 16  # stands in for V4's 128; same code path, far fewer steps to cross
+    cfg = _cfg(hc_mult=4, compress_ratio=ratio, max_seq=256)
+    cfg.compress_ratio = ratio
+    cfg.validate()
+
+    W = make_weights(rank=0, cfg=cfg, device=device, seed=7, moe_mode=MoeMode.W8A16)
+    with torch.device(device):
+        block = om.Block(0, _oracle_args(om, cfg))
+    _load_block_weights(block, W, cfg, moe_format(MoeMode.W8A16).weight)
+
+    cos, sin = rope_table(512, theta=cfg.compress_rope_theta, device=device)
+    kv_cache = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device)
+    kv_state = torch.zeros(ratio, cfg.head_dim, device=device)
+    score_state = torch.zeros(ratio, cfg.head_dim, device=device)
+
+    compressed_seen = 0
+    near_ties = 0
+    for pos in range(steps):
+        h = (0.5 * torch.randn(1, cfg.hc_mult, cfg.hidden, device=device)).to(torch.bfloat16)
+        idx = layer_idxs(pos, 1, cfg, device)
+        res = golden_layer(
+            W,
+            h,
+            pos,
+            kv_cache,
+            idx,
+            cos,
+            sin,
+            lambda z: z,
+            moe_mode=MoeMode.W8A16,
+            kv_state=kv_state,
+            score_state=score_state,
+            cos_c=cos,
+            sin_c=sin,
+        )
+        with torch.device(device):
+            ids = torch.zeros(1, 1, dtype=torch.long, device=device)
+            ref = block(h.unsqueeze(0), pos, ids).squeeze(0)
+        if (pos + 1) % ratio == 0:
+            compressed_seen += 1
+
+        # Routing is a discrete top-k, so a near-tie between the last kept expert
+        # and the first dropped one can resolve differently here and in the oracle
+        # over a difference far smaller than either is accurate to. Scores agree to
+        # about 0.005 relative on magnitudes near 3, i.e. ~0.017 absolute, so a
+        # margin under NEAR_TIE is genuinely at risk and the comparison past it
+        # says nothing about the compressor.
+        sc = res["scores"][0].float() + W.t["bias"].float()
+        top = torch.topk(sc, cfg.top_k + 1).values
+        if (top[cfg.top_k - 1] - top[cfg.top_k]).item() < NEAR_TIE:
+            near_ties += 1
+            continue
+
+        d = (res["x_out"].float() - ref.float()).abs().max().item()
+        scale = ref.float().abs().max().item()
+        assert d < 5e-2 * max(scale, 1.0), f"pos={pos} diverges: {d} (|ref| {scale})"
+
+    assert compressed_seen >= 2, "the run must cross at least two compression boundaries"
+    assert near_ties < steps // 4, f"too many near-ties to have tested much: {near_ties}/{steps}"

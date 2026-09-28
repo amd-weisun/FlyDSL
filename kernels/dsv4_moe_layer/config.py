@@ -68,7 +68,10 @@ MAX_LAYERS_PER_STEP = 128
 COMPRESS_SWA = 0  # sliding window only (the MTP block's shape)
 COMPRESS_CSA = 4  # compressed sparse attention, needs the lightning indexer
 COMPRESS_HCA = 128  # heavily compressed attention, dense over compressed
-SUPPORTED_COMPRESS = (COMPRESS_SWA,)  # P1 covers the sliding-window layer only
+# HCA needs only the KV compressor; CSA additionally needs the lightning indexer
+# (and the compressor in its overlapping form), which is not implemented.
+SUPPORTED_COMPRESS = (COMPRESS_SWA, COMPRESS_HCA)  # informational; see V4Config.validate
+COMPRESS_ROPE_THETA = 1.6e5  # compressed layers use their own rope base
 
 
 def validate_shard(
