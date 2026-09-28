@@ -275,6 +275,89 @@ def test_dsv4_layer_tp8():
     assert run_tp(8)
 
 
+# ------------------------------------------------------------------ benchmark
+#   python3 tests/kernels/test_dsv4_layer.py --bench --npes 8 --real
+# HIP-graph replay of LAYERS launches per step, so the number is steady-state
+# decode latency of one layer, not launch overhead.
+
+BENCH_LAYERS = 16
+
+
+def bench_rank(rank, npes, real=True, iters=320, group=None, timeline=False, moe_mode=MoeMode.A8W4):
+    """Returns us per layer."""
+    import torch.distributed as dist
+
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    dev = torch.device("cuda", rank)
+    torch.cuda.set_device(dev)
+    cfg = _tp_cfg(real)
+    cfg.validate()
+    W = make_weights(rank, cfg=cfg, device=dev, seed=TP_SEED, moe_mode=moe_mode)
+    cos, sin = rope_table(4096, theta=cfg.rope_theta, device=dev)
+    kv = torch.randn(cfg.window, cfg.head_dim, device=dev).to(torch.bfloat16)
+    pos = cfg.window
+    idx = window_idxs(pos, 1, cfg.window, dev)
+    cur = torch.tensor([pos], dtype=torch.int32, device=dev)
+    op = Dsv4MoeLayer(W, 1, rank=rank, npes=npes, group=group, moe_mode=moe_mode)
+    h = torch.randn(1, cfg.hidden, device=dev).to(torch.bfloat16)
+    x = torch.empty_like(h)
+    for _ in range(10):
+        op.forward(h, cur, kv, idx, cos, sin, x_out=x)
+    torch.cuda.synchronize()
+    if npes > 1:
+        dist.barrier()
+
+    if timeline:
+        top = Dsv4MoeLayer(W, 1, rank=rank, npes=npes, group=group, timeline=True, moe_mode=moe_mode)
+        for _ in range(3):
+            top.forward(h, cur, kv, idx, cos, sin, x_out=x)
+        torch.cuda.synchronize()
+        if rank == 0:
+            print(top.timeline_report(), flush=True)
+        top.close()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for layer in range(BENCH_LAYERS):
+            op.forward(h, cur, kv, idx, cos, sin, x_out=x, layer=layer, advance=False)
+        op.advance_step()
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    if npes > 1:
+        dist.barrier()
+    t0, t1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    t0.record()
+    for _ in range(iters // BENCH_LAYERS):
+        graph.replay()
+    t1.record()
+    torch.cuda.synchronize()
+    us = t0.elapsed_time(t1) * 1e3 / (iters // BENCH_LAYERS * BENCH_LAYERS)
+    op.close()
+    return us
+
+
+def _bench_worker(rank, npes, real, timeline, moe_mode, results):
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29552", rank=rank, world_size=npes)
+    try:
+        results[rank] = bench_rank(rank, npes, real=real, timeline=timeline, moe_mode=moe_mode)
+    finally:
+        dist.destroy_process_group()
+
+
+def run_bench(npes, real=True, timeline=False, moe_mode=MoeMode.A8W4):
+    if npes == 1:
+        return {0: bench_rank(0, 1, real=real, timeline=timeline, moe_mode=moe_mode)}
+    import torch.multiprocessing as mp
+
+    results = mp.Manager().dict()
+    mp.spawn(_bench_worker, args=(npes, real, timeline, moe_mode, results), nprocs=npes)
+    return dict(results)
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -282,5 +365,18 @@ if __name__ == "__main__":
     ap.add_argument("--npes", type=int, default=8)
     ap.add_argument("--real", action="store_true", help="use the real V4-Pro TP8 shard")
     ap.add_argument("--iters", type=int, default=2)
+    ap.add_argument("--bench", action="store_true")
+    ap.add_argument("--timeline", action="store_true")
+    ap.add_argument("--moe-mode", default=MoeMode.A8W4.value, choices=tuple(m.value for m in MoeMode))
     a = ap.parse_args()
-    print("PASS" if run_tp(a.npes, a.real, a.iters) else "FAIL")
+    if a.bench:
+        res = run_bench(a.npes, a.real, a.timeline, MoeMode(a.moe_mode))
+        us = [res[r] for r in sorted(res)]
+        tag = "real V4-Pro" if a.real else "reduced"
+        print(
+            f"{tag} shard, {a.moe_mode}, npes={a.npes}: {max(us):7.1f} us/layer  (per rank: "
+            + " ".join(f"{v:.1f}" for v in us)
+            + ")"
+        )
+    else:
+        print("PASS" if run_tp(a.npes, a.real, a.iters) else "FAIL")
