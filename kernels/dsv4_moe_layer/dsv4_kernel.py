@@ -173,6 +173,7 @@ def layout(
     compress_ratio: int = 0,
     n_keys: int | None = None,
     c_coff: int = 1,
+    index_head_dim: int = 0,
 ):
     """Byte offsets of the per-rank scratch and of the symmetric buffer.
 
@@ -199,6 +200,9 @@ def layout(
         # c_coff-wide: overlapping windows carry a previous-window half too.
         ("c_kv", S * c_coff * head_dim * pr if compress_ratio else pr),
         ("c_gate", S * c_coff * head_dim * pr if compress_ratio else pr),
+        # ... and the indexer's own compressor, out of the same GEMV
+        ("i_kv", S * c_coff * index_head_dim * pr if index_head_dim else pr),
+        ("i_gate", S * c_coff * index_head_dim * pr if index_head_dim else pr),
         # the compressed row this launch just wrote, for the same reason kvnew
         # exists: the gather cannot rely on seeing our own global store
         ("cnew", S * head_dim * pr if compress_ratio else pr),
@@ -341,6 +345,37 @@ def _mbcnt(mask):
     return fx.Int32(llvm.call_intrinsic(T.i32, "llvm.amdgcn.mbcnt.hi", [fx.Int32(mask >> 32).ir_value(), lo], [], []))
 
 
+FP4_MAX = 6.0
+FP4_BLOCK = 32
+
+
+def _fp4_roundtrip(a, b):
+    """f32 pair -> E2M1 -> f32 pair (inputs already scaled into range).
+
+    The scale operand is 1.0 and the scaling is done in f32 around this, as
+    ``_fp8_to_bf16x8`` does: the hardware honours only the scale's exponent, and
+    keeping the arithmetic explicit means this does not depend on which direction
+    the instruction applies it.
+    """
+    one = as_ir_value(fx.Float32(1.0))
+    word = fx.Int32(rocdl.cvt_scalef32_pk_fp4_f32(T.i32, as_ir_value(fx.Int32(0)), a, b, one, 0))
+    v2 = fx.Vector.make_type(2, fx.Float32)
+    out = fx.Vector(rocdl.cvt_scalef32_pk_f32_fp4(res=v2, src=as_ir_value(word), scale=one, src_sel_index=0))
+    return out[0], out[1]
+
+
+def _pow2_ceil(x):
+    """Smallest power of two >= x, by exponent arithmetic.
+
+    V4's FP4 block scale is rounded UP to a power of two, so it is exact in the
+    exponent and costs no mantissa. Matches reference.quant_dequant_fp4.
+    """
+    bits = fx.Float32(x).bitcast(fx.Int32)
+    man = bits & ((1 << 23) - 1)
+    e = ((bits >> 23) & 0xFF) - 127 + (man != 0).select(fx.Int32(1), fx.Int32(0))
+    return ((e + 127) << 23).bitcast(fx.Float32)
+
+
 def _fp8_roundtrip(a, b):
     """f32 pair -> E4M3FN -> f32 pair (inputs already scaled into range)."""
     word = rocdl.cvt_pk_fp8_f32(T.i32, a, b, fx.Int32(0), False)
@@ -383,14 +418,17 @@ def _mxfp4_to_bf16x8(word, scale):
     return fx.Vector.from_elements(parts, fx.BFloat16)
 
 
-def qkv_a_rows(q_lora: int, head_dim: int, compress_ratio: int, c_coff: int) -> int:
-    """Rows of the fused qkv_a GEMV: q_a, kv, and the compressor's c_coff-wide pair.
+def qkv_a_rows(q_lora: int, head_dim: int, compress_ratio: int, c_coff: int, index_head_dim: int = 0) -> int:
+    """Rows of the fused qkv_a GEMV.
 
-    Mirrors reference.qkv_a_tail(). Both the task count and the kernel's loop bound
-    come from here -- they disagreed before, so the kernel ran qkv_a tasks the CTA
-    placement had not accounted for.
+    q_a, kv, the compressor's c_coff-wide pair, and -- when the indexer runs --
+    its own compressor's pair as well. Mirrors reference.qkv_a_tail(). Both the
+    task count and the kernel's loop bound come from here; they disagreed before,
+    so the kernel ran qkv_a tasks the CTA placement had not accounted for.
     """
-    tail = 2 * c_coff * head_dim if compress_ratio else 0
+    if not compress_ratio:
+        return q_lora + head_dim
+    tail = 2 * c_coff * (head_dim + index_head_dim)
     return q_lora + head_dim + tail
 
 
@@ -409,12 +447,13 @@ def stage_tasks(
     compress_ratio: int = 0,
     n_keys: int | None = None,
     c_coff: int = 1,
+    index_head_dim: int = 0,
 ):
     """[(stage name, task count)] in execution order.
 
     MLA's ``uk`` stage has no V4 counterpart (no absorbed W_UK) and its ``o``
     GEMV splits into the grouped low-rank pair ``o_a`` / ``o_b``."""
-    n_qkv_a = qkv_a_rows(q_lora, head_dim, compress_ratio, c_coff) // QKV_A_TILE
+    n_qkv_a = qkv_a_rows(q_lora, head_dim, compress_ratio, c_coff, index_head_dim) // QKV_A_TILE
     hc_tasks, _, _, _ = hc_shape(hc_mult, hidden)
     return [
         # hyper-connection pre-mix for the attention side, before anything reads
@@ -425,6 +464,8 @@ def stage_tasks(
         ("cache", 1),
         # the compressed entry has to land before the attention gathers it
         ("cmp", S if compress_ratio else 0),
+        # the indexer's compressed entry, for the scoring that selects keys
+        ("i_cmp", S if index_head_dim else 0),
         ("q_b", heads * head_dim // Q_B_TILE),
         ("q_norm", S * heads),
         ("split", S * ((window if n_keys is None else n_keys) // SPLIT_KEYS)),
@@ -467,6 +508,7 @@ def build_dsv4_kernel(
     window_rows: int | None = None,
     n_keys: int | None = None,
     c_coff: int = 1,
+    index_head_dim: int = 0,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole V4 layer.
 
@@ -528,7 +570,7 @@ def build_dsv4_kernel(
     NOPE_DIM = HEAD_DIM - ROPE_DIM
     MOE_SLOTS = 1 + TOP_K
     SHARED_EXPERT = N_EXPERTS
-    QKV_A_ROWS = qkv_a_rows(Q_LORA, HEAD_DIM, compress_ratio, c_coff)
+    QKV_A_ROWS = qkv_a_rows(Q_LORA, HEAD_DIM, compress_ratio, c_coff, index_head_dim)
     N_QKV_A = QKV_A_ROWS // QKV_A_TILE
     N_ROW_TILES = HIDDEN // ROW_TILE
     N_ROUTER = N_EXPERTS // ROUTER_TILE
@@ -550,6 +592,11 @@ def build_dsv4_kernel(
     # projections carry two halves (C_COFF) and the state holds two windows.
     CR = compress_ratio
     C_COFF = c_coff
+    # The lightning indexer keeps a SECOND compressor over the same tokens at its
+    # own smaller head_dim, Hadamard-rotated and FP4-quantized. IHD == 0 is "no
+    # indexer" and compiles the whole thing out.
+    IHD = index_head_dim
+    IW = C_COFF * IHD
     CW = C_COFF * HEAD_DIM  # width of one state row
     C_ROWS = C_COFF * CR  # rows of state
     OVERLAP = C_COFF > 1
@@ -606,6 +653,7 @@ def build_dsv4_kernel(
         compress_ratio=CR,
         n_keys=N_KEYS,
         c_coff=C_COFF,
+        index_head_dim=IHD,
     )
     assert N_KEYS % SPLIT_KEYS == 0, "the index list must be a whole number of key tiles"
     N_SPLIT = N_KEYS // SPLIT_KEYS
@@ -658,6 +706,7 @@ def build_dsv4_kernel(
         compress_ratio=CR,
         n_keys=N_KEYS,
         c_coff=C_COFF,
+        index_head_dim=IHD,
     )
     base, first, acc = {}, {}, 0
     for name, n in stage_tasks(S, H, **st_args):
@@ -673,6 +722,7 @@ def build_dsv4_kernel(
         "qkv_a",
         "cache",
         "cmp",
+        "i_cmp",
         "split",
         "q_b",
         "q_norm",
@@ -716,6 +766,11 @@ def build_dsv4_kernel(
         g_ckv: Int64,
         kv_state: Int64,
         score_state: Int64,
+        i_ape: Int64,
+        g_ickv: Int64,
+        i_kv_state: Int64,
+        i_score_state: Int64,
+        i_cache: Int64,
         hc_attn_fn: Int64,
         hc_attn_sb: Int64,
         hc_ffn_fn: Int64,
@@ -1630,8 +1685,12 @@ def build_dsv4_kernel(
                     put(mb("kv_a"), s * HEAD_DIM + row - Q_LORA, v)
                 elif row < Q_LORA + HEAD_DIM + CW:
                     put(mb("c_kv"), s * CW + row - Q_LORA - HEAD_DIM, v)
-                else:
+                elif row < Q_LORA + HEAD_DIM + 2 * CW:
                     put(mb("c_gate"), s * CW + row - Q_LORA - HEAD_DIM - CW, v)
+                elif row < Q_LORA + HEAD_DIM + 2 * CW + IW:
+                    put(mb("i_kv"), s * IW + row - Q_LORA - HEAD_DIM - 2 * CW, v)
+                else:
+                    put(mb("i_gate"), s * IW + row - Q_LORA - HEAD_DIM - 2 * CW - IW, v)
             stamp("qkv_a", t, 4)
 
         # ====== 2. KV RMSNorm + RoPE + FP8 round trip -> sliding-window ring cache
@@ -1761,6 +1820,121 @@ def build_dsv4_kernel(
                                     bo.buffer_store(ld_f32(r_kvst, (CR + i) * CW + o), r_kvst, i * CW + o)
                                     bo.buffer_store(ld_f32(r_scst, (CR + i) * CW + o), r_scst, i * CW + o)
                 stamp("cmp", tt, 4)
+
+        # ========== 2c. the indexer's compressor: same pooling, different tail
+        # Half the head_dim, and it finishes with a Hadamard rotation over the whole
+        # row followed by FP4 instead of FP8 over the nope part. The rotation is what
+        # makes FP4 survivable: it spreads an outlier across every lane, so a block's
+        # amax stops being set by one coordinate, and being orthonormal it leaves the
+        # scores the indexer ranks unchanged.
+        if const_expr(IHD):
+            r_ikvst = _rsrc(i_kv_state)
+            r_iscst = _rsrc(i_score_state)
+
+            def had_pair(v0, v1, ln):
+                """FWHT over IHD channels held two per lane, scaled by IHD**-0.5.
+
+                Lane ln owns channels ln and ln + 64, so every butterfly below stride 64
+                is an xor shuffle inside the wave and the stride-64 one is the pair
+                this lane already holds -- no LDS, no barrier.
+                """
+                # an explicit sequence, NOT `while h < 64`: a Python while over a
+                # value the tracer can see becomes a device scf.while, and the
+                # shuffle offset then stops being a compile-time constant
+                for h in range_constexpr(6):
+                    st = 1 << h
+                    p0, p1 = _xshfl(v0, st), _xshfl(v1, st)
+                    hi = (ln & st) != 0
+                    v0 = hi.select(p0 - v0, v0 + p0)
+                    v1 = hi.select(p1 - v1, v1 + p1)
+                v0, v1 = v0 + v1, v0 - v1
+                sc = float(IHD) ** -0.5
+                return v0 * sc, v1 * sc
+
+            def fp4_block(v):
+                """FP4 round trip over aligned 32-lane blocks, power-of-two scale."""
+                amax = fmath.absf(v)
+                for off in (16, 8, 4, 2, 1):
+                    amax = _xred(amax, off, fx.max)
+                sc = _pow2_ceil(fx.max(amax, fx.Float32(FP4_MAX * 2.0**-126)) * (1.0 / FP4_MAX))
+                q = fx.min(fx.max(v * _rcp(sc), -FP4_MAX), FP4_MAX)
+                d, _ = _fp4_roundtrip(q, fx.Float32(0.0))
+                return d * sc
+
+            for tt in range(start("i_cmp"), S, G):
+                tt = fx.Int32(tt)
+                stamp("i_cmp", tt, 0)
+                # one WAVE covers the row: lane ln holds channels ln and ln + 64
+                ln = lane
+                ilive = wave == 0
+                p = pos0 + tt
+                slot = p % CR
+                chs = [ln, ln + 64]
+                ap0 = [[ld_f32(_rsrc(i_ape), slot * IW + j * IHD + c) for j in range(C_COFF)] for c in chs]
+                gg = [ld_bf16(_rsrc(g_ickv), c) for c in chs]
+                anchor = fx.max(p + 1 - CR, fx.Int32(0))
+                kvv = [[getf(mb("i_kv"), (tt * C_COFF + j) * IHD + c) for j in range(C_COFF)] for c in chs]
+                gtv = [[getf(mb("i_gate"), (tt * C_COFF + j) * IHD + c) for j in range(C_COFF)] for c in chs]
+                stamp("i_cmp", tt, 2)
+                if ilive:
+                    for e in range_constexpr(2):
+                        for j in range_constexpr(C_COFF):
+                            w = (CBASE + slot) * IW + j * IHD + chs[e]
+                            bo.buffer_store(kvv[e][j], r_ikvst, w)
+                            bo.buffer_store(gtv[e][j] + ap0[e][j], r_iscst, w)
+                if (p + 1) % CR == 0:  # uniform across the CTA
+                    pooled = []
+                    for e in range_constexpr(2):
+                        for _i, acc in range(
+                            0,
+                            C_ROWS,
+                            fx.Int32(1),
+                            init=[fx.Float32(NEG), fx.Float32(0.0), fx.Float32(0.0)],
+                        ):
+                            m = fx.Float32(acc[0])
+                            den = fx.Float32(acc[1])
+                            num = fx.Float32(acc[2])
+                            i = fx.Int32(_i)
+                            coff = (i >= CR).select(fx.Int32(IHD), fx.Int32(0)) if OVERLAP else 0
+                            wi = i * IW + coff + chs[e]
+                            sv = ld_f32(r_iscst, wi)
+                            kv_i = ld_f32(r_ikvst, wi)
+                            m_new = fx.max(m, sv)
+                            rescale = _exp(m - m_new)
+                            w = _exp(sv - m_new)
+                            res = yield [m_new, den * rescale + w, num * rescale + w * kv_i]
+                        pooled.append(bf16_round(fx.Float32(res[2]) * _rcp(fx.Float32(res[1]))))
+                    # RMS over the whole IHD row: both halves, one wave
+                    sq = pooled[0] * pooled[0] + pooled[1] * pooled[1]
+                    for off in range_constexpr(6):
+                        sq = _xred(sq, 32 >> off, lambda a, b: a + b)
+                    rs = _rsq(sq * (1.0 / IHD) + EPS)
+                    nv = [bf16_round(pooled[e] * rs * gg[e]) for e in range(2)]
+                    # rope lives in the TAIL of the row, i.e. entirely in the second
+                    # half (IHD - ROPE_DIM == 64), so only channel ln + 64 rotates
+                    rc = ld_f32(_rsrc(rope_cos), anchor * (ROPE_DIM // 2) + ln // 2)
+                    rs2 = ld_f32(_rsrc(rope_sin), anchor * (ROPE_DIM // 2) + ln // 2)
+                    partner = _xshfl(nv[1], 1)
+                    even = ln % 2 == 0
+                    nv[1] = bf16_round(even.select(nv[1] * rc - partner * rs2, partner * rs2 + nv[1] * rc))
+                    h0, h1 = had_pair(nv[0], nv[1], ln)
+                    q0, q1 = bf16_round(h0), bf16_round(h1)
+                    o0, o1 = fp4_block(q0), fp4_block(q1)
+                    if ilive:
+                        r_ic = _rsrc(i_cache)
+                        row = (p // CR) * IHD
+                        bo.buffer_store(bf16_round(o0).to(fx.BFloat16), r_ic, row + ln)
+                        bo.buffer_store(bf16_round(o1).to(fx.BFloat16), r_ic, row + ln + 64)
+                    if const_expr(OVERLAP):
+                        # retire the window, as the attention compressor does
+                        for i in range_constexpr(CR):
+                            for e in range_constexpr(2):
+                                for j in range_constexpr(C_COFF):
+                                    o = j * IHD + chs[e]
+                                    if ilive:
+                                        bo.buffer_store(ld_f32(r_ikvst, (CR + i) * IW + o), r_ikvst, i * IW + o)
+                                        bo.buffer_store(ld_f32(r_iscst, (CR + i) * IW + o), r_iscst, i * IW + o)
+                stamp("i_cmp", tt, 4)
 
         # ==================================== 3. q_a RMSNorm -> q_b (raw f32 query)
         r_wqb, r_sqb = _rsrc(w_q_b), _rsrc(s_q_b)
@@ -2700,6 +2874,11 @@ def build_dsv4_kernel(
         g_ckv: Int64,
         kv_state: Int64,
         score_state: Int64,
+        i_ape: Int64,
+        g_ickv: Int64,
+        i_kv_state: Int64,
+        i_score_state: Int64,
+        i_cache: Int64,
         hc_attn_fn: Int64,
         hc_attn_sb: Int64,
         hc_ffn_fn: Int64,
@@ -2744,6 +2923,11 @@ def build_dsv4_kernel(
             g_ckv,
             kv_state,
             score_state,
+            i_ape,
+            g_ickv,
+            i_kv_state,
+            i_score_state,
+            i_cache,
             hc_attn_fn,
             hc_attn_sb,
             hc_ffn_fn,

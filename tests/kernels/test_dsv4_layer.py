@@ -810,3 +810,77 @@ def test_dsv4_csa_compressor_in_kernel():
         assert rel_l2 < 5e-3, f"pos={pos} compressed row rel_l2 {rel_l2:.5f}"
 
     assert emitted >= 4, f"expected several compressed entries, got {emitted}"
+
+
+def test_dsv4_indexer_compressor_in_kernel():
+    """The INDEXER's compressor in the kernel, against ``compress_step(rotate=True)``.
+
+    Same pooling as the attention compressor, different tail: half the head_dim,
+    a Hadamard rotation over the whole row, then FP4 instead of FP8 over the nope
+    part. What this covers that the attention one does not is the rotation and the
+    FP4 block scale -- and those are the parts with no prior art in this kernel,
+    so they get compared against the golden that was itself checked bit-exact
+    against DeepSeek's module.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+    from kernels.dsv4_moe_layer.reference import compress_step, dequant, qkv_a_split
+
+    torch.manual_seed(0)
+    ratio = COMPRESS_CSA
+    cfg = _cfg(hc_mult=1)
+    cfg.compress_ratio, cfg.max_seq = ratio, 256
+    assert cfg.indexed, "only CSA runs an indexer"
+    ihd, dev, mode = cfg.index_head_dim, "cuda", MoeMode.W8A8
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    t = W.t
+    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode)
+
+    cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    i_ks = torch.zeros(cfg.c_rows, cfg.c_coff * ihd, device=dev)
+    i_ss = torch.full((cfg.c_rows, cfg.c_coff * ihd), float("-inf"), device=dev)
+    i_ref = torch.zeros(cfg.n_compressed, ihd, dtype=torch.bfloat16, device=dev)
+    dq = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+    cut = qkv_a_split(cfg)
+
+    emitted = 0
+    for pos in range(5 * ratio):
+        h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
+        cur = torch.tensor([pos], dtype=torch.int32, device=dev)
+        layer.forward(h, cur, kv_k, layer_idxs(pos, 1, cfg, dev), cos, sin)
+        torch.cuda.synchronize()
+
+        x = bf(rmsnorm(h.float(), t["g_in"], cfg.eps))
+        proj = x @ dq.float().T
+        ref = compress_step(
+            proj[0, slice(*cut["i_kv"])],
+            proj[0, slice(*cut["i_gate"])],
+            pos,
+            cfg,
+            t,
+            i_ks,
+            i_ss,
+            i_ref,
+            cos,
+            sin,
+            head_dim=ihd,
+            ape=t["i_ape"],
+            gamma=t["g_ickv"],
+            base=0,
+            rotate=True,
+        )
+        if (pos + 1) % ratio:
+            assert ref is None, f"pos={pos} should emit nothing"
+            continue
+        emitted += 1
+        slot = pos // ratio
+        a, b = layer.i_cache[slot].float(), i_ref[slot].float()
+        # FP4's levels are coarse enough that a last-bit difference upstream moves
+        # one element a whole step; bound the bulk and the count instead of the max,
+        # as the attention compressor's test does.
+        n_diff = int((a != b).sum())
+        rel_l2 = ((a - b).norm() / max(b.norm().item(), 1e-6)).item()
+        assert n_diff <= 4, f"pos={pos}: {n_diff}/{ihd} elements differ, not a quantization tie"
+        assert rel_l2 < 1e-2, f"pos={pos} indexer compressed row rel_l2 {rel_l2:.5f}"
+
+    assert emitted >= 4, f"expected several compressed entries, got {emitted}"

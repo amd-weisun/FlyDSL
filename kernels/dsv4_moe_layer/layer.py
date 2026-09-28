@@ -88,6 +88,8 @@ class Dsv4MoeLayer:
         dims["compress_ratio"] = cfg.compress_ratio
         dims["n_keys"] = cfg.n_keys
         dims["c_coff"] = cfg.c_coff
+        # 0 means "no indexer"; only CSA runs one
+        dims["index_head_dim"] = cfg.index_head_dim if cfg.indexed else 0
         self.scr_layout, self.sym_layout = layout(samples, cfg.heads, npes, cfg.window, self.moe_mode, **dims)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
@@ -115,6 +117,14 @@ class Dsv4MoeLayer:
         self.stages = stage_tasks(samples, cfg.heads, window=cfg.window, top_k=cfg.top_k, inter=cfg.inter, **dims)
         # the compressor carries a rolling window across decode steps, so its state
         # lives here rather than being rebuilt per call
+        if cfg.indexed:
+            ishape = (cfg.c_rows, cfg.c_coff * cfg.index_head_dim)
+            self.i_kv_state = torch.zeros(*ishape, dtype=torch.float32, device=dev)
+            self.i_score_state = torch.full(ishape, float("-inf"), dtype=torch.float32, device=dev)
+            # the indexer's cache holds compressed entries only, no window half
+            self.i_cache = torch.zeros(cfg.n_compressed, cfg.index_head_dim, dtype=torch.bfloat16, device=dev)
+        else:
+            self.i_kv_state = self.i_score_state = self.i_cache = torch.zeros(1, device=dev)
         if cfg.compress_ratio:
             shape = (cfg.c_rows, cfg.c_coff * cfg.head_dim)
             self.kv_state = torch.zeros(*shape, dtype=torch.float32, device=dev)
@@ -174,6 +184,11 @@ class Dsv4MoeLayer:
             p(t["g_ckv"]) if "g_ckv" in t else 0,
             p(self.kv_state),
             p(self.score_state),
+            p(t["i_ape"]) if "i_ape" in t else 0,
+            p(t["g_ickv"]) if "g_ickv" in t else 0,
+            p(self.i_kv_state),
+            p(self.i_score_state),
+            p(self.i_cache),
             p(t["hc_attn_fn"]) if "hc_attn_fn" in t else 0,
             p(self.hc_sb["attn"]),
             p(t["hc_ffn_fn"]) if "hc_ffn_fn" in t else 0,
