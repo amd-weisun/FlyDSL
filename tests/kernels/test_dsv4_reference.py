@@ -298,7 +298,7 @@ def test_v4_hca_compressor_matches_deepseek(steps):
         block = om.Block(0, _oracle_args(om, cfg))
     _load_block_weights(block, W, cfg, moe_format(MoeMode.W8A16).weight)
 
-    cos, sin = rope_table(512, theta=cfg.compress_rope_theta, device=device)
+    cos, sin = rope_table(512, theta=cfg.rope_base, device=device)
     kv_cache = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device)
     kv_state = torch.zeros(ratio, cfg.head_dim, device=device)
     score_state = torch.zeros(ratio, cfg.head_dim, device=device)

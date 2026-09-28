@@ -97,6 +97,18 @@ class V4Config:
         return (2 + self.hc_mult) * self.hc_mult
 
     @property
+    def rope_base(self) -> float:
+        """The rope base for THIS layer.
+
+        V4 chooses per layer, not per consumer: a compressing layer rotates
+        everything -- window q/kv, the compressed rows, and the indexer -- on
+        ``compress_rope_theta`` (with YaRN), and a pure sliding-window layer on
+        ``rope_theta`` (without). Getting this per-consumer instead of per-layer
+        is an easy and invisible mistake, so it lives in one place.
+        """
+        return self.compress_rope_theta if self.compress_ratio else self.rope_theta
+
+    @property
     def overlap(self) -> bool:
         """CSA compresses with overlapping windows -- DeepSeek ties that to ratio 4.
         Each entry then pools 2*ratio tokens at a stride of ratio."""

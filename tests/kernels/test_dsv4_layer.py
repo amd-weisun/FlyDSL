@@ -217,10 +217,9 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4,
     cfg.validate()
     W = make_weights(rank, cfg=cfg, device=dev, seed=TP_SEED, moe_mode=moe_mode)
     layer = Dsv4MoeLayer(W, samples=1, rank=rank, npes=npes, group=group, moe_mode=moe_mode)
-    # a compressing layer rotates everything on compress_rope_theta, a pure
-    # sliding-window layer on rope_theta -- one table either way
-    theta = cfg.compress_rope_theta if compress_ratio else cfg.rope_theta
-    cos, sin = rope_table(4096, theta=theta, device=dev)
+    # one table either way; cfg.rope_base picks compress_rope_theta for a
+    # compressing layer and rope_theta for a pure sliding-window one
+    cos, sin = rope_table(4096, theta=cfg.rope_base, device=dev)
     gen = torch.Generator(device=dev).manual_seed(TP_SEED + 99)  # identical inputs everywhere
     # Without compression each step is independent, so the cache is re-seeded from
     # kv0 every iteration. The compressor carries state across steps, so its run has
@@ -519,10 +518,10 @@ def test_dsv4_hca_layer_matches_golden(moe_mode):
     W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=moe_mode)
     layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=moe_mode)
 
-    # ONE table for the whole layer, on compress_rope_theta: V4 picks the rope base
-    # per LAYER, not per consumer -- a compressing layer rotates its window q/kv on
-    # the same table as its compressed rows.
-    cos, sin = rope_table(2048, theta=cfg.compress_rope_theta, device=dev)
+    # ONE table for the whole layer: V4 picks the rope base per LAYER, not per
+    # consumer, so a compressing layer rotates its window q/kv on the same table
+    # as its compressed rows. cfg.rope_base holds that rule.
+    cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
     kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     kv_r = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     ks = torch.zeros(cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev)
@@ -618,8 +617,8 @@ def test_dsv4_hca_layer_at_real_dims():
     W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
     layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode)
 
-    # one table for the whole layer, on the compressing layer's base
-    cos, sin = rope_table(2048, theta=cfg.compress_rope_theta, device=dev)
+    # one table for the whole layer, at this layer's base
+    cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
     kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     kv_r = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     ks = torch.zeros(cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev)
