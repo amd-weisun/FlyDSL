@@ -463,7 +463,10 @@ def test_dsv4_hca_layer_matches_golden(moe_mode):
     W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=moe_mode)
     layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=moe_mode)
 
-    cos, sin = rope_table(2048, theta=cfg.compress_rope_theta, device=dev)
+    cos, sin = rope_table(2048, theta=cfg.rope_theta, device=dev)
+    # the compressor rotates on its own base, so a wrong table here is visible at
+    # every boundary whose anchor is non-zero (anchor 0 is identity in both)
+    cos_c, sin_c = rope_table(2048, theta=cfg.compress_rope_theta, device=dev)
     kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     kv_r = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     ks = torch.zeros(cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev)
@@ -475,7 +478,7 @@ def test_dsv4_hca_layer_matches_golden(moe_mode):
         h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
         cur = torch.tensor([pos], dtype=torch.int32, device=dev)
         idx = layer_idxs(pos, 1, cfg, dev)
-        out = layer.forward(h, cur, kv_k, idx, cos, sin)
+        out = layer.forward(h, cur, kv_k, idx, cos, sin, cos_c=cos_c, sin_c=sin_c)
         torch.cuda.synchronize()
         ref = golden_layer(
             W,
@@ -489,8 +492,8 @@ def test_dsv4_hca_layer_matches_golden(moe_mode):
             moe_mode=moe_mode,
             kv_state=ks,
             score_state=ss,
-            cos_c=cos,
-            sin_c=sin,
+            cos_c=cos_c,
+            sin_c=sin_c,
         )
         if (pos + 1) % ratio == 0:
             boundaries += 1
@@ -503,12 +506,19 @@ def test_dsv4_hca_layer_matches_golden(moe_mode):
             rel = (a_c - b_c).abs().max().item() / max(b_c.abs().max().item(), 1e-6)
             assert rel < 2e-2, f"compressed row at slot {slot} differs by rel {rel:.5f}"
 
+        # `a` below is the kernel's own, so attention cancels out of that check --
+        # compare it here, where a mis-sized gather over the compressed half shows.
+        got = layer.intermediates()
+        rel_o = (got["o"].float() - ref["o"].float()).abs().max().item() / max(
+            ref["o"].float().abs().max().item(), 1e-6
+        )
+        assert rel_o < STAGE_TOL["o"], f"pos={pos} stage o diverged: rel {rel_o:.5f}"
+
         # Over a long sequential run a near-tie will eventually flip an expert, and
         # with 128 experts and top-6 the 6th/7th margin is crowded enough that
         # skipping near-ties would skip most positions. So judge the layer against a
         # golden rebuilt from the kernel's OWN routing, which is flip-immune by
         # construction -- the same structure the multi-rank test uses.
-        got = layer.intermediates()
         own = golden_moe(
             W,
             got["a"],
@@ -524,3 +534,110 @@ def test_dsv4_hca_layer_matches_golden(moe_mode):
         assert rel_l2 < tol, f"pos={pos} x_out rel_l2 {rel_l2:.5f} >= {tol}"
 
     assert boundaries >= 3, "must cross several compression boundaries"
+
+
+@pytest.mark.large_shape
+def test_dsv4_hca_layer_at_real_dims():
+    """HCA at V4-Pro's own numbers, which the reduced shard above cannot reach.
+
+    The reduced case stands ratio 16 in for 128, and that is exactly the kind of
+    substitution that hid the selection key's 8-bit id field in P1. Here the
+    pooling loop really runs 128 rows, ``ape`` is the full 128 x 512 table, the
+    compressed half of the cache is addressed at its real offset, and the split
+    stage walks the real ``n_keys`` (192, not the window's 128) -- the stride that
+    was wrong when the compressed entries were silently never gathered.
+
+    One boundary is enough to exercise all of that, and 128 steps per boundary is
+    what makes more expensive.
+    """
+    from kernels.dsv4_moe_layer.config import COMPRESS_HCA
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    torch.manual_seed(0)
+    cfg = V4Config(hc_mult=1)  # defaults are DeepSeek-V4-Pro at TP8
+    cfg.compress_ratio = COMPRESS_HCA
+    cfg.validate()
+    ratio, dev, mode = cfg.compress_ratio, "cuda", MoeMode.W8A8
+    assert cfg.n_keys > cfg.window, "the gather must reach past the window"
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode)
+
+    cos, sin = rope_table(2048, theta=cfg.rope_theta, device=dev)
+    cos_c, sin_c = rope_table(2048, theta=cfg.compress_rope_theta, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    kv_r = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    ks = torch.zeros(cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev)
+    ss = torch.full((cfg.c_rows, cfg.c_coff * cfg.head_dim), float("-inf"), device=dev)
+
+    # Two boundaries, not one: the first anchors at position 0, where every rope
+    # table is the identity, so it cannot tell the compressor's base from the
+    # window's. The second anchors at `ratio` and does.
+    boundaries, checked, top_id = 0, 0, 0
+    for pos in range(2 * ratio + 4):
+        h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
+        cur = torch.tensor([pos], dtype=torch.int32, device=dev)
+        idx = layer_idxs(pos, 1, cfg, dev)
+        out = layer.forward(h, cur, kv_k, idx, cos, sin, cos_c=cos_c, sin_c=sin_c)
+        torch.cuda.synchronize()
+        ref = golden_layer(
+            W,
+            h,
+            pos,
+            kv_r,
+            idx,
+            cos,
+            sin,
+            lambda z: z,
+            moe_mode=mode,
+            kv_state=ks,
+            score_state=ss,
+            cos_c=cos_c,
+            sin_c=sin_c,
+        )
+        if (pos + 1) % ratio == 0:
+            boundaries += 1
+            slot = cfg.window + pos // ratio
+            a_c, b_c = kv_k[slot].float(), kv_r[slot].float()
+            rel = (a_c - b_c).abs().max().item() / max(b_c.abs().max().item(), 1e-6)
+            assert rel < 2e-2, f"compressed row at slot {slot} differs by rel {rel:.5f}"
+
+        got = layer.intermediates()
+        # Stage-by-stage only where it is informative: the steps around the
+        # boundary, which is the only place this differs from the plain window.
+        if any(abs(pos - (b * ratio - 1)) <= 2 for b in (1, 2)):
+            checked += 1
+            # `mid` is the one stage that depends on which experts were picked, and
+            # over a run this long a near-tie eventually flips one. Every other
+            # stage -- the whole attention half, which is what HCA changes -- is
+            # compared unconditionally.
+            same_route = got["sel"].tolist() == ref["sel"].tolist()
+            for name, base in STAGE_TOL.items():
+                if name == "mid" and not same_route:
+                    continue
+                tol = _tol(base, cfg.hc_mult, 1) if name in SCALES_WITH_CONFIG else base
+                a = got[name].float().reshape(-1)
+                b = ref[name].float().reshape(-1)
+                rel = (a - b).abs().max().item() / max(b.abs().max().item(), 1e-6)
+                assert rel < tol, f"pos={pos} stage {name} diverged: rel {rel:.5f} >= {tol}"
+        top_id = max(top_id, *got["sel"].reshape(-1).tolist()[1:])
+
+        # flip-immune: judge the layer against a golden rebuilt from the kernel's
+        # own routing, as the long reduced run and the multi-rank test do
+        own = golden_moe(
+            W,
+            got["a"],
+            lambda z: z,
+            mid=got["mid"],
+            sel=got["sel"],
+            prob=got["prob"],
+            moe_mode=mode,
+        )
+        b_out = own["x_out"].float()
+        rel_l2 = ((out.float() - b_out).norm() / b_out.norm()).item()
+        tol = _tol(OUT_REL_L2, cfg.hc_mult, 1)
+        assert rel_l2 < tol, f"pos={pos} x_out rel_l2 {rel_l2:.5f} >= {tol}"
+
+    assert boundaries == 2 and checked == 10
+    # an id above 255 is the case the selection key's 8-bit field used to corrupt;
+    # over this many steps the routing is certain to reach one
+    assert top_id > 255 or cfg.n_experts <= 256

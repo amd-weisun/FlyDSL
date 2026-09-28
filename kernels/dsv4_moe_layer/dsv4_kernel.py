@@ -171,6 +171,7 @@ def layout(
     o_lora: int = O_LORA,
     hc_mult: int = 1,
     compress_ratio: int = 0,
+    n_keys: int | None = None,
 ):
     """Byte offsets of the per-rank scratch and of the symmetric buffer.
 
@@ -178,7 +179,7 @@ def layout(
     fmt = moe_format(moe_mode)
     quant_group = fmt.activation_group
     xq_blocks = 0 if quant_group is None else hidden // quant_group
-    n_split = window // SPLIT_KEYS
+    n_split = (window if n_keys is None else n_keys) // SPLIT_KEYS
     hc_tasks, _, hc_rows, hc_vals = hc_shape(hc_mult, hidden)
     hc_coef = 2 * hc_mult + hc_mult * hc_mult  # pre | post | comb
     pr = 8
@@ -393,6 +394,7 @@ def stage_tasks(
     inter: int = INTER,
     hc_mult: int = 1,
     compress_ratio: int = 0,
+    n_keys: int | None = None,
 ):
     """[(stage name, task count)] in execution order.
 
@@ -411,7 +413,7 @@ def stage_tasks(
         ("cmp", S if compress_ratio else 0),
         ("q_b", heads * head_dim // Q_B_TILE),
         ("q_norm", S * heads),
-        ("split", S * (window // SPLIT_KEYS)),
+        ("split", S * ((window if n_keys is None else n_keys) // SPLIT_KEYS)),
         ("uv", S * (heads * head_dim // UV_TILE)),
         ("o_a", S * o_groups * o_lora // ROW_TILE),
         ("o_b", hidden // ROW_TILE),
@@ -581,6 +583,7 @@ def build_dsv4_kernel(
         o_lora=O_LORA,
         hc_mult=HC,
         compress_ratio=CR,
+        n_keys=N_KEYS,
     )
     assert N_KEYS % SPLIT_KEYS == 0, "the index list must be a whole number of key tiles"
     N_SPLIT = N_KEYS // SPLIT_KEYS
@@ -631,6 +634,7 @@ def build_dsv4_kernel(
         inter=INTER,
         hc_mult=HC,
         compress_ratio=CR,
+        n_keys=N_KEYS,
     )
     base, first, acc = {}, {}, 0
     for name, n in stage_tasks(S, H, **st_args):
@@ -680,6 +684,8 @@ def build_dsv4_kernel(
         indices: Int64,
         rope_cos: Int64,
         rope_sin: Int64,
+        crope_cos: Int64,
+        crope_sin: Int64,
         g_in: Int64,
         g_q: Int64,
         g_kv: Int64,
@@ -1666,8 +1672,8 @@ def build_dsv4_kernel(
                 # but the load is unconditional, so clamp it.
                 anchor = fx.max(p + 1 - CR, fx.Int32(0))
                 ri = fx.max(tid - NOPE_DIM, fx.Int32(0)) // 2
-                rc = ld_f32(_rsrc(rope_cos), anchor * (ROPE_DIM // 2) + ri)
-                rs = ld_f32(_rsrc(rope_sin), anchor * (ROPE_DIM // 2) + ri)
+                rc = ld_f32(_rsrc(crope_cos), anchor * (ROPE_DIM // 2) + ri)
+                rs = ld_f32(_rsrc(crope_sin), anchor * (ROPE_DIM // 2) + ri)
                 kvv = getf(mb("c_kv"), tt * HEAD_DIM + ch)
                 gtv = getf(mb("c_gate"), tt * HEAD_DIM + ch)
                 stamp("cmp", tt, 2)
@@ -2642,6 +2648,8 @@ def build_dsv4_kernel(
         indices: Int64,
         rope_cos: Int64,
         rope_sin: Int64,
+        crope_cos: Int64,
+        crope_sin: Int64,
         g_in: Int64,
         g_q: Int64,
         g_kv: Int64,
@@ -2686,6 +2694,8 @@ def build_dsv4_kernel(
             indices,
             rope_cos,
             rope_sin,
+            crope_cos,
+            crope_sin,
             g_in,
             g_q,
             g_kv,

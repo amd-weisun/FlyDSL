@@ -74,8 +74,13 @@ class Dsv4MoeLayer:
         # layout() and build_dsv4_kernel() MUST see identical shape arguments: the
         # host derives scratch offsets and its size from one and the kernel from the
         # other, so any drift both misreads every mailbox and undersizes the buffer.
+        # build_dsv4_kernel() then re-derives both from ITS arguments, so a new shape
+        # has to reach all three -- which is why every one of them is fed from `dims`.
+        # Note the JIT disk cache does not key on layout()/stage_tasks(), so a change
+        # to either needs FLYDSL_RUNTIME_ENABLE_CACHE=0 to actually take effect.
         dims["hc_mult"] = cfg.hc_mult
         dims["compress_ratio"] = cfg.compress_ratio
+        dims["n_keys"] = cfg.n_keys
         self.scr_layout, self.sym_layout = layout(samples, cfg.heads, npes, cfg.window, self.moe_mode, **dims)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
@@ -98,7 +103,6 @@ class Dsv4MoeLayer:
             hc_sinkhorn_iters=cfg.hc_sinkhorn_iters,
             hc_eps=cfg.hc_eps,
             window_rows=cfg.cache_rows,
-            n_keys=cfg.n_keys,
             **dims,
         )
         self.stages = stage_tasks(samples, cfg.heads, window=cfg.window, top_k=cfg.top_k, inter=cfg.inter, **dims)
@@ -132,7 +136,20 @@ class Dsv4MoeLayer:
         words = self.scratch[off : off + n * 8].view(torch.int32).view(n, 2)[:, 0].contiguous()
         return words.view(dtype).view(shape)
 
-    def forward(self, h, cur_pos, kv_cache, indices, cos, sin, x_out=None, layer=0, advance=True):
+    def forward(
+        self,
+        h,
+        cur_pos,
+        kv_cache,
+        indices,
+        cos,
+        sin,
+        x_out=None,
+        layer=0,
+        advance=True,
+        cos_c=None,
+        sin_c=None,
+    ):
         """One layer.  Mailbox epochs are ``step * 128 + layer + 1``: layers sharing
         this scratch within a decode step need distinct ``layer``; call
         ``advance_step`` (or pass ``advance=True``) once per step.  Both are
@@ -154,6 +171,9 @@ class Dsv4MoeLayer:
             p(indices),
             p(cos),
             p(sin),
+            # the compressor has its own rope base; fall back to the window's table
+            p(cos if cos_c is None else cos_c),
+            p(sin if sin_c is None else sin_c),
             p(t["g_in"]),
             p(t["g_q"]),
             p(t["g_kv"]),
