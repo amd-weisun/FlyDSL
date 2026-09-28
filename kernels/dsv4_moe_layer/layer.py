@@ -58,6 +58,16 @@ class Dsv4MoeLayer:
         self.W, self.S, self.rank, self.npes = W, samples, rank, npes
         self.window = cfg.window
         self.packed = pack_layer_weights(W.t, self.moe_mode)
+        # [3 scales | hc_mix bases] per side, as one f32 vector the kernel indexes
+        dev0 = torch.device("cuda", torch.cuda.current_device())
+        self.hc_sb = {}
+        for side in ("attn", "ffn"):
+            if f"hc_{side}_scale" in W.t:
+                self.hc_sb[side] = torch.cat(
+                    [W.t[f"hc_{side}_scale"].float(), W.t[f"hc_{side}_base"].float()]
+                ).contiguous()
+            else:
+                self.hc_sb[side] = torch.zeros(1, device=dev0)
         dims = dict(
             hidden=cfg.hidden,
             q_lora=cfg.q_lora,
@@ -84,6 +94,9 @@ class Dsv4MoeLayer:
             top_k=cfg.top_k,
             inter=cfg.inter,
             swiglu_limit=cfg.swiglu_limit,
+            hc_mult=cfg.hc_mult,
+            hc_sinkhorn_iters=cfg.hc_sinkhorn_iters,
+            hc_eps=cfg.hc_eps,
             **dims,
         )
         self.stages = stage_tasks(samples, cfg.heads, window=cfg.window, **dims)
@@ -130,6 +143,10 @@ class Dsv4MoeLayer:
             p(t["g_kv"]),
             p(t["g_post"]),
             p(t["attn_sink"]),
+            p(t["hc_attn_fn"]) if "hc_attn_fn" in t else 0,
+            p(self.hc_sb["attn"]),
+            p(t["hc_ffn_fn"]) if "hc_ffn_fn" in t else 0,
+            p(self.hc_sb["ffn"]),
             p(t["w_qkv_a"]),
             p(t["s_qkv_a"]),
             p(t["w_q_b"]),

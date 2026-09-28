@@ -73,6 +73,8 @@ from kernels.common.dpp_utils import update_dpp_i32
 from kernels.dsv4_moe_layer.config import (
     EPS,
     FP8_MAX,
+    HC_EPS,
+    HC_SINKHORN_ITERS,
     HEAD_DIM,
     HIDDEN,
     INTER,
@@ -107,6 +109,7 @@ ROUTER_TILE = 8  # experts per router task (a part of a 16-row MFMA group)
 UG_TILE = 16  # intermediates per up/gate task (16 gate rows + 16 up rows)
 UG8 = 8  # intermediates one up/gate task actually owns
 SPLIT_KEYS = 64
+HC_CPW = 2  # hc_pre 64-K chunks per wave; sets the K split across tasks
 NEG = -1.0e30
 
 # task counts per stage
@@ -139,6 +142,22 @@ def _align(n, a=256):
     return (n + a - 1) // a * a
 
 
+def hc_shape(hc_mult: int, hidden: int):
+    """(tasks per side, K per task, rows, values published per task) for hc_pre.
+
+    The projection has only (2 + hc) * hc rows but K = hc * hidden, so its cost is
+    weight bytes. K is split across tasks to keep the per-task volume in line with
+    the other GEMVs instead of parking megabytes on one CU. Each task also carries
+    a partial sum of squares for hc_pre's weightless RMS, published as one extra row.
+    """
+    if hc_mult <= 1:
+        return 0, 0, 0, 0
+    rows = ((2 + hc_mult) * hc_mult + 15) // 16 * 16
+    k_total = hc_mult * hidden
+    n_tasks = k_total // (64 * WAVES * HC_CPW)
+    return n_tasks, k_total // n_tasks, rows, rows + 1
+
+
 def layout(
     S: int,
     heads: int,
@@ -150,6 +169,7 @@ def layout(
     head_dim: int = HEAD_DIM,
     o_groups: int = O_GROUPS,
     o_lora: int = O_LORA,
+    hc_mult: int = 1,
 ):
     """Byte offsets of the per-rank scratch and of the symmetric buffer.
 
@@ -158,8 +178,13 @@ def layout(
     quant_group = fmt.activation_group
     xq_blocks = 0 if quant_group is None else hidden // quant_group
     n_split = window // SPLIT_KEYS
+    hc_tasks, _, hc_rows, hc_vals = hc_shape(hc_mult, hidden)
+    hc_coef = 2 * hc_mult + hc_mult * hc_mult  # pre | post | comb
     pr = 8
     items = [
+        # two sides (attention, ffn) of hyper-connection coefficients per sample
+        ("hc_d", S * 2 * max(hc_tasks, 1) * max(hc_vals, 1) * pr),
+        ("hc_c", S * 2 * max(hc_coef, 1) * pr),
         ("q_a", S * q_lora * pr),
         ("kv_a", S * head_dim * pr),  # the single shared KV row, pre-norm
         ("kvnew", S * head_dim * pr),  # this launch's KV ring rows (bf16 values)
@@ -354,13 +379,20 @@ def stage_tasks(
     o_lora: int = O_LORA,
     top_k: int = TOP_K,
     inter: int = INTER,
+    hc_mult: int = 1,
 ):
     """[(stage name, task count)] in execution order.
 
     MLA's ``uk`` stage has no V4 counterpart (no absorbed W_UK) and its ``o``
     GEMV splits into the grouped low-rank pair ``o_a`` / ``o_b``."""
     n_qkv_a = (q_lora + head_dim) // QKV_A_TILE
+    hc_tasks, _, _, _ = hc_shape(hc_mult, hidden)
+    hc_one = S if hc_mult > 1 else 0
     return [
+        # hyper-connection pre-mix for the attention side, before anything reads
+        # the (hc_mult-wide) residual stream
+        ("hcd_a", S * hc_tasks),
+        ("hcm_a", hc_one),
         ("qkv_a", n_qkv_a),
         ("cache", 1),
         ("q_b", heads * head_dim // Q_B_TILE),
@@ -369,6 +401,9 @@ def stage_tasks(
         ("uv", S * (heads * head_dim // UV_TILE)),
         ("o_a", S * o_groups * o_lora // ROW_TILE),
         ("o_b", hidden // ROW_TILE),
+        # ... and for the ffn side, once o_b has produced the new residual stream
+        ("hcd_f", S * hc_tasks),
+        ("hcm_f", hc_one),
         ("router", S * N_ROUTER),
         # one tile per (routed slot, 8 intermediates); tasks below INTER / UG8 also
         # carry the shared expert.  GLM-5/V3 happened to make this exactly BLOCKS
@@ -395,6 +430,9 @@ def build_dsv4_kernel(
     top_k: int = TOP_K,
     inter: int = INTER,
     swiglu_limit: float = SWIGLU_LIMIT,
+    hc_mult: int = 1,
+    hc_sinkhorn_iters: int = HC_SINKHORN_ITERS,
+    hc_eps: float = HC_EPS,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole V4 layer.
 
@@ -478,6 +516,24 @@ def build_dsv4_kernel(
     H = heads
     W = npes
     G = BLOCKS
+    # --- hyper-connections. HC == 1 is a plain residual and compiles all of this out.
+    HC = hc_mult
+    HC_TASKS, HC_KSLICE, HC_ROWS, HC_VALS = hc_shape(HC, HIDDEN)
+    HC_MIX = (2 + HC) * HC if HC > 1 else 0
+    HC_COEF = 2 * HC + HC * HC if HC > 1 else 0
+    # comb lane = j * HC + k, so XORing the low bits walks a row and the high bits
+    # a column -- the whole Sinkhorn is cross-lane inside one wave
+    HC_ROW_OFFS = tuple(1 << b for b in range(HC.bit_length() - 1)) if HC > 1 else ()
+    HC_COL_OFFS = tuple(HC << b for b in range(HC.bit_length() - 1)) if HC > 1 else ()
+    HC_NKC = HC_KSLICE // 64 if HC > 1 else 0
+    HC_RG = HC_ROWS // 16 if HC > 1 else 0
+    HC_WPR = WAVES // HC_RG if HC > 1 else 0
+    HC_NKC_FULL = (HC * HIDDEN) // 64 if HC > 1 else 0
+    if HC > 1:
+        assert HC & (HC - 1) == 0, "hc_mult must be a power of two for the cross-lane Sinkhorn"
+        assert HC * HC <= 64, "the Sinkhorn matrix must fit one wave"
+        assert HC_NKC % HC_WPR == 0, "hc_pre chunks must divide over the waves of a row group"
+
     SC, SY = layout(
         S,
         H,
@@ -489,6 +545,7 @@ def build_dsv4_kernel(
         head_dim=HEAD_DIM,
         o_groups=O_GROUPS,
         o_lora=O_LORA,
+        hc_mult=HC,
     )
     N_SPLIT = window // SPLIT_KEYS
     N_QB = H * HEAD_DIM // Q_B_TILE
@@ -536,6 +593,7 @@ def build_dsv4_kernel(
         o_lora=O_LORA,
         top_k=TOP_K,
         inter=INTER,
+        hc_mult=HC,
     )
     base, first, acc = {}, {}, 0
     for name, n in stage_tasks(S, H, **st_args):
@@ -545,7 +603,23 @@ def build_dsv4_kernel(
     # tile starts on a CTA already freed by qkv_a
     tasks = dict(stage_tasks(S, H, **st_args))
     acc = 0
-    for name in ("qkv_a", "cache", "split", "q_b", "q_norm", "uv", "o_a", "o_b", "router", "ug", "down"):
+    for name in (
+        "hcd_a",
+        "hcm_a",
+        "qkv_a",
+        "cache",
+        "split",
+        "q_b",
+        "q_norm",
+        "uv",
+        "o_a",
+        "o_b",
+        "hcd_f",
+        "hcm_f",
+        "router",
+        "ug",
+        "down",
+    ):
         base[name] = acc % G
         acc += tasks[name]
 
@@ -573,6 +647,10 @@ def build_dsv4_kernel(
         g_kv: Int64,
         g_post: Int64,
         attn_sink: Int64,
+        hc_attn_fn: Int64,
+        hc_attn_sb: Int64,
+        hc_ffn_fn: Int64,
+        hc_ffn_sb: Int64,
         w_qkv_a: Int64,
         s_qkv_a: Int64,
         w_q_b: Int64,
@@ -1248,6 +1326,110 @@ def build_dsv4_kernel(
         def n_sel():
             """This lane's MFMA B column (sample); columns >= S duplicate the last one."""
             return fx.min(lane % 16, S - 1)
+
+        # ======== 0. hyper-connection pre-mix: partial dots + partial sum of squares
+        # hc_pre projects the whole hc*hidden residual stream onto (2+hc)*hc mixes.
+        # Only 24 rows but K = hc*hidden, so K is split across tasks; each task also
+        # carries a partial sum of squares for hc_pre's weightless RMS, published as
+        # one extra row so the reduce below is a single poll per row.
+        def hc_pre_stages(side, sd, fn_ptr, sb_ptr, src_word):
+            r_fn = _rsrc(fn_ptr)
+            r_sb = _rsrc(sb_ptr)  # [3 scales | HC_MIX bases]
+            for tt in range(start(f"hcd_{side}"), S * HC_TASKS, G):
+                tt = fx.Int32(tt)
+                stamp(f"hcd_{side}", tt, 0)
+                s = tt // HC_TASKS
+                t = tt % HC_TASKS
+                w = src_word(s, t * HC_KSLICE + tid * 2)
+                lds_st(xs, tid, w.bitcast(fx.Float32))
+                x0, x1 = bf2_f32(w)
+                ssq = block_sum(x0 * x0 + x1 * x1)
+                stamp(f"hcd_{side}", tt, 2)
+                gpu.barrier()
+
+                def u_hc(c, t=t):
+                    kc = (wave % HC_WPR) * (HC_NKC // HC_WPR) + c
+                    return unit_bf16(r_fn, wave // HC_WPR, t * HC_NKC + kc, HC_NKC_FULL, kc * 32)
+
+                acc = run_units(u_hc, HC_NKC // HC_WPR, HC_NKC // HC_WPR)
+                reduce_rows(HC_RG, acc, emit_out(HC_ROWS))
+                stamp(f"hcd_{side}", tt, 3)
+                gpu.barrier()
+                base_i = ((s * 2 + sd) * HC_TASKS + t) * HC_VALS
+                if tid < HC_ROWS:
+                    put(mb("hc_d"), base_i + tid, lds_ld(outs, tid))
+                if tid == HC_ROWS:
+                    put(mb("hc_d"), base_i + HC_ROWS, ssq)
+                stamp(f"hcd_{side}", tt, 4)
+
+            # --- reduce the partials, take the RMS scale, run the Sinkhorn
+            for s in range(start(f"hcm_{side}"), S, G):
+                s = fx.Int32(s)
+                stamp(f"hcm_{side}", s, 0)
+                sc0 = ld_f32(r_sb, 0)
+                sc1 = ld_f32(r_sb, 1)
+                sc2 = ld_f32(r_sb, 2)
+                if wave == 0:
+                    j = fx.min(lane, fx.Int32(HC_ROWS))
+                    parts = poll(
+                        [(mb("hc_d"), ((s * 2 + sd) * HC_TASKS + i) * HC_VALS + j, 1) for i in range(HC_TASKS)]
+                    )
+                    tot = fx.Float32(0.0)
+                    for i in range_constexpr(HC_TASKS):
+                        tot = tot + parts[i][0].bitcast(fx.Float32)
+                    lds_st(misc, 8 + lane, tot)
+                stamp(f"hcm_{side}", s, 2)
+                gpu.barrier()
+                rstd = _rsq(lds_ld(misc, 8 + HC_ROWS) * (1.0 / (HC * HIDDEN)) + EPS)
+                if wave == 0:
+                    mix = lds_ld(misc, 8 + fx.min(lane, fx.Int32(HC_MIX - 1))) * rstd
+                    if lane < HC:  # pre and post ride the same lanes
+                        b0 = ld_f32(r_sb, 3 + lane)
+                        pre = _rcp(1.0 + _exp(-(mix * sc0 + b0))) + hc_eps
+                        put(mb("hc_c"), (s * 2 + sd) * HC_COEF + lane, pre)
+                    if lane >= HC and lane < 2 * HC:
+                        b1 = ld_f32(r_sb, 3 + lane)
+                        put(
+                            mb("hc_c"),
+                            (s * 2 + sd) * HC_COEF + lane,
+                            2.0 * _rcp(1.0 + _exp(-(mix * sc1 + b1))),
+                        )
+                    # comb: lane = j * HC + k, so a row is the lanes sharing lane // HC
+                    # and a column the lanes sharing lane % HC -- both reachable by XOR
+                    if lane < HC * HC:
+                        cb = lds_ld(misc, 8 + 2 * HC + lane) * rstd * sc2 + ld_f32(r_sb, 3 + 2 * HC + lane)
+                        rmax = cb
+                        for off in HC_ROW_OFFS:
+                            rmax = _xred(rmax, off, fx.max)
+                        c = _exp(cb - rmax)
+                        rsum = c
+                        for off in HC_ROW_OFFS:
+                            rsum = _xred(rsum, off, lambda a, b: a + b)
+                        c = c * _rcp(rsum) + hc_eps
+                        csum = c
+                        for off in HC_COL_OFFS:
+                            csum = _xred(csum, off, lambda a, b: a + b)
+                        c = c * _rcp(csum + hc_eps)
+                        for _ in range_constexpr(hc_sinkhorn_iters - 1):
+                            rsum = c
+                            for off in HC_ROW_OFFS:
+                                rsum = _xred(rsum, off, lambda a, b: a + b)
+                            c = c * _rcp(rsum + hc_eps)
+                            csum = c
+                            for off in HC_COL_OFFS:
+                                csum = _xred(csum, off, lambda a, b: a + b)
+                            c = c * _rcp(csum + hc_eps)
+                        put(mb("hc_c"), (s * 2 + sd) * HC_COEF + 2 * HC + lane, c)
+                stamp(f"hcm_{side}", s, 4)
+
+        if const_expr(HC > 1):
+            hc_pre_stages(
+                "a",
+                0,
+                hc_attn_fn,
+                hc_attn_sb,
+                lambda s, k: fx.Int32(bo.buffer_load(r_h, (s * HC * HIDDEN + k) // 2, vec_width=1, dtype=T.i32)),
+            )
 
         # ================================================= 1. q_a / kv GEMV
         # 1 row group x (HIDDEN / 64) chunks: 8 waves split K (all prefetched)
@@ -2206,6 +2388,10 @@ def build_dsv4_kernel(
         g_kv: Int64,
         g_post: Int64,
         attn_sink: Int64,
+        hc_attn_fn: Int64,
+        hc_attn_sb: Int64,
+        hc_ffn_fn: Int64,
+        hc_ffn_sb: Int64,
         w_qkv_a: Int64,
         s_qkv_a: Int64,
         w_q_b: Int64,
@@ -2242,6 +2428,10 @@ def build_dsv4_kernel(
             g_kv,
             g_post,
             attn_sink,
+            hc_attn_fn,
+            hc_attn_sb,
+            hc_ffn_fn,
+            hc_ffn_sb,
             w_qkv_a,
             s_qkv_a,
             w_q_b,
@@ -2262,7 +2452,4 @@ def build_dsv4_kernel(
             timeline_buf,
             step,
             rank,
-            layer,
-        ).launch(grid=(G,), block=(THREADS,), stream=stream)
-
-    return launch_dsv4
+   
