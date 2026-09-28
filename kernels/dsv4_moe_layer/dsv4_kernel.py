@@ -1355,7 +1355,16 @@ def build_dsv4_kernel(
             """out[k] = post[k] * x + sum_j comb[j, k] * residual[j], for a row pair.
 
             The residual streams are read once and reused across k, so this costs
-            hc reads rather than hc * hc."""
+            hc reads rather than hc * hc.
+
+            ``v0``/``v1`` arrive as the f32 sum of the peer partials, but the model
+            this reproduces rounds there: its row-parallel projection all-reduces in
+            f32 and returns bf16, so hc_post sees bf16. Keeping f32 here is *more*
+            precise than the reference and shows up as a growing mismatch against it
+            as the rank count rises, so round to match.
+            """
+            v0 = bf16_round(v0)
+            v1 = bf16_round(v1)
             rj = [bf2_f32(res_word(s, j, row)) for j in range_constexpr(HC)]
             for k in range_constexpr(HC):
                 pk = lds_ld(misc, HC_MISC + s * HC_COEF + HC + k)
