@@ -97,6 +97,23 @@ class V4Config:
         return (2 + self.hc_mult) * self.hc_mult
 
     @property
+    def overlap(self) -> bool:
+        """CSA compresses with overlapping windows -- DeepSeek ties that to ratio 4.
+        Each entry then pools 2*ratio tokens at a stride of ratio."""
+        return self.compress_ratio == COMPRESS_CSA
+
+    @property
+    def c_coff(self) -> int:
+        """Channel multiplier on the compressor's projections: overlapping windows
+        carry two halves, one for the previous window and one for the current."""
+        return 2 if self.overlap else 1
+
+    @property
+    def c_rows(self) -> int:
+        """Rows of compressor state: two windows' worth when overlapping."""
+        return self.compress_ratio * self.c_coff
+
+    @property
     def n_compressed(self) -> int:
         """Compressed cache slots. The window and the compressed entries share one
         cache, the compressed half starting at ``window`` -- which is what lets the
@@ -139,14 +156,9 @@ class V4Config:
         return self.head_dim**-0.5
 
     def validate(self) -> None:
-        # The unimplemented piece is CSA: DeepSeek ties the *overlapping* compressor
-        # to compress_ratio == 4 exactly, and that ratio is also the one carrying the
-        # lightning indexer. Any other non-zero ratio takes the same non-overlapping
-        # path as V4's 128, so smaller values are valid stand-ins in tests.
-        assert self.compress_ratio != COMPRESS_CSA, (
-            "CSA (compress_ratio 4) needs the overlapping compressor and the lightning "
-            "indexer, neither of which is implemented"
-        )
+        # NOTE: CSA is gated at the layer (validate_shard), not here. The
+        # overlapping compressor it needs IS modelled, and is tested on its own; what
+        # is missing is the lightning indexer, which only a whole layer needs.
         assert self.compress_ratio == 0 or self.window % self.compress_ratio == 0
         assert self.nope_dim % 64 == 0, "act_quant blocks the nope part by 64"
         assert self.heads % self.o_groups == 0
@@ -159,7 +171,11 @@ def fp8_mats(cfg: V4Config):
         # wq_a, wkv and -- when the layer compresses -- the compressor's own wkv and
         # wgate all read the same normed input, so they fuse into one GEMV rather
         # than costing a second weight stream and another dependency
-        "qkv_a": (cfg.q_lora + cfg.head_dim * (3 if cfg.compress_ratio else 1), cfg.hidden, 128),
+        "qkv_a": (
+            cfg.q_lora + cfg.head_dim + (2 * cfg.c_coff * cfg.head_dim if cfg.compress_ratio else 0),
+            cfg.hidden,
+            128,
+        ),
         "q_b": (cfg.heads * cfg.head_dim, cfg.q_lora, 128),
         "o_a": (cfg.o_groups * cfg.o_lora, cfg.group_dim, 128),
         "o_b": (cfg.hidden, cfg.o_groups * cfg.o_lora, 128),
@@ -207,7 +223,7 @@ def make_weights(
         # The compressor runs in fp32, and is replicated: it consumes the same
         # layer input on every rank.
         r = cfg.compress_ratio
-        t["ape"] = 0.5 * torch.randn(r, cfg.head_dim, generator=rep, device=device)
+        t["ape"] = 0.5 * torch.randn(r, cfg.c_coff * cfg.head_dim, generator=rep, device=device)
         t["g_ckv"] = (1 + 0.1 * torch.randn(cfg.head_dim, generator=rep, device=device)).to(bfl)
 
     if cfg.hc_mult > 1:
@@ -303,7 +319,7 @@ def hc_post(x: torch.Tensor, residual: torch.Tensor, post, comb):
 
 
 def compress_step(kv, score, cur_pos, cfg, t, kv_state, score_state, cache, cos_c, sin_c):
-    """One decode step of the KV compressor (HCA, non-overlapping).
+    """One decode step of the KV compressor.
 
     Every token feeds a rolling window of ``compress_ratio`` positions; only the
     last of each window emits a compressed entry. The pooling weight is a
@@ -311,16 +327,36 @@ def compress_step(kv, score, cur_pos, cfg, t, kv_state, score_state, cache, cos_
     token -- plus a learned absolute-position bias ``ape``. Mutates
     ``kv_state`` / ``score_state`` / ``cache``, as the kernel does. ``kv`` and
     ``score`` come from the fused qkv_a projection.
+
+    When ``cfg.overlap`` (CSA), the windows overlap: each entry pools 2*ratio
+    tokens at a stride of ratio, taking the previous window's overlap channels and
+    the current window's normal ones.
     """
-    r, rd = cfg.compress_ratio, cfg.rope_dim
+    r, rd, d = cfg.compress_ratio, cfg.rope_dim, cfg.head_dim
     kv = kv.float()
     score = score.float() + t["ape"][cur_pos % r]
-    kv_state[cur_pos % r] = kv
-    score_state[cur_pos % r] = score
-    if (cur_pos + 1) % r:
-        return None
-    pooled = (kv_state * score_state.softmax(dim=0)).sum(dim=0)
-    v = rmsnorm(pooled.to(torch.bfloat16), t["g_ckv"], cfg.eps)
+    if cfg.overlap:
+        # the current window fills the second half of the state; the first half
+        # still holds the previous window, and a pooled entry spans both
+        kv_state[r + cur_pos % r] = kv
+        score_state[r + cur_pos % r] = score
+        if (cur_pos + 1) % r:
+            return None
+        ks = torch.cat([kv_state[:r, :d], kv_state[r:, d:]], dim=0)
+        ss = torch.cat([score_state[:r, :d], score_state[r:, d:]], dim=0)
+        pooled = (ks * ss.softmax(dim=0)).sum(dim=0)
+        kv_state[:r] = kv_state[r:]  # the current window becomes the previous one
+        score_state[:r] = score_state[r:]
+    else:
+        kv_state[cur_pos % r] = kv
+        score_state[cur_pos % r] = score
+        if (cur_pos + 1) % r:
+            return None
+        pooled = (kv_state * score_state.softmax(dim=0)).sum(dim=0)
+    # the norm returns bf16 in the model this reproduces, so the RoPE and the FP8
+    # round trip below see bf16 -- keeping fp32 here is more precise than the
+    # reference and shows up as a systematic offset in the compressed entry
+    v = bf(rmsnorm(pooled.to(torch.bfloat16), t["g_ckv"], cfg.eps))
     anchor = cur_pos + 1 - r  # the window's FIRST position carries the rotation
     v = torch.cat([quant_dequant(v[:-rd], 64), rope(v[-rd:], cos_c[anchor], sin_c[anchor])])
     cache[cfg.window + cur_pos // r] = v.to(torch.bfloat16)

@@ -24,6 +24,7 @@ import torch
 from kernels.dsv4_moe_layer.config import MoeMode, moe_format
 from kernels.dsv4_moe_layer.reference import (
     V4Config,
+    compress_step,
     fp8_mats,
     golden_layer,
     layer_idxs,
@@ -346,3 +347,70 @@ def test_v4_hca_compressor_matches_deepseek(steps):
 
     assert compressed_seen >= 2, "the run must cross at least two compression boundaries"
     assert near_ties < steps // 4, f"too many near-ties to have tested much: {near_ties}/{steps}"
+
+
+@pytest.mark.parametrize("ratio", [4, 8])
+def test_v4_compressor_matches_deepseek_directly(ratio):
+    """The compressor alone, against DeepSeek's Compressor module.
+
+    ratio 4 is CSA's OVERLAPPING form -- each entry pools 2*ratio tokens at a
+    stride of ratio, taking the previous window's overlap channels and the
+    current window's normal ones. Tested here in isolation because a whole CSA
+    layer also needs the lightning indexer, which is not implemented.
+    """
+    om = _oracle()
+    device = "cuda"
+    torch.manual_seed(0)
+    cfg = _cfg(hc_mult=1, compress_ratio=ratio, max_seq=256)
+    cfg.compress_ratio = ratio
+    assert cfg.overlap == (ratio == 4), "overlap is tied to ratio 4"
+
+    W = make_weights(rank=0, cfg=cfg, device=device, seed=11, moe_mode=MoeMode.W8A16)
+    t = W.t
+    args = _oracle_args(om, cfg)
+    with torch.device(device):
+        comp = om.Compressor(args, ratio, cfg.head_dim)
+        comp.kv_cache = torch.zeros(1, cfg.n_compressed, cfg.head_dim, device=device)
+        comp.freqs_cis = om.precompute_freqs_cis(cfg.rope_dim, 512, 0, cfg.compress_rope_theta, 1.0, 32, 1)
+    dq = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+    hd, ql, coff = cfg.head_dim, cfg.q_lora, cfg.c_coff
+    with torch.no_grad():
+        comp.wkv.weight.copy_(dq[ql + hd : ql + hd + coff * hd].float())
+        comp.wgate.weight.copy_(dq[ql + hd + coff * hd :].float())
+        comp.ape.copy_(t["ape"].float())
+        comp.norm.weight.copy_(t["g_ckv"].float())
+
+    cos, sin = rope_table(512, theta=cfg.compress_rope_theta, device=device)
+    cache = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device)
+    kv_state = torch.zeros(cfg.c_rows, coff * cfg.head_dim, device=device)
+    # -inf, not zero: with overlapping windows the previous window's rows are not
+    # written before the first emit, and they must drop out of the softmax
+    score_state = torch.full((cfg.c_rows, coff * cfg.head_dim), float("-inf"), device=device)
+
+    emitted = 0
+    for pos in range(6 * ratio):
+        x = (0.5 * torch.randn(1, cfg.hidden, device=device)).to(torch.bfloat16)
+        proj = (x.float() @ dq.float().T)[:, ql + hd :]
+        ours = compress_step(
+            proj[0, : coff * hd],
+            proj[0, coff * hd :],
+            pos,
+            cfg,
+            t,
+            kv_state,
+            score_state,
+            cache,
+            cos,
+            sin,
+        )
+        with torch.device(device):
+            theirs = comp(x.unsqueeze(0), pos)
+        if (pos + 1) % ratio:
+            assert ours is None and theirs is None, f"pos={pos} should emit nothing"
+            continue
+        emitted += 1
+        d = (ours.float() - theirs.reshape(-1).float()).abs().max().item()
+        scale = max(theirs.float().abs().max().item(), 1e-6)
+        assert d < 2e-2 * scale, f"ratio={ratio} pos={pos} compressed entry differs: {d / scale:.5f}"
+
+    assert emitted >= 4, f"expected several compressed entries, got {emitted}"

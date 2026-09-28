@@ -105,9 +105,12 @@ class Dsv4MoeLayer:
         # the compressor carries a rolling window across decode steps, so its state
         # lives here rather than being rebuilt per call
         if cfg.compress_ratio:
-            shape = (cfg.compress_ratio, cfg.head_dim)
+            shape = (cfg.c_rows, cfg.c_coff * cfg.head_dim)
             self.kv_state = torch.zeros(*shape, dtype=torch.float32, device=dev)
-            self.score_state = torch.zeros(*shape, dtype=torch.float32, device=dev)
+            # -inf, not zero: with overlapping windows (CSA) the previous window's
+            # rows are unwritten before the first emit and must drop out of the
+            # softmax. Harmless for the non-overlapping case, which fills them all.
+            self.score_state = torch.full(shape, float("-inf"), dtype=torch.float32, device=dev)
         else:
             self.kv_state = self.score_state = torch.zeros(1, device=dev)
         n_tasks = sum(n for _, n in self.stages)

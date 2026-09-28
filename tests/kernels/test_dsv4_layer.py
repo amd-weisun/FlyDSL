@@ -466,8 +466,9 @@ def test_dsv4_hca_layer_matches_golden(moe_mode):
     cos, sin = rope_table(2048, theta=cfg.compress_rope_theta, device=dev)
     kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     kv_r = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
-    ks = torch.zeros(ratio, cfg.head_dim, device=dev)
-    ss = torch.zeros(ratio, cfg.head_dim, device=dev)
+    ks = torch.zeros(cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev)
+    # -inf like the layer's own state: unwritten rows must drop out of the softmax
+    ss = torch.full((cfg.c_rows, cfg.c_coff * cfg.head_dim), float("-inf"), device=dev)
 
     boundaries = 0
     for pos in range(3 * ratio + 2):
@@ -494,9 +495,13 @@ def test_dsv4_hca_layer_matches_golden(moe_mode):
         if (pos + 1) % ratio == 0:
             boundaries += 1
             slot = cfg.window + pos // ratio
-            # the compressed row is the thing under test, and it should be exact
-            d = (kv_k[slot].float() - kv_r[slot].float()).abs().max().item()
-            assert d == 0.0, f"compressed row at slot {slot} differs by {d}"
+            # The compressed row is the thing under test. Not bit-exact: the kernel
+            # pools with an online softmax on the hardware exp2 while the golden uses
+            # a batch softmax, and the result is rounded to bf16, so they can land a
+            # few ulp apart. A few percent means the pooling itself is right.
+            a_c, b_c = kv_k[slot].float(), kv_r[slot].float()
+            rel = (a_c - b_c).abs().max().item() / max(b_c.abs().max().item(), 1e-6)
+            assert rel < 2e-2, f"compressed row at slot {slot} differs by rel {rel:.5f}"
 
         # Over a long sequential run a near-tie will eventually flip an expert, and
         # with 128 experts and top-6 the 6th/7th margin is crowded enough that

@@ -1696,7 +1696,9 @@ def build_dsv4_kernel(
                     pooled = fx.Float32(res[2]) * _rcp(fx.Float32(res[1]))
                     pooled = bf16_round(pooled)
                     ssq = block_sum(live.select(pooled * pooled, fx.Float32(0.0)))
-                    nv = pooled * _rsq(ssq * (1.0 / HEAD_DIM) + EPS) * g
+                    # the model this reproduces returns bf16 from the norm, so the
+                    # RoPE and FP8 round trip below see bf16
+                    nv = bf16_round(pooled * _rsq(ssq * (1.0 / HEAD_DIM) + EPS) * g)
                     partner = _xshfl(nv, 1)
                     even = tid % 2 == 0
                     rot = even.select(nv * rc - partner * rs, partner * rs + nv * rc)
