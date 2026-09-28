@@ -43,6 +43,10 @@ STAGE_TOL = {
     "mid": 0.02,
 }
 OUT_TOL = 0.02
+# End to end, a single FP8/bf16 rounding flip upstream moves one element a long
+# way, so max-abs is the wrong statistic there -- judge the final hidden state by
+# relative L2, as the MLA kernel's own suite does for x_out_e2e.
+OUT_REL_L2 = 0.05
 
 
 def _cfg():
@@ -159,3 +163,124 @@ def test_dsv4_rejects_head_dim_that_would_deadlock():
 
     with pytest.raises(AssertionError, match="head_dim"):
         build_dsv4_kernel(S=1, heads=8, npes=1, head_dim=128)
+
+
+# ---------------------------------------------------------------- multi-rank TP
+#   python3 tests/kernels/test_dsv4_layer.py --npes 8
+# Routing must agree bit-identically across ranks: every rank sums the peer
+# partials in rank order, so all ranks see the same post-attention hidden state
+# and therefore select the same experts without a second exchange.
+
+TP_SEED = 1234
+
+
+def _tp_cfg(real: bool):
+    return V4Config() if real else _cfg()
+
+
+def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4):
+    import torch.distributed as dist
+
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    dev = torch.device("cuda", rank)
+    torch.cuda.set_device(dev)
+    cfg = _tp_cfg(real)
+    cfg.validate()
+    W = make_weights(rank, cfg=cfg, device=dev, seed=TP_SEED, moe_mode=moe_mode)
+    layer = Dsv4MoeLayer(W, samples=1, rank=rank, npes=npes, group=group, moe_mode=moe_mode)
+    cos, sin = rope_table(4096, theta=cfg.rope_theta, device=dev)
+    gen = torch.Generator(device=dev).manual_seed(TP_SEED + 99)  # identical inputs everywhere
+    kv0 = torch.randn(cfg.window, cfg.head_dim, generator=gen, device=dev).to(torch.bfloat16)
+    pos = cfg.window
+    idx = window_idxs(pos, 1, cfg.window, dev)
+
+    if npes == 1:
+        allreduce = lambda x: x  # noqa: E731
+    else:
+
+        def allreduce(x):
+            # peer_reduce rounds each rank's partial to bf16 before pushing it over
+            # XGMI, and every rank sums the partials in rank order; model both, or
+            # the golden compares exact fp32 sums against 8 rounded ones.
+            x = x.to(torch.bfloat16).float()
+            parts = [torch.empty_like(x.cpu()) for _ in range(npes)]
+            dist.all_gather(parts, x.cpu().contiguous(), group=group)
+            return sum(parts[1:], parts[0]).to(x.device)
+
+    ok = True
+    for _ in range(iters):
+        h = torch.randn(1, cfg.hidden, generator=gen, device=dev).to(torch.bfloat16)
+        cur = torch.tensor([pos], dtype=torch.int32, device=dev)
+        out = layer.forward(h, cur, kv0.clone(), idx, cos, sin)
+        torch.cuda.synchronize()
+        got = layer.intermediates()
+
+        if npes > 1:
+            # every rank must produce the SAME hidden state, bit for bit
+            peers = [torch.empty_like(out.cpu()) for _ in range(npes)]
+            dist.all_gather(peers, out.cpu().contiguous(), group=group)
+            for other in peers[1:]:
+                torch.testing.assert_close(other, peers[0], atol=0, rtol=0)
+            sels = [torch.empty_like(got["sel"].cpu()) for _ in range(npes)]
+            dist.all_gather(sels, got["sel"].cpu().contiguous(), group=group)
+            for other in sels[1:]:
+                torch.testing.assert_close(other, sels[0], atol=0, rtol=0)
+
+        ref = golden_layer(W, h, pos, kv0.clone(), idx, cos, sin, allreduce, moe_mode=moe_mode)
+        for name, tol in STAGE_TOL.items():
+            a = got[name].float().reshape(-1)
+            b = ref[name].float().reshape(-1)
+            rel = (a - b).abs().max().item() / max(b.abs().max().item(), 1e-6)
+            if rel >= tol:
+                print(f"rank {rank}: stage {name} rel {rel:.5f} >= {tol}", flush=True)
+                ok = False
+        if got["sel"].tolist() != ref["sel"].tolist():
+            print(f"rank {rank}: expert selection differs", flush=True)
+            ok = False
+        a_out, b_out = out.float(), ref["x_out"].float()
+        rel_max = (a_out - b_out).abs().max().item() / max(b_out.abs().max().item(), 1e-6)
+        rel_l2 = ((a_out - b_out).norm() / b_out.norm()).item()
+        if rel_l2 >= OUT_REL_L2:
+            print(f"rank {rank}: x_out rel_max {rel_max:.5f}  rel_l2 {rel_l2:.5f}", flush=True)
+            ok = False
+    layer.close()
+    return ok
+
+
+def _worker(rank, npes, real, iters, results):
+    import torch.distributed as dist
+
+    dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29551", rank=rank, world_size=npes)
+    try:
+        results[rank] = run_rank(rank, npes, real=real, iters=iters)
+    finally:
+        dist.destroy_process_group()
+
+
+def run_tp(npes, real=False, iters=2):
+    if npes == 1:
+        return run_rank(0, 1, real=real, iters=iters)
+    import torch.multiprocessing as mp
+
+    results = mp.Manager().dict()
+    mp.spawn(_worker, args=(npes, real, iters, results), nprocs=npes)
+    return all(results[r] for r in range(npes))
+
+
+@pytest.mark.multi_gpu
+def test_dsv4_layer_tp8():
+    if torch.cuda.device_count() < 8:
+        pytest.skip("needs 8 GPUs")
+    assert run_tp(8)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--npes", type=int, default=8)
+    ap.add_argument("--real", action="store_true", help="use the real V4-Pro TP8 shard")
+    ap.add_argument("--iters", type=int, default=2)
+    a = ap.parse_args()
+    print("PASS" if run_tp(a.npes, a.real, a.iters) else "FAIL")
