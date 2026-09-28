@@ -217,8 +217,10 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4,
     cfg.validate()
     W = make_weights(rank, cfg=cfg, device=dev, seed=TP_SEED, moe_mode=moe_mode)
     layer = Dsv4MoeLayer(W, samples=1, rank=rank, npes=npes, group=group, moe_mode=moe_mode)
-    cos, sin = rope_table(4096, theta=cfg.rope_theta, device=dev)
-    cos_c, sin_c = rope_table(4096, theta=cfg.compress_rope_theta, device=dev)
+    # a compressing layer rotates everything on compress_rope_theta, a pure
+    # sliding-window layer on rope_theta -- one table either way
+    theta = cfg.compress_rope_theta if compress_ratio else cfg.rope_theta
+    cos, sin = rope_table(4096, theta=theta, device=dev)
     gen = torch.Generator(device=dev).manual_seed(TP_SEED + 99)  # identical inputs everywhere
     # Without compression each step is independent, so the cache is re-seeded from
     # kv0 every iteration. The compressor carries state across steps, so its run has
@@ -257,7 +259,7 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4,
             boundaries += (pos + 1) % compress_ratio == 0
         cur = torch.tensor([pos], dtype=torch.int32, device=dev)
         kv_in = kv_k if compress_ratio else kv0.clone()
-        out = layer.forward(h, cur, kv_in, idx, cos, sin, cos_c=cos_c, sin_c=sin_c)
+        out = layer.forward(h, cur, kv_in, idx, cos, sin)
         torch.cuda.synchronize()
         got = layer.intermediates()
 
@@ -272,7 +274,7 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4,
             for other in sels[1:]:
                 torch.testing.assert_close(other, sels[0], atol=0, rtol=0)
 
-        gkw = dict(kv_state=ks, score_state=ss, cos_c=cos_c, sin_c=sin_c) if compress_ratio else {}
+        gkw = dict(kv_state=ks, score_state=ss, cos_c=cos, sin_c=sin) if compress_ratio else {}
         ref = golden_layer(
             W,
             h,
@@ -517,10 +519,10 @@ def test_dsv4_hca_layer_matches_golden(moe_mode):
     W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=moe_mode)
     layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=moe_mode)
 
-    cos, sin = rope_table(2048, theta=cfg.rope_theta, device=dev)
-    # the compressor rotates on its own base, so a wrong table here is visible at
-    # every boundary whose anchor is non-zero (anchor 0 is identity in both)
-    cos_c, sin_c = rope_table(2048, theta=cfg.compress_rope_theta, device=dev)
+    # ONE table for the whole layer, on compress_rope_theta: V4 picks the rope base
+    # per LAYER, not per consumer -- a compressing layer rotates its window q/kv on
+    # the same table as its compressed rows.
+    cos, sin = rope_table(2048, theta=cfg.compress_rope_theta, device=dev)
     kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     kv_r = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     ks = torch.zeros(cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev)
@@ -532,7 +534,7 @@ def test_dsv4_hca_layer_matches_golden(moe_mode):
         h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
         cur = torch.tensor([pos], dtype=torch.int32, device=dev)
         idx = layer_idxs(pos, 1, cfg, dev)
-        out = layer.forward(h, cur, kv_k, idx, cos, sin, cos_c=cos_c, sin_c=sin_c)
+        out = layer.forward(h, cur, kv_k, idx, cos, sin)
         torch.cuda.synchronize()
         ref = golden_layer(
             W,
@@ -546,8 +548,8 @@ def test_dsv4_hca_layer_matches_golden(moe_mode):
             moe_mode=moe_mode,
             kv_state=ks,
             score_state=ss,
-            cos_c=cos_c,
-            sin_c=sin_c,
+            cos_c=cos,
+            sin_c=sin,
         )
         if (pos + 1) % ratio == 0:
             boundaries += 1
@@ -616,8 +618,8 @@ def test_dsv4_hca_layer_at_real_dims():
     W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
     layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode)
 
-    cos, sin = rope_table(2048, theta=cfg.rope_theta, device=dev)
-    cos_c, sin_c = rope_table(2048, theta=cfg.compress_rope_theta, device=dev)
+    # one table for the whole layer, on the compressing layer's base
+    cos, sin = rope_table(2048, theta=cfg.compress_rope_theta, device=dev)
     kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     kv_r = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     ks = torch.zeros(cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev)
@@ -631,7 +633,7 @@ def test_dsv4_hca_layer_at_real_dims():
         h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
         cur = torch.tensor([pos], dtype=torch.int32, device=dev)
         idx = layer_idxs(pos, 1, cfg, dev)
-        out = layer.forward(h, cur, kv_k, idx, cos, sin, cos_c=cos_c, sin_c=sin_c)
+        out = layer.forward(h, cur, kv_k, idx, cos, sin)
         torch.cuda.synchronize()
         ref = golden_layer(
             W,
@@ -645,8 +647,8 @@ def test_dsv4_hca_layer_at_real_dims():
             moe_mode=mode,
             kv_state=ks,
             score_state=ss,
-            cos_c=cos_c,
-            sin_c=sin_c,
+            cos_c=cos,
+            sin_c=sin,
         )
         if (pos + 1) % ratio == 0:
             boundaries += 1

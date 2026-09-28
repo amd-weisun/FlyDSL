@@ -684,8 +684,6 @@ def build_dsv4_kernel(
         indices: Int64,
         rope_cos: Int64,
         rope_sin: Int64,
-        crope_cos: Int64,
-        crope_sin: Int64,
         g_in: Int64,
         g_q: Int64,
         g_kv: Int64,
@@ -1672,8 +1670,11 @@ def build_dsv4_kernel(
                 # but the load is unconditional, so clamp it.
                 anchor = fx.max(p + 1 - CR, fx.Int32(0))
                 ri = fx.max(tid - NOPE_DIM, fx.Int32(0)) // 2
-                rc = ld_f32(_rsrc(crope_cos), anchor * (ROPE_DIM // 2) + ri)
-                rs = ld_f32(_rsrc(crope_sin), anchor * (ROPE_DIM // 2) + ri)
+                # One table per layer, indexed at the window's FIRST position: a
+                # compressing layer's table is built on compress_rope_theta (and
+                # YaRN) for EVERYTHING it rotates, not just the compressed rows.
+                rc = ld_f32(_rsrc(rope_cos), anchor * (ROPE_DIM // 2) + ri)
+                rs = ld_f32(_rsrc(rope_sin), anchor * (ROPE_DIM // 2) + ri)
                 kvv = getf(mb("c_kv"), tt * HEAD_DIM + ch)
                 gtv = getf(mb("c_gate"), tt * HEAD_DIM + ch)
                 stamp("cmp", tt, 2)
@@ -2648,8 +2649,6 @@ def build_dsv4_kernel(
         indices: Int64,
         rope_cos: Int64,
         rope_sin: Int64,
-        crope_cos: Int64,
-        crope_sin: Int64,
         g_in: Int64,
         g_q: Int64,
         g_kv: Int64,
@@ -2694,8 +2693,6 @@ def build_dsv4_kernel(
             indices,
             rope_cos,
             rope_sin,
-            crope_cos,
-            crope_sin,
             g_in,
             g_q,
             g_kv,
