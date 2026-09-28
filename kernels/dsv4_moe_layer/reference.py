@@ -214,7 +214,11 @@ def route(scores: torch.Tensor, bias: torch.Tensor, cfg: V4Config):
     n = cfg.n_experts
     bits = (scores.float() + bias.float()).view(torch.int32).long()
     okey = torch.where(bits >= 0, bits ^ (1 << 31), ~bits & 0xFFFFFFFF) & 0xFFFFFFFF
-    key = (okey & 0xFFFFFF00) | (255 - torch.arange(n, device=scores.device))
+    # the id field is sized to the expert count: V4's 384 does not fit the 8 bits
+    # that GLM-5/V3's 256 experts filled exactly
+    id_bits = max(8, (n - 1).bit_length())
+    id_mask = (1 << id_bits) - 1
+    key = (okey & (0xFFFFFFFF ^ id_mask)) | (id_mask - torch.arange(n, device=scores.device))
     idx = torch.argsort(key, descending=True)[: cfg.top_k]
     p = scores[idx]
     return idx, p / p.sum() * cfg.route_scale

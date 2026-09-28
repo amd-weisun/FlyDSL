@@ -436,6 +436,7 @@ def build_dsv4_kernel(
     assert head_dim <= THREADS, "the cache / q_norm stages map one thread per head dim"
     assert (head_dim - ROPE_DIM) % 2 == 0, "interleaved RoPE pairs must align to the nope boundary"
     assert n_experts % 64 == 0, "route_topk packs n_experts // 64 selection keys per lane"
+    assert n_experts <= 1 << 16, "the packed selection key needs room for the score above the id field"
     assert inter % UG_TILE == 0
     # Shadow the module-level fixed-shard constants of the same name with this
     # build's overrides before anything else in this function reads them; every
@@ -498,6 +499,13 @@ def build_dsv4_kernel(
     N_OA = S * O_GROUPS * O_LORA // ROW_TILE
     OA_PER_GROUP = O_LORA // ROW_TILE
     OB_K = O_GROUPS * O_LORA
+    # Packed selection key: the score's order-preserving bits with the low ID_BITS
+    # replaced by ID_MASK - expert id, so keys are unique and near-ties go to the
+    # lower id.  GLM-5/V3's 256 experts fit an 8-bit field exactly (255 - 255 == 0);
+    # V4's 384 would make that term negative and flood the key with ones, so the
+    # field is sized to the expert count.
+    ID_BITS = max(8, (N_EXPERTS - 1).bit_length())
+    ID_MASK = (1 << ID_BITS) - 1
     UG_PER_SLOT = INTER // UG8
     N_UG_TASKS = TOP_K * UG_PER_SLOT
     N_UG = S * MOE_SLOTS * N_UG_PER_SLOT
@@ -1120,7 +1128,8 @@ def build_dsv4_kernel(
             scores landed).
 
             Packed-key argmax: key = order-preserving bits of (score + bias) with the
-            low byte replaced by 255 - expert id (unique; near-ties go to the lower id),
+            low ID_BITS replaced by ID_MASK - expert id (unique; near-ties go to the
+            lower id),
             so each round is one u32 wave max (candidate i of this lane is expert
             lane + 64 i).  V4 has no group-limited routing -- selection is flat over all
             experts.  Returns (expert id, route weight = raw score / sum of the TOP_K
@@ -1136,7 +1145,7 @@ def build_dsv4_kernel(
             for i in range_constexpr(KPL):
                 kb = (raws[i] + bs[i]).bitcast(fx.Int32)
                 ok = (kb >= 0).select(kb ^ fx.Int32(-(2**31)), ~kb)
-                ks.append(fx.Uint32((ok & fx.Int32(-256)) | (255 - (lane + i * 64))))
+                ks.append(fx.Uint32((ok & fx.Int32(-(1 << ID_BITS))) | (ID_MASK - (lane + i * 64))))
             # sort this lane's KPL keys descending; each round then takes the wave max of
             # the lane heads and shifts the winning lane's list (0 is below every key)
             for a, b in _sort_network(KPL):
@@ -1156,7 +1165,7 @@ def build_dsv4_kernel(
                         [],
                     )
                 )
-            e = 255 - (mv & 255)
+            e = ID_MASK - (mv & ID_MASK)
             src = (e % 64) * 4
             got = [fx.Int32(rocdl.ds_bpermute(T.i32, src.ir_value(), r.bitcast(fx.Int32).ir_value())) for r in raws]
             raw = got[0]

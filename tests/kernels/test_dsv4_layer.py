@@ -102,6 +102,48 @@ def test_dsv4_layer_matches_golden(moe_mode):
     assert rel_out < OUT_TOL, f"x_out diverged: rel {rel_out:.5f}"
 
 
+@pytest.mark.large_shape
+def test_dsv4_layer_matches_golden_at_real_dims():
+    """The reduced shard above cannot catch mappings that only break at V4's own
+    numbers -- 384 experts overflowed the selection key's id field, which 256 (and
+    the reduced 128) fit exactly. Keep a real-shard case."""
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    torch.manual_seed(0)
+    cfg = V4Config()  # defaults are DeepSeek-V4-Pro at TP8
+    cfg.validate()
+    dev, S, mode = "cuda", 1, MoeMode.A8W4
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    layer = Dsv4MoeLayer(W, samples=S, rank=0, npes=1, moe_mode=mode)
+
+    h = (0.5 * torch.randn(S, cfg.hidden, device=dev)).bfloat16()
+    pos = cfg.window
+    cur = torch.tensor([pos], dtype=torch.int32, device=dev)
+    kv0 = (0.3 * torch.randn(cfg.window, cfg.head_dim, device=dev)).bfloat16()
+    idx = window_idxs(pos, S, cfg.window, dev)
+    cos, sin = rope_table(4096, theta=cfg.rope_theta, device=dev)
+
+    kv_kernel = kv0.clone()
+    out = layer.forward(h, cur, kv_kernel, idx, cos, sin)
+    torch.cuda.synchronize()
+    got = layer.intermediates()
+    ref = golden_layer(W, h, pos, kv0.clone(), idx, cos, sin, lambda z: z, moe_mode=mode)
+
+    for name, tol in STAGE_TOL.items():
+        a = got[name].float().reshape(-1)
+        b = ref[name].float().reshape(-1)
+        rel = (a - b).abs().max().item() / max(b.abs().max().item(), 1e-6)
+        assert rel < tol, f"stage {name} diverged: rel {rel:.5f} >= {tol}"
+    assert got["sel"].tolist() == ref["sel"].tolist(), "expert selection differs"
+    # an id above 255 is the case the 8-bit key field used to corrupt
+    assert max(got["sel"].reshape(-1).tolist()[1:]) > 255 or cfg.n_experts <= 256
+
+    rel_out = (out.float() - ref["x_out"].float()).abs().max().item() / max(
+        ref["x_out"].float().abs().max().item(), 1e-6
+    )
+    assert rel_out < OUT_TOL, f"x_out diverged: rel {rel_out:.5f}"
+
+
 def test_dsv4_rejects_unsupported_compress_ratio():
     """The KV compressor (HCA) and lightning indexer (CSA) are not implemented yet."""
     from kernels.dsv4_moe_layer.config import COMPRESS_CSA, validate_shard
