@@ -537,6 +537,9 @@ def build_dsv4_kernel(
         assert HC_NKC % HC_WPR == 0, "hc_pre chunks must divide over the waves of a row group"
 
     down_scale_words = 0 if fmt.activation_group is None else S * MOE_SLOTS * INTER // fmt.activation_group
+    # the router and up/gate read the contracted stream, which is a separate
+    # mailbox once hyper-connections widen `a`
+    A_IN = "ain" if hc_mult > 1 else "a"
     HC_MISC = 8 + max(S * XQ_BLOCKS, down_scale_words)
     misc_words = HC_MISC + S * max(HC_COEF, 1)
     H = heads
@@ -1353,6 +1356,22 @@ def build_dsv4_kernel(
                 lds_st(misc, HC_MISC + tid, getf(mb("hc_c"), (s_ * 2 + sd) * HC_COEF + tid % HC_COEF))
             gpu.barrier()
 
+        def hc_post(s, row, v0, v1, res_word, emit):
+            """out[k] = post[k] * x + sum_j comb[j, k] * residual[j], for a row pair.
+
+            The residual streams are read once and reused across k, so this costs
+            hc reads rather than hc * hc."""
+            rj = [bf2_f32(res_word(s, j, row)) for j in range_constexpr(HC)]
+            for k in range_constexpr(HC):
+                pk = lds_ld(misc, HC_MISC + s * HC_COEF + HC + k)
+                o0 = pk * v0
+                o1 = pk * v1
+                for j in range_constexpr(HC):
+                    cjk = lds_ld(misc, HC_MISC + s * HC_COEF + 2 * HC + j * HC + k)
+                    o0 = o0 + cjk * rj[j][0]
+                    o1 = o1 + cjk * rj[j][1]
+                emit(s, k, row, o0, o1)
+
         def hc_pre_stages(side, sd, fn_ptr, sb_ptr, src_word, out_name):
             r_fn = _rsrc(fn_ptr)
             r_sb = _rsrc(sb_ptr)  # [3 scales | HC_MIX bases]
@@ -1486,6 +1505,14 @@ def build_dsv4_kernel(
                 return unit_fp8(r_wqa, r_sqa, t, kc, QA_NKC, HIDDEN, 128, (n_sel() * HIDDEN + kc * 64) // 2)
 
             def ld_h(sks):
+                if const_expr(HC > 1):  # hc_pre already contracted the streams
+                    vals = poll([(mb("xin"), (s * HIDDEN + k) // 2, 2) for s, k in sks])
+                    res = []
+                    for i in range_constexpr(len(sks)):
+                        a0, a1 = bf2_f32(vals[i][0])
+                        b0, b1 = bf2_f32(vals[i][1])
+                        res.append([a0, a1, b0, b1])
+                    return res
                 res = []
                 for s, k in sks:
                     w = fx.Vector(bo.buffer_load(r_h, (s * HIDDEN + k) // 2, vec_width=2, dtype=T.i32))
@@ -1894,13 +1921,41 @@ def build_dsv4_kernel(
                 v = w.bitcast(fx.BFloat16).to(fx.Float32)
                 return v[0], v[1]
 
-            peer_reduce(
-                "attn",
-                t,
-                resid_h,
-                lambda s, row, v0, v1: put_bf(mb("a"), s * HIDDEN + row, [v0, v1]),
-            )
+            if const_expr(HC > 1):
+                hc_stage_coef(0)
+                peer_reduce(
+                    "attn",
+                    t,
+                    None,  # hc_post owns the combination
+                    lambda s, row, v0, v1: hc_post(
+                        s,
+                        row,
+                        v0,
+                        v1,
+                        lambda s_, j, r_: fx.Int32(
+                            bo.buffer_load(r_h, ((s_ * HC + j) * HIDDEN + r_) // 2, vec_width=1, dtype=T.i32)
+                        ),
+                        lambda s_, k, r_, o0, o1: put_bf(mb("a"), (s_ * HC + k) * HIDDEN + r_, [o0, o1]),
+                    ),
+                )
+            else:
+                peer_reduce(
+                    "attn",
+                    t,
+                    resid_h,
+                    lambda s, row, v0, v1: put_bf(mb("a"), s * HIDDEN + row, [v0, v1]),
+                )
             stamp("o_b", t, 4)
+        if const_expr(HC > 1):
+            hc_pre_stages(
+                "f",
+                1,
+                hc_ffn_fn,
+                hc_ffn_sb,
+                lambda s, k: get(mb("a"), (s * HC * HIDDEN + k) // 2),
+                "ain",
+            )
+
         # ====== 8. post-attn RMSNorm -> router scores + this task's FP8 activation blocks
         # One sample per CTA: 1 row group x 96 chunks (bf16), 8 waves split K
         r_wr = _rsrc(w_r)
@@ -1927,7 +1982,7 @@ def build_dsv4_kernel(
             pre = [u_r(c) for c in range(R_CPW)]
             hint_wait(
                 N_ROW_TILES,
-                lambda k: (mb("a"), router_sample * HIDDEN + k * ROW_TILE + ROW_TILE - 1),
+                lambda k: (mb(A_IN), router_sample * HIDDEN + k * ROW_TILE + ROW_TILE - 1),
                 mark=("router", tt),
             )
             # This task's expert-activation block inputs ride along with the staging
@@ -1945,8 +2000,8 @@ def build_dsv4_kernel(
             xa = []
 
             def ld_a(sks):
-                specs = [(mb("a"), (router_sample * HIDDEN + k) // 2, 2) for s, k in sks]
-                specs.append((mb("a"), (x_s * HIDDEN + xk) // 2, 1))
+                specs = [(mb(A_IN), (router_sample * HIDDEN + k) // 2, 2) for s, k in sks]
+                specs.append((mb(A_IN), (x_s * HIDDEN + xk) // 2, 1))
                 v = poll(specs, batch=len(specs))
                 stamp("router", tt, 5, lead=THREADS - 64)
                 xa.append(bf2_f32(v[-1][0]))
@@ -2094,15 +2149,15 @@ def build_dsv4_kernel(
                 # the shared expert's weights do not depend on routing: prefetch them (the
                 # later zero-weight MMAs of the other tasks are cheaper than a branch)
                 pre = [u_ug8(cc, fx.Int32(SHARED_EXPERT), has_sh) for cc in range(UG8_UNITS)]
-                hint_wait(N_ROW_TILES, lambda k: (mb("a"), s_u * HIDDEN + k * ROW_TILE + ROW_TILE - 1), mark=("ug", u))
+                hint_wait(N_ROW_TILES, lambda k: (mb(A_IN), s_u * HIDDEN + k * ROW_TILE + ROW_TILE - 1), mark=("ug", u))
                 # the sum of squares takes the router's element partition and order
                 # (stage_x_rmsnorm, via the same _rmsnorm_tail_ks), so rstd -- and
                 # every FP8 rounding -- is bit-identical
                 nq4_ks, nq4_active = _rmsnorm_tail_ks(HIDDEN)
                 NQ4 = len(nq4_ks)
                 got = poll(
-                    [(mb("a"), (s_u * HIDDEN + k) // 2, 2) for k in nq4_ks]
-                    + [(mb("a"), (s_u * HIDDEN + k) // 2, 1) for k in ks_]
+                    [(mb(A_IN), (s_u * HIDDEN + k) // 2, 2) for k in nq4_ks]
+                    + [(mb(A_IN), (s_u * HIDDEN + k) // 2, 1) for k in ks_]
                 )
                 av = [bf2_f32(w[0]) for w in got[NQ4:]]
                 ss = fx.Float32(0.0)
@@ -2412,7 +2467,28 @@ def build_dsv4_kernel(
                     fx.Vector.from_elements([v0, v1], fx.Float32).to(fx.BFloat16), _rsrc(x_out), s * HIDDEN + row
                 )
 
-            peer_reduce("ffn", t, mb("a"), store_x, tile=DN_TILE)
+            if const_expr(HC > 1):
+                hc_stage_coef(1)
+                peer_reduce(
+                    "ffn",
+                    t,
+                    None,
+                    lambda s, row, v0, v1: hc_post(
+                        s,
+                        row,
+                        v0,
+                        v1,
+                        lambda s_, j, r_: get(mb("a"), ((s_ * HC + j) * HIDDEN + r_) // 2),
+                        lambda s_, k, r_, o0, o1: bo.buffer_store(
+                            fx.Vector.from_elements([o0, o1], fx.Float32).to(fx.BFloat16),
+                            _rsrc(x_out),
+                            (s_ * HC + k) * HIDDEN + r_,
+                        ),
+                    ),
+                    tile=DN_TILE,
+                )
+            else:
+                peer_reduce("ffn", t, mb("a"), store_x, tile=DN_TILE)
             gpu.barrier()
             stamp("down", t, 4)
 

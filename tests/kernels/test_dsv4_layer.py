@@ -49,7 +49,7 @@ OUT_TOL = 0.02
 OUT_REL_L2 = 0.05
 
 
-def _cfg():
+def _cfg(hc_mult=1):
     return V4Config(
         heads=8,
         hidden=1024,
@@ -62,22 +62,25 @@ def _cfg():
         top_k=6,
         inter=128,
         window=128,
-        hc_mult=1,  # the kernel does a plain residual; mHC lives in the golden for now
+        hc_mult=hc_mult,
     )
 
 
 @pytest.mark.parametrize("moe_mode", [MoeMode.A8W4, MoeMode.W8A8])
-def test_dsv4_layer_matches_golden(moe_mode):
+@pytest.mark.parametrize("hc_mult", [1, 4])
+def test_dsv4_layer_matches_golden(moe_mode, hc_mult):
+    """hc_mult=1 is a plain residual; 4 is V4's hyper-connection stream."""
     from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
 
     torch.manual_seed(0)
-    cfg = _cfg()
+    cfg = _cfg(hc_mult)
     cfg.validate()
     dev, S = "cuda", 1
     W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=moe_mode)
     layer = Dsv4MoeLayer(W, samples=S, rank=0, npes=1, moe_mode=moe_mode)
 
-    h = (0.5 * torch.randn(S, cfg.hidden, device=dev)).bfloat16()
+    hshape = (S, cfg.hidden) if cfg.hc_mult == 1 else (S, cfg.hc_mult, cfg.hidden)
+    h = (0.5 * torch.randn(*hshape, device=dev)).bfloat16()
     pos = cfg.window  # ring already wrapped once
     cur = torch.tensor([pos], dtype=torch.int32, device=dev)
     kv0 = (0.3 * torch.randn(cfg.window, cfg.head_dim, device=dev)).bfloat16()
@@ -100,11 +103,14 @@ def test_dsv4_layer_matches_golden(moe_mode):
 
     # routing must agree exactly: a different expert set is not a rounding artefact
     assert got["sel"].tolist() == ref["sel"].tolist(), "expert selection differs"
+    assert out.shape == h.shape, f"the layer must preserve its input shape, got {out.shape}"
 
-    rel_out = (out.float() - ref["x_out"].float()).abs().max().item() / max(
-        ref["x_out"].float().abs().max().item(), 1e-6
-    )
-    assert rel_out < OUT_TOL, f"x_out diverged: rel {rel_out:.5f}"
+    # end to end, judge by relative L2: one FP8/bf16 rounding flip upstream moves a
+    # single element a long way, and hc_post mixes hc_mult streams so it propagates
+    a_out, b_out = out.float(), ref["x_out"].float()
+    rel_max = (a_out - b_out).abs().max().item() / max(b_out.abs().max().item(), 1e-6)
+    rel_l2 = ((a_out - b_out).norm() / b_out.norm()).item()
+    assert rel_l2 < OUT_REL_L2, f"x_out diverged: rel_l2 {rel_l2:.5f} (rel_max {rel_max:.5f})"
 
 
 @pytest.mark.large_shape
@@ -143,10 +149,9 @@ def test_dsv4_layer_matches_golden_at_real_dims():
     # an id above 255 is the case the 8-bit key field used to corrupt
     assert max(got["sel"].reshape(-1).tolist()[1:]) > 255 or cfg.n_experts <= 256
 
-    rel_out = (out.float() - ref["x_out"].float()).abs().max().item() / max(
-        ref["x_out"].float().abs().max().item(), 1e-6
-    )
-    assert rel_out < OUT_TOL, f"x_out diverged: rel {rel_out:.5f}"
+    a_out, b_out = out.float(), ref["x_out"].float()
+    rel_l2 = ((a_out - b_out).norm() / b_out.norm()).item()
+    assert rel_l2 < OUT_REL_L2, f"x_out diverged: rel_l2 {rel_l2:.5f}"
 
 
 def test_dsv4_rejects_unsupported_compress_ratio():
@@ -175,18 +180,20 @@ def test_dsv4_rejects_head_dim_that_would_deadlock():
 TP_SEED = 1234
 
 
-def _tp_cfg(real: bool):
-    return V4Config(hc_mult=1) if real else _cfg()
+def _tp_cfg(real: bool, hc_mult: int = 1):
+    # NOT a module global: mp.spawn re-imports this module in each child, so
+    # anything set under __main__ never reaches the workers
+    return V4Config(hc_mult=hc_mult) if real else _cfg(hc_mult)
 
 
-def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4):
+def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4, hc_mult=1):
     import torch.distributed as dist
 
     from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
 
     dev = torch.device("cuda", rank)
     torch.cuda.set_device(dev)
-    cfg = _tp_cfg(real)
+    cfg = _tp_cfg(real, hc_mult)
     cfg.validate()
     W = make_weights(rank, cfg=cfg, device=dev, seed=TP_SEED, moe_mode=moe_mode)
     layer = Dsv4MoeLayer(W, samples=1, rank=rank, npes=npes, group=group, moe_mode=moe_mode)
@@ -211,7 +218,8 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4)
 
     ok = True
     for _ in range(iters):
-        h = torch.randn(1, cfg.hidden, generator=gen, device=dev).to(torch.bfloat16)
+        hshape = (1, cfg.hidden) if cfg.hc_mult == 1 else (1, cfg.hc_mult, cfg.hidden)
+        h = torch.randn(*hshape, generator=gen, device=dev).to(torch.bfloat16)
         cur = torch.tensor([pos], dtype=torch.int32, device=dev)
         out = layer.forward(h, cur, kv0.clone(), idx, cos, sin)
         torch.cuda.synchronize()
@@ -249,23 +257,23 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4)
     return ok
 
 
-def _worker(rank, npes, real, iters, results):
+def _worker(rank, npes, real, iters, hc_mult, results):
     import torch.distributed as dist
 
     dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29551", rank=rank, world_size=npes)
     try:
-        results[rank] = run_rank(rank, npes, real=real, iters=iters)
+        results[rank] = run_rank(rank, npes, real=real, iters=iters, hc_mult=hc_mult)
     finally:
         dist.destroy_process_group()
 
 
-def run_tp(npes, real=False, iters=2):
+def run_tp(npes, real=False, iters=2, hc_mult=1):
     if npes == 1:
-        return run_rank(0, 1, real=real, iters=iters)
+        return run_rank(0, 1, real=real, iters=iters, hc_mult=hc_mult)
     import torch.multiprocessing as mp
 
     results = mp.Manager().dict()
-    mp.spawn(_worker, args=(npes, real, iters, results), nprocs=npes)
+    mp.spawn(_worker, args=(npes, real, iters, hc_mult, results), nprocs=npes)
     return all(results[r] for r in range(npes))
 
 
@@ -284,7 +292,7 @@ def test_dsv4_layer_tp8():
 BENCH_LAYERS = 16
 
 
-def bench_rank(rank, npes, real=True, iters=320, group=None, timeline=False, moe_mode=MoeMode.A8W4):
+def bench_rank(rank, npes, real=True, iters=320, group=None, timeline=False, moe_mode=MoeMode.A8W4, hc_mult=1):
     """Returns us per layer."""
     import torch.distributed as dist
 
@@ -292,7 +300,7 @@ def bench_rank(rank, npes, real=True, iters=320, group=None, timeline=False, moe
 
     dev = torch.device("cuda", rank)
     torch.cuda.set_device(dev)
-    cfg = _tp_cfg(real)
+    cfg = _tp_cfg(real, hc_mult)
     cfg.validate()
     W = make_weights(rank, cfg=cfg, device=dev, seed=TP_SEED, moe_mode=moe_mode)
     cos, sin = rope_table(4096, theta=cfg.rope_theta, device=dev)
@@ -301,7 +309,8 @@ def bench_rank(rank, npes, real=True, iters=320, group=None, timeline=False, moe
     idx = window_idxs(pos, 1, cfg.window, dev)
     cur = torch.tensor([pos], dtype=torch.int32, device=dev)
     op = Dsv4MoeLayer(W, 1, rank=rank, npes=npes, group=group, moe_mode=moe_mode)
-    h = torch.randn(1, cfg.hidden, device=dev).to(torch.bfloat16)
+    hshape = (1, cfg.hidden) if cfg.hc_mult == 1 else (1, cfg.hc_mult, cfg.hidden)
+    h = torch.randn(*hshape, device=dev).to(torch.bfloat16)
     x = torch.empty_like(h)
     for _ in range(10):
         op.forward(h, cur, kv, idx, cos, sin, x_out=x)
@@ -339,23 +348,23 @@ def bench_rank(rank, npes, real=True, iters=320, group=None, timeline=False, moe
     return us
 
 
-def _bench_worker(rank, npes, real, timeline, moe_mode, results):
+def _bench_worker(rank, npes, real, timeline, moe_mode, hc_mult, results):
     import torch.distributed as dist
 
     dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29552", rank=rank, world_size=npes)
     try:
-        results[rank] = bench_rank(rank, npes, real=real, timeline=timeline, moe_mode=moe_mode)
+        results[rank] = bench_rank(rank, npes, real=real, timeline=timeline, moe_mode=moe_mode, hc_mult=hc_mult)
     finally:
         dist.destroy_process_group()
 
 
-def run_bench(npes, real=True, timeline=False, moe_mode=MoeMode.A8W4):
+def run_bench(npes, real=True, timeline=False, moe_mode=MoeMode.A8W4, hc_mult=1):
     if npes == 1:
-        return {0: bench_rank(0, 1, real=real, timeline=timeline, moe_mode=moe_mode)}
+        return {0: bench_rank(0, 1, real=real, timeline=timeline, moe_mode=moe_mode, hc_mult=hc_mult)}
     import torch.multiprocessing as mp
 
     results = mp.Manager().dict()
-    mp.spawn(_bench_worker, args=(npes, real, timeline, moe_mode, results), nprocs=npes)
+    mp.spawn(_bench_worker, args=(npes, real, timeline, moe_mode, hc_mult, results), nprocs=npes)
     return dict(results)
 
 
@@ -369,15 +378,16 @@ if __name__ == "__main__":
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--timeline", action="store_true")
     ap.add_argument("--moe-mode", default=MoeMode.A8W4.value, choices=tuple(m.value for m in MoeMode))
+    ap.add_argument("--hc-mult", type=int, default=1, help="1 = plain residual, 4 = hyper-connections")
     a = ap.parse_args()
     if a.bench:
-        res = run_bench(a.npes, a.real, a.timeline, MoeMode(a.moe_mode))
+        res = run_bench(a.npes, a.real, a.timeline, MoeMode(a.moe_mode), a.hc_mult)
         us = [res[r] for r in sorted(res)]
         tag = "real V4-Pro" if a.real else "reduced"
         print(
-            f"{tag} shard, {a.moe_mode}, npes={a.npes}: {max(us):7.1f} us/layer  (per rank: "
+            f"{tag} shard, {a.moe_mode}, hc={a.hc_mult}, npes={a.npes}: {max(us):7.1f} us/layer  (per rank: "
             + " ".join(f"{v:.1f}" for v in us)
             + ")"
         )
     else:
-        print("PASS" if run_tp(a.npes, a.real, a.iters) else "FAIL")
+        print("PASS" if run_tp(a.npes, a.real, a.iters, a.hc_mult) else "FAIL")

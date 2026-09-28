@@ -48,12 +48,8 @@ class Dsv4MoeLayer:
     ):
         cfg = W.cfg
         validate_shard(samples, cfg.heads, rank, npes, cfg.window)
-        if cfg.hc_mult != 1:
-            raise NotImplementedError(
-                f"the kernel implements a plain residual (hc_mult == 1), got {cfg.hc_mult}; "
-                "hyper-connections change the layer's I/O contract to [S, hc_mult, hidden] "
-                "and are modelled in the golden only"
-            )
+        if cfg.hc_mult > 1 and cfg.hc_mult & (cfg.hc_mult - 1):
+            raise ValueError(f"hc_mult must be 1 or a power of two, got {cfg.hc_mult}")
         self.moe_mode = as_moe_mode(moe_mode)
         self.W, self.S, self.rank, self.npes = W, samples, rank, npes
         self.window = cfg.window
@@ -75,6 +71,10 @@ class Dsv4MoeLayer:
             o_groups=cfg.o_groups,
             o_lora=cfg.o_lora,
         )
+        # layout() and build_dsv4_kernel() MUST see identical shape arguments: the
+        # host derives scratch offsets and its size from one and the kernel from the
+        # other, so any drift both misreads every mailbox and undersizes the buffer.
+        dims["hc_mult"] = cfg.hc_mult
         self.scr_layout, self.sym_layout = layout(samples, cfg.heads, npes, cfg.window, self.moe_mode, **dims)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
@@ -94,12 +94,11 @@ class Dsv4MoeLayer:
             top_k=cfg.top_k,
             inter=cfg.inter,
             swiglu_limit=cfg.swiglu_limit,
-            hc_mult=cfg.hc_mult,
             hc_sinkhorn_iters=cfg.hc_sinkhorn_iters,
             hc_eps=cfg.hc_eps,
             **dims,
         )
-        self.stages = stage_tasks(samples, cfg.heads, window=cfg.window, **dims)
+        self.stages = stage_tasks(samples, cfg.heads, window=cfg.window, top_k=cfg.top_k, inter=cfg.inter, **dims)
         n_tasks = sum(n for _, n in self.stages)
         self.timeline = torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev) if timeline else None
         self.step = torch.zeros(1, dtype=torch.int32, device=dev)  # decode-step counter
@@ -128,7 +127,10 @@ class Dsv4MoeLayer:
             raise ValueError(f"layer must be in [0, {MAX_LAYERS_PER_STEP}), got {layer}")
         t = dict(self.W.t, **self.packed)
         if x_out is None:
-            x_out = torch.empty(self.S, self.W.cfg.hidden, dtype=torch.bfloat16, device=h.device)
+            shape = (self.S, self.W.cfg.hidden)
+            if self.W.cfg.hc_mult > 1:  # the layer preserves the whole residual stream
+                shape = (self.S, self.W.cfg.hc_mult, self.W.cfg.hidden)
+            x_out = torch.empty(*shape, dtype=torch.bfloat16, device=h.device)
         p = lambda x: x.data_ptr()  # noqa: E731
         self.launch(
             p(h),
@@ -221,7 +223,11 @@ class Dsv4MoeLayer:
             q=self.debug("q", (S, H, cfg.head_dim), bf2=True),
             o=self.debug("o", (S, H, cfg.head_dim), bf2=True),
             o_lora=self.debug("o_lora", (S, cfg.o_groups * cfg.o_lora), bf2=True),
-            a=self.debug("a", (S, cfg.hidden), bf2=True).to(torch.bfloat16),
+            a=self.debug(
+                "a",
+                (S, cfg.hidden) if cfg.hc_mult == 1 else (S, cfg.hc_mult, cfg.hidden),
+                bf2=True,
+            ).to(torch.bfloat16),
             scores=self.debug("scores", (S, cfg.n_experts)),
             sel=self.debug("sel", (S, cfg.top_k + 1), torch.int32),
             prob=self.debug("prob", (S, cfg.top_k + 1)),
