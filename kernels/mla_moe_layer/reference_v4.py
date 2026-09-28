@@ -1,0 +1,374 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 FlyDSL Project Contributors
+
+"""Weights, layouts and the torch golden for the DeepSeek-V4 attention+MoE layer.
+
+One rank's TP shard of one fused layer, matching what the monokernel will fuse.
+DeepSeek-V4 drops MLA's absorbed ``W_UK``/``W_UV`` for shared-KV (MQA) attention:
+``wkv`` emits a single ``head_dim`` vector per token and K and V are the *same*
+tensor, with RoPE occupying its last ``rope_dim`` lanes. The output projection is
+grouped low-rank (``o_a`` per group, then a row-parallel ``o_b``).
+
+This module currently covers the **sliding-window-only** layer (``compress_ratio
+== 0``): the attention rewrite plus the V4 MoE, without the KV compressor or the
+lightning indexer. Those extend :func:`golden_layer_v4` for the HCA (ratio 128)
+and CSA (ratio 4) variants respectively; hyper-connections replace the plain
+residual at that point too (``hc_mult`` > 1).
+
+Quantization mirrors the kernel, not the published checkpoint: every attention
+matrix is row-major FP8 E4M3FN with FP32 block scales, and GEMV activations are
+rounded to bf16 (the MFMA operand precision). ``tests/kernels/`` checks the
+*algorithm* against DeepSeek's own reference implementation separately.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+from kernels.common.mx_formats import quant_dequant_mxfp8, quantize_mxfp4
+from kernels.mla_moe_layer.config import (
+    ExpertActivation,
+    ExpertWeight,
+    MoeMode,
+    as_moe_mode,
+    moe_format,
+)
+from kernels.mla_moe_layer.reference import (
+    _rand_fp8,
+    bf,
+    dequant,
+    dequant_expert,
+    quant_dequant,
+    rope,
+    scale_shape,
+)
+
+
+@dataclass
+class V4Config:
+    """One rank's shard of a DeepSeek-V4 layer. Defaults are V4-Pro at TP8."""
+
+    heads: int = 16  # local; 128 global / 8 ranks
+    hidden: int = 7168
+    q_lora: int = 1536
+    head_dim: int = 512  # K and V share this; rope lives in its tail
+    rope_dim: int = 64
+    o_groups: int = 2  # local; 16 global / 8 ranks
+    o_lora: int = 1024
+    n_experts: int = 384
+    top_k: int = 6
+    inter: int = 384  # local; 3072 global / 8 ranks
+    window: int = 128
+    route_scale: float = 2.5
+    swiglu_limit: float = 10.0
+    eps: float = 1e-6
+    rope_theta: float = 1.0e4
+
+    @property
+    def nope_dim(self) -> int:
+        return self.head_dim - self.rope_dim
+
+    @property
+    def group_dim(self) -> int:
+        """Slice of the concatenated heads that one ``o_a`` group consumes."""
+        return self.heads * self.head_dim // self.o_groups
+
+    @property
+    def shared_expert(self) -> int:
+        """The shared expert sits last in the bank, as in the GLM-5/V3 layout."""
+        return self.n_experts
+
+    @property
+    def softmax_scale(self) -> float:
+        return self.head_dim**-0.5
+
+    def validate(self) -> None:
+        assert self.nope_dim % 64 == 0, "act_quant blocks the nope part by 64"
+        assert self.heads % self.o_groups == 0
+        assert self.head_dim % 2 == 0 and self.rope_dim % 2 == 0
+
+
+def fp8_mats_v4(cfg: V4Config):
+    """(rows, K, BK) of every FP8 attention matrix in one rank's shard."""
+    return {
+        # wq_a and wkv fuse into one GEMV off the same normed input
+        "qkv_a": (cfg.q_lora + cfg.head_dim, cfg.hidden, 128),
+        "q_b": (cfg.heads * cfg.head_dim, cfg.q_lora, 128),
+        "o_a": (cfg.o_groups * cfg.o_lora, cfg.group_dim, 128),
+        "o_b": (cfg.hidden, cfg.o_groups * cfg.o_lora, 128),
+    }
+
+
+@dataclass
+class V4LayerWeights:
+    cfg: V4Config
+    t: dict  # name -> tensor
+
+
+def make_weights_v4(
+    rank: int,
+    cfg: V4Config | None = None,
+    device="cuda",
+    seed: int = 1234,
+    moe_mode: MoeMode | str = MoeMode.A8W4,
+) -> V4LayerWeights:
+    """Replicated tensors share ``seed``; TP shards add ``rank`` to it.
+
+    ``moe_mode`` defaults to A8W4 because V4 ships native MXFP4 expert weights.
+    """
+    cfg = cfg or V4Config()
+    cfg.validate()
+    expert_weight = moe_format(moe_mode).weight
+    rep = torch.Generator(device=device).manual_seed(seed)
+    shd = torch.Generator(device=device).manual_seed(seed + 1 + rank)
+    t = {}
+    bfl = torch.bfloat16
+
+    t["g_in"] = (1 + 0.1 * torch.randn(cfg.hidden, generator=rep, device=device)).to(bfl)
+    t["g_q"] = (1 + 0.1 * torch.randn(cfg.q_lora, generator=rep, device=device)).to(bfl)
+    t["g_kv"] = (1 + 0.1 * torch.randn(cfg.head_dim, generator=rep, device=device)).to(bfl)
+    t["g_post"] = (1 + 0.1 * torch.randn(cfg.hidden, generator=rep, device=device)).to(bfl)
+    # per-head learnable softmax sink, fp32
+    t["attn_sink"] = 0.5 * torch.randn(cfg.heads, generator=shd, device=device)
+
+    for name, (rows, k, bk) in fp8_mats_v4(cfg).items():
+        # qkv_a is replicated (wkv is not TP-sharded in V4); the rest are shards
+        gen = rep if name == "qkv_a" else shd
+        t[f"w_{name}"], t[f"s_{name}"] = _rand_fp8(rows, k, bk, gen, device)
+
+    t["w_r"] = (torch.randn(cfg.n_experts, cfg.hidden, generator=rep, device=device) / cfg.hidden**0.5 * 4).to(bfl)
+    t["bias"] = torch.randn(cfg.n_experts, generator=rep, device=device) * 0.1
+
+    n_bank = cfg.n_experts + 1
+    if expert_weight is ExpertWeight.FP8_BLOCK128:
+        ug_q = torch.empty(n_bank, 2 * cfg.inter, cfg.hidden, dtype=torch.float8_e4m3fn, device=device)
+        ug_s = torch.empty(n_bank, *scale_shape(2 * cfg.inter, cfg.hidden, 128), device=device)
+        dn_q = torch.empty(n_bank, cfg.hidden, cfg.inter, dtype=torch.float8_e4m3fn, device=device)
+        dn_s = torch.empty(n_bank, *scale_shape(cfg.hidden, cfg.inter, 128), device=device)
+        for e in range(n_bank):
+            ug_q[e], ug_s[e] = _rand_fp8(2 * cfg.inter, cfg.hidden, 128, shd, device)
+            dn_q[e], dn_s[e] = _rand_fp8(cfg.hidden, cfg.inter, 128, shd, device)
+    else:
+        ug_q = torch.empty(n_bank, 2 * cfg.inter, cfg.hidden // 2, dtype=torch.uint8, device=device)
+        ug_s = torch.empty(n_bank, 2 * cfg.inter, cfg.hidden // 32, dtype=torch.uint8, device=device)
+        dn_q = torch.empty(n_bank, cfg.hidden, cfg.inter // 2, dtype=torch.uint8, device=device)
+        dn_s = torch.empty(n_bank, cfg.hidden, cfg.inter // 32, dtype=torch.uint8, device=device)
+        for e in range(n_bank):
+            ug = torch.randn(2 * cfg.inter, cfg.hidden, generator=shd, device=device) / cfg.hidden**0.5
+            dn = torch.randn(cfg.hidden, cfg.inter, generator=shd, device=device) / cfg.inter**0.5
+            ug_q[e], ug_s[e] = quantize_mxfp4(ug)
+            dn_q[e], dn_s[e] = quantize_mxfp4(dn)
+    t["w_ug"], t["s_ug"], t["w_dn"], t["s_dn"] = ug_q, ug_s, dn_q, dn_s
+    return V4LayerWeights(cfg, t)
+
+
+def rmsnorm_v4(x: torch.Tensor, g: torch.Tensor | None, eps: float) -> torch.Tensor:
+    """RMSNorm; ``g=None`` is the weightless per-head scale applied to the query."""
+    x = x.float()
+    y = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+    return y if g is None else y * g.float()
+
+
+def window_idxs(cur_pos: int, samples: int, window: int, device) -> torch.Tensor:
+    """Ring-buffer slots for the sliding window, oldest first, -1 where unfilled.
+
+    Mirrors ``get_window_topk_idxs`` in DeepSeek's reference: once the ring is
+    full the slots are a rotation of ``range(window)``; before that they are the
+    written prefix, right-padded with -1.
+    """
+    rows = []
+    for s in range(samples):
+        p = cur_pos + s
+        if p + 1 >= window:
+            start = (p + 1) % window
+            rows.append([(start + i) % window for i in range(window)])
+        else:
+            rows.append(list(range(p + 1)) + [-1] * (window - p - 1))
+    return torch.tensor(rows, dtype=torch.int32, device=device)
+
+
+def route_v4(scores: torch.Tensor, bias: torch.Tensor, cfg: V4Config):
+    """sqrt-softplus scores [E] -> (indices [top_k], probs [top_k]) in score order.
+
+    Flat top-k over all experts: V4 drops V3's group-limited routing. As in the
+    kernel's packed-key argmax, the selection key is the order-preserving bits of
+    the f32 ``score + bias`` with the low byte replaced by ``255 - expert id``, so
+    keys are unique and near-ties go to the lower expert id. The returned weight
+    comes from the *unbiased* score (``noaux_tc``).
+    """
+    n = cfg.n_experts
+    bits = (scores.float() + bias.float()).view(torch.int32).long()
+    okey = torch.where(bits >= 0, bits ^ (1 << 31), ~bits & 0xFFFFFFFF) & 0xFFFFFFFF
+    key = (okey & 0xFFFFFF00) | (255 - torch.arange(n, device=scores.device))
+    idx = torch.argsort(key, descending=True)[: cfg.top_k]
+    p = scores[idx]
+    return idx, p / p.sum() * cfg.route_scale
+
+
+def golden_layer_v4(
+    W: V4LayerWeights,
+    h,
+    cur_pos: int,
+    kv_cache,
+    indices,
+    cos,
+    sin,
+    allreduce,
+    moe_mode: MoeMode | str = MoeMode.A8W4,
+):
+    """One rank's view of a sliding-window-only V4 layer. Mutates ``kv_cache``.
+
+    ``kv_cache`` is a ring of ``cfg.window`` rows of ``head_dim`` (K and V both).
+    ``indices`` [S, n_keys] are ring slots, -1 meaning "not yet written".
+    Returns a dict of intermediates keyed like the kernel's debug scratch.
+    """
+    cfg, t = W.cfg, W.t
+    H, S = cfg.heads, h.shape[0]
+    rd, hd = cfg.rope_dim, cfg.head_dim
+    dq = {n: dequant(t[f"w_{n}"], t[f"s_{n}"], bk) for n, (_, _, bk) in fp8_mats_v4(cfg).items()}
+
+    x = bf(rmsnorm_v4(h, t["g_in"], cfg.eps))
+    qkv = x @ dq["qkv_a"].T
+    q_a, kv = qkv[:, : cfg.q_lora], qkv[:, cfg.q_lora :]
+
+    # query: lora -> per-head, then a weightless RMS over the whole head, then rope
+    q = (bf(rmsnorm_v4(q_a, t["g_q"], cfg.eps)) @ dq["q_b"].T).view(S, H, hd)
+    q = rmsnorm_v4(q, None, cfg.eps)
+    pos = [cur_pos + s for s in range(S)]
+    q = torch.stack(
+        [torch.cat([q[s, :, :-rd], rope(q[s, :, -rd:], cos[pos[s]], sin[pos[s]])], dim=-1) for s in range(S)]
+    )
+
+    # shared KV: one row per token, rope in the tail, nope part FP8 round-tripped
+    for s in range(S):
+        v = rmsnorm_v4(kv[s], t["g_kv"], cfg.eps)
+        v = torch.cat([quant_dequant(v[:-rd], 64), rope(v[-rd:], cos[pos[s]], sin[pos[s]])])
+        kv_cache[pos[s] % cfg.window] = v.to(torch.bfloat16)
+    kvf = kv_cache.float()
+
+    # gather-sparse attention with a per-head sink in the denominator
+    sink = t["attn_sink"].float()
+    o = torch.empty(S, H, hd, device=h.device)
+    for s in range(S):
+        keys = indices[s].long()
+        valid = keys >= 0
+        k = kvf[keys.clamp(min=0)]
+        sc = (bf(q[s]) @ k.T) * cfg.softmax_scale
+        sc = sc.masked_fill(~valid.unsqueeze(0), float("-inf"))
+        # split softmax over 64-key splits: bf16 unnormalized probs feed P V (MFMA)
+        ms, ls, accs = [], [], []
+        for k0 in range(0, keys.numel(), 64):
+            scs = sc[:, k0 : k0 + 64]
+            m = scs.amax(-1, keepdim=True)
+            m = torch.where(torch.isneginf(m), torch.zeros_like(m), m)
+            p = torch.exp(scs - m)
+            ms.append(m)
+            ls.append(p.sum(-1, keepdim=True))
+            accs.append(bf(p) @ k[k0 : k0 + 64])
+        mx = torch.stack(ms).amax(0)
+        w = [torch.exp(m - mx) for m in ms]
+        denom = sum(li * wi for li, wi in zip(ls, w)) + torch.exp(sink.unsqueeze(-1) - mx)
+        o[s] = sum(a * wi for a, wi in zip(accs, w)) / denom
+
+    # V shares the RoPE'd K, so the output has to be de-rotated
+    o = torch.stack(
+        [torch.cat([o[s, :, :-rd], rope(o[s, :, -rd:], cos[pos[s]], sin[pos[s]], True)], dim=-1) for s in range(S)]
+    )
+
+    # grouped low-rank output projection: per-group o_a, then a row-parallel o_b
+    og = bf(o).reshape(S, cfg.o_groups, cfg.group_dim)
+    wa = dq["o_a"].view(cfg.o_groups, cfg.o_lora, cfg.group_dim)
+    o_lora = torch.einsum("sgd,grd->sgr", og, wa).reshape(S, cfg.o_groups * cfg.o_lora)
+    a = (h.float() + allreduce(bf(o_lora) @ dq["o_b"].T)).to(torch.bfloat16)
+
+    moe = golden_moe_v4(W, a, allreduce, moe_mode=moe_mode)
+    res = dict(q_a=q_a, kv=kv, q=q, o=o, o_lora=o_lora, a=a)
+    res.update(moe)
+    return res
+
+
+def golden_moe_v4(
+    W: V4LayerWeights,
+    a,
+    allreduce,
+    mid=None,
+    sel=None,
+    prob=None,
+    xq=None,
+    hash_ids=None,
+    moe_mode: MoeMode | str = MoeMode.A8W4,
+):
+    """MoE half from the post-attention hidden state ``a`` [S, hidden] (bf16).
+
+    ``xq`` overrides the quant-dequantized activation and ``mid``/``sel``/``prob``
+    the down-projection inputs, so each stage can be checked from the kernel's own
+    inputs. ``hash_ids`` [S, top_k] replaces scored routing with V4's hash routing
+    (the first ``num_hash_layers`` layers look expert ids up by token id).
+    """
+    cfg, t = W.cfg, W.t
+    mode = as_moe_mode(moe_mode)
+    fmt = moe_format(mode)
+    S = a.shape[0]
+    out = {k: [] for k in ("sel", "prob", "mid")}
+
+    x2 = rmsnorm_v4(a, t["g_post"], cfg.eps)
+    # V4 scores with sqrt(softplus(.)) instead of V3/GLM-5's sigmoid
+    scores = torch.nn.functional.softplus(bf(x2) @ t["w_r"].float().T).sqrt()
+
+    if fmt.activation is ExpertActivation.FP8_BLOCK128:
+        xq_ref = quant_dequant(x2)
+    elif fmt.activation is ExpertActivation.MXFP8_BLOCK32:
+        xq_ref = quant_dequant_mxfp8(x2)
+    else:
+        xq_ref = bf(x2)
+    xq = xq_ref if xq is None else xq.float()
+
+    lim = cfg.swiglu_limit
+    y = torch.zeros(S, cfg.hidden, device=a.device)
+    for s in range(S):
+        if hash_ids is None:
+            idx, p = route_v4(scores[s], t["bias"], cfg)
+        else:
+            idx = hash_ids[s].long()
+            raw = scores[s][idx]
+            p = raw / raw.sum() * cfg.route_scale
+        experts = [cfg.shared_expert] + idx.tolist()
+        weights = [1.0] + p.tolist()
+        mids = []
+        for e in experts:
+            ug = dequant_expert(t["w_ug"][e], t["s_ug"][e], fmt.weight) @ xq[s]
+            gate, up = ug[: cfg.inter], ug[cfg.inter :]
+            if lim > 0:
+                # note the asymmetry: up is clamped both sides, gate only above
+                gate = gate.clamp(max=lim)
+                up = up.clamp(min=-lim, max=lim)
+            value = torch.nn.functional.silu(gate) * up
+            mids.append(bf(value) if fmt.activation is ExpertActivation.BF16 else value)
+        out["sel"].append(torch.tensor(experts, device=a.device, dtype=torch.int32))
+        out["prob"].append(torch.tensor(weights, device=a.device))
+        out["mid"].append(torch.stack(mids))
+
+    for s in range(S):
+        experts = out["sel"][s].tolist() if sel is None else sel[s].tolist()
+        weights = out["prob"][s].tolist() if prob is None else prob[s].tolist()
+        for j, (e, wgt) in enumerate(zip(experts, weights)):
+            m = out["mid"][s][j] if mid is None else mid[s, j].float()
+            if fmt.activation is ExpertActivation.FP8_BLOCK128:
+                activation = quant_dequant(m)
+            elif fmt.activation is ExpertActivation.MXFP8_BLOCK32:
+                activation = quant_dequant_mxfp8(m)
+            else:
+                activation = bf(m)
+            y[s] += wgt * (dequant_expert(t["w_dn"][e], t["s_dn"][e], fmt.weight) @ activation)
+
+    x_out = (a.float() + allreduce(y)).to(torch.bfloat16)
+    return dict(
+        scores=scores,
+        xq=xq_ref,
+        x_out=x_out,
+        sel=torch.stack(out["sel"]),
+        prob=torch.stack(out["prob"]),
+        mid=torch.stack(out["mid"]),
+    )

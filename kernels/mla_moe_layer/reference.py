@@ -152,12 +152,17 @@ def rmsnorm(x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
     return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + EPS) * g.float()
 
 
-def rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """Interleaved pairs (2i, 2i+1); ``x`` [..., 64], ``cos``/``sin`` [32]."""
+def rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+    """Interleaved pairs (2i, 2i+1); ``x`` [..., 64], ``cos``/``sin`` [32].
+
+    ``inverse`` de-rotates (the conjugate rotation), which DeepSeek-V4 needs on
+    the attention output because there V shares the RoPE'd K.
+    """
     x0, x1 = x[..., 0::2], x[..., 1::2]
     out = torch.empty_like(x)
-    out[..., 0::2] = x0 * cos - x1 * sin
-    out[..., 1::2] = x0 * sin + x1 * cos
+    s = -sin if inverse else sin
+    out[..., 0::2] = x0 * cos - x1 * s
+    out[..., 1::2] = x0 * s + x1 * cos
     return out
 
 
