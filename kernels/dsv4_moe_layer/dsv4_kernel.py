@@ -174,6 +174,7 @@ def layout(
     n_keys: int | None = None,
     c_coff: int = 1,
     index_head_dim: int = 0,
+    index_heads: int = 0,
 ):
     """Byte offsets of the per-rank scratch and of the symmetric buffer.
 
@@ -208,6 +209,9 @@ def layout(
         ("cnew", S * head_dim * pr if compress_ratio else pr),
         ("kvnew", S * head_dim * pr),  # this launch's KV ring rows (bf16 values)
         ("q_raw", S * heads * head_dim * pr),  # q_b output, before the per-head RMS
+        # the indexer's query, raw then rotated/rotated-into-Hadamard/FP4
+        ("i_q_raw", S * index_heads * index_head_dim * pr if index_head_dim else pr),
+        ("i_q", S * index_heads * index_head_dim * pr if index_head_dim else pr),
         ("q", S * heads * head_dim * pr),  # full per-head query: rope is inside it
         ("sp_acc", S * n_split * heads * head_dim * pr),
         ("sp_m", S * n_split * heads * pr),
@@ -448,6 +452,7 @@ def stage_tasks(
     n_keys: int | None = None,
     c_coff: int = 1,
     index_head_dim: int = 0,
+    index_heads: int = 0,
 ):
     """[(stage name, task count)] in execution order.
 
@@ -468,6 +473,9 @@ def stage_tasks(
         ("i_cmp", S if index_head_dim else 0),
         ("q_b", heads * head_dim // Q_B_TILE),
         ("q_norm", S * heads),
+        # the indexer's query, and its rope / rotation / FP4 tail
+        ("i_q_b", index_heads * index_head_dim // Q_B_TILE if index_head_dim else 0),
+        ("i_q", S if index_head_dim else 0),
         ("split", S * ((window if n_keys is None else n_keys) // SPLIT_KEYS)),
         ("uv", S * (heads * head_dim // UV_TILE)),
         ("o_a", S * o_groups * o_lora // ROW_TILE),
@@ -509,6 +517,7 @@ def build_dsv4_kernel(
     n_keys: int | None = None,
     c_coff: int = 1,
     index_head_dim: int = 0,
+    index_heads: int = 0,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole V4 layer.
 
@@ -654,11 +663,20 @@ def build_dsv4_kernel(
         n_keys=N_KEYS,
         c_coff=C_COFF,
         index_head_dim=IHD,
+        index_heads=index_heads,
     )
     assert N_KEYS % SPLIT_KEYS == 0, "the index list must be a whole number of key tiles"
     N_SPLIT = N_KEYS // SPLIT_KEYS
     N_QB = H * HEAD_DIM // Q_B_TILE
     QB_PER_HEAD = HEAD_DIM // Q_B_TILE
+    # the indexer's query: its own per-head projection off the SAME normed q_lora
+    IH = index_heads if IHD else 0
+    N_IQB = IH * IHD // Q_B_TILE
+    IQB_PER_HEAD = IHD // Q_B_TILE if IHD else 0
+    if IHD:
+        assert IHD == 128, "the indexer's Hadamard is written for a 128-wide head"
+        assert IH % WAVES == 0, "one wave takes a whole index head"
+        assert IHD - ROPE_DIM == 64, "rope must fall entirely in the head's second half"
     N_UV = H * HEAD_DIM // UV_TILE
     UV_PER_HEAD = HEAD_DIM // UV_TILE
     OA_K = H * HEAD_DIM // O_GROUPS  # one group's slice of the concatenated heads
@@ -707,6 +725,7 @@ def build_dsv4_kernel(
         n_keys=N_KEYS,
         c_coff=C_COFF,
         index_head_dim=IHD,
+        index_heads=index_heads,
     )
     base, first, acc = {}, {}, 0
     for name, n in stage_tasks(S, H, **st_args):
@@ -726,6 +745,8 @@ def build_dsv4_kernel(
         "split",
         "q_b",
         "q_norm",
+        "i_q_b",
+        "i_q",
         "uv",
         "o_a",
         "o_b",
@@ -779,6 +800,8 @@ def build_dsv4_kernel(
         s_qkv_a: Int64,
         w_q_b: Int64,
         s_q_b: Int64,
+        w_i_q_b: Int64,
+        s_i_q_b: Int64,
         w_o_a: Int64,
         s_o_a: Int64,
         w_o_b: Int64,
@@ -1821,6 +1844,36 @@ def build_dsv4_kernel(
                                     bo.buffer_store(ld_f32(r_scst, (CR + i) * CW + o), r_scst, i * CW + o)
                 stamp("cmp", tt, 4)
 
+        def had_pair(v0, v1, ln):
+            """FWHT over IHD channels held two per lane, scaled by IHD**-0.5.
+
+            Lane ln owns channels ln and ln + 64, so every butterfly below stride 64
+            is an xor shuffle inside the wave and the stride-64 one is the pair
+            this lane already holds -- no LDS, no barrier.
+            """
+            # an explicit sequence, NOT `while h < 64`: a Python while over a
+            # value the tracer can see becomes a device scf.while, and the
+            # shuffle offset then stops being a compile-time constant
+            for h in range_constexpr(6):
+                st = 1 << h
+                p0, p1 = _xshfl(v0, st), _xshfl(v1, st)
+                hi = (ln & st) != 0
+                v0 = hi.select(p0 - v0, v0 + p0)
+                v1 = hi.select(p1 - v1, v1 + p1)
+            v0, v1 = v0 + v1, v0 - v1
+            sc = float(IHD) ** -0.5
+            return v0 * sc, v1 * sc
+
+        def fp4_block(v):
+            """FP4 round trip over aligned 32-lane blocks, power-of-two scale."""
+            amax = fmath.absf(v)
+            for off in (16, 8, 4, 2, 1):
+                amax = _xred(amax, off, fx.max)
+            sc = _pow2_ceil(fx.max(amax, fx.Float32(FP4_MAX * 2.0**-126)) * (1.0 / FP4_MAX))
+            q = fx.min(fx.max(v * _rcp(sc), -FP4_MAX), FP4_MAX)
+            d, _ = _fp4_roundtrip(q, fx.Float32(0.0))
+            return d * sc
+
         # ========== 2c. the indexer's compressor: same pooling, different tail
         # Half the head_dim, and it finishes with a Hadamard rotation over the whole
         # row followed by FP4 instead of FP8 over the nope part. The rotation is what
@@ -1830,36 +1883,6 @@ def build_dsv4_kernel(
         if const_expr(IHD):
             r_ikvst = _rsrc(i_kv_state)
             r_iscst = _rsrc(i_score_state)
-
-            def had_pair(v0, v1, ln):
-                """FWHT over IHD channels held two per lane, scaled by IHD**-0.5.
-
-                Lane ln owns channels ln and ln + 64, so every butterfly below stride 64
-                is an xor shuffle inside the wave and the stride-64 one is the pair
-                this lane already holds -- no LDS, no barrier.
-                """
-                # an explicit sequence, NOT `while h < 64`: a Python while over a
-                # value the tracer can see becomes a device scf.while, and the
-                # shuffle offset then stops being a compile-time constant
-                for h in range_constexpr(6):
-                    st = 1 << h
-                    p0, p1 = _xshfl(v0, st), _xshfl(v1, st)
-                    hi = (ln & st) != 0
-                    v0 = hi.select(p0 - v0, v0 + p0)
-                    v1 = hi.select(p1 - v1, v1 + p1)
-                v0, v1 = v0 + v1, v0 - v1
-                sc = float(IHD) ** -0.5
-                return v0 * sc, v1 * sc
-
-            def fp4_block(v):
-                """FP4 round trip over aligned 32-lane blocks, power-of-two scale."""
-                amax = fmath.absf(v)
-                for off in (16, 8, 4, 2, 1):
-                    amax = _xred(amax, off, fx.max)
-                sc = _pow2_ceil(fx.max(amax, fx.Float32(FP4_MAX * 2.0**-126)) * (1.0 / FP4_MAX))
-                q = fx.min(fx.max(v * _rcp(sc), -FP4_MAX), FP4_MAX)
-                d, _ = _fp4_roundtrip(q, fx.Float32(0.0))
-                return d * sc
 
             for tt in range(start("i_cmp"), S, G):
                 tt = fx.Int32(tt)
@@ -1974,6 +1997,72 @@ def build_dsv4_kernel(
                 r = tid % Q_B_TILE
                 put(mb("q_raw"), (s * H + head) * HEAD_DIM + hoff + r, lds_ld(outs, tid))
             stamp("q_b", t, 4)
+
+        # ========= 3b. the indexer's query: its own per-head projection off q_a
+        # Same normed q_lora the main q_b reads, so this is a second weight stream
+        # but no second dependency. NOTE there is no per-head RMS here -- the
+        # indexer's query is rotated and quantized, not normalised.
+        if const_expr(IHD):
+            r_wiqb, r_siqb = _rsrc(w_i_q_b), _rsrc(s_i_q_b)
+            IQB_NKC = Q_LORA // 64
+            for t in range(start("i_q_b"), N_IQB, G):
+                t = fx.Int32(t)
+                stamp("i_q_b", t, 0)
+
+                def u_iqb(c):
+                    kc = wave * (IQB_NKC // WAVES) + c
+                    return unit_fp8(r_wiqb, r_siqb, t, kc, IQB_NKC, Q_LORA, 128, (n_sel() * Q_LORA + kc * 64) // 2)
+
+                pre = [u_iqb(c) for c in range(IQB_NKC // WAVES)]
+                hint_wait(
+                    Q_LORA // QKV_A_TILE,
+                    lambda k: (mb("q_a"), (S - 1) * Q_LORA + k * QKV_A_TILE + QKV_A_TILE - 1),
+                    mark=("i_q_b", t),
+                )
+
+                def ld_iqa(sks):
+                    v = get2_many([(mb("q_a"), s * Q_LORA + k + j) for s, k in sks for j in (0, 2)])
+                    return [list(v[2 * i]) + list(v[2 * i + 1]) for i in range(len(sks))]
+
+                stage_x_rmsnorm(ld_iqa, Q_LORA, g_q)
+                stamp("i_q_b", t, 2)
+                gpu.barrier()
+                acc = run_units(u_iqb, IQB_NKC // WAVES, IQB_NKC // WAVES, pre)
+                reduce_rows(1, acc, emit_out(Q_B_TILE))
+                stamp("i_q_b", t, 3)
+                gpu.barrier()
+                ihead = t // IQB_PER_HEAD
+                ihoff = (t % IQB_PER_HEAD) * Q_B_TILE
+                if tid < S * Q_B_TILE:
+                    s = tid // Q_B_TILE
+                    r = tid % Q_B_TILE
+                    put(mb("i_q_raw"), (s * IH + ihead) * IHD + ihoff + r, lds_ld(outs, tid))
+                stamp("i_q_b", t, 4)
+
+            # ---- rope -> Hadamard -> FP4, one whole index head per wave
+            # The rotation has to see the rope'd lanes, and the Hadamard mixes the
+            # whole head, so this cannot ride in a 16-row tile either.
+            for tt in range(start("i_q"), S, G):
+                tt = fx.Int32(tt)
+                stamp("i_q", tt, 0)
+                ln = lane
+                chs = [ln, ln + 64]
+                rc = ld_f32(_rsrc(rope_cos), (pos0 + tt) * (ROPE_DIM // 2) + ln // 2)
+                rs2 = ld_f32(_rsrc(rope_sin), (pos0 + tt) * (ROPE_DIM // 2) + ln // 2)
+                for k in range_constexpr(IH // WAVES):
+                    ihead = wave + k * WAVES
+                    base_i = (tt * IH + ihead) * IHD
+                    v = [getf(mb("i_q_raw"), base_i + c) for c in chs]
+                    # rope falls entirely in the head's second half (IHD - ROPE_DIM == 64)
+                    partner = _xshfl(v[1], 1)
+                    even = ln % 2 == 0
+                    v[1] = bf16_round(even.select(v[1] * rc - partner * rs2, partner * rs2 + v[1] * rc))
+                    v[0] = bf16_round(v[0])
+                    h0, h1 = had_pair(v[0], v[1], ln)
+                    o0, o1 = fp4_block(bf16_round(h0)), fp4_block(bf16_round(h1))
+                    put(mb("i_q"), base_i + chs[0], o0)
+                    put(mb("i_q"), base_i + chs[1], o1)
+                stamp("i_q", tt, 4)
 
         # ============== 4. per-head query RMS (no weight) + RoPE -> bf16 query
         # V4 scales each head's whole HEAD_DIM query by rsqrt(mean(q^2) + eps) before
@@ -2887,6 +2976,8 @@ def build_dsv4_kernel(
         s_qkv_a: Int64,
         w_q_b: Int64,
         s_q_b: Int64,
+        w_i_q_b: Int64,
+        s_i_q_b: Int64,
         w_o_a: Int64,
         s_o_a: Int64,
         w_o_b: Int64,
@@ -2936,6 +3027,8 @@ def build_dsv4_kernel(
             s_qkv_a,
             w_q_b,
             s_q_b,
+            w_i_q_b,
+            s_i_q_b,
             w_o_a,
             s_o_a,
             w_o_b,

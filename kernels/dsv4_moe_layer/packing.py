@@ -19,6 +19,8 @@ from kernels.mla_moe_layer.packing import pack_bf16, pack_fp8, pack_mxfp4
 __all__ = ["pack_bf16", "pack_fp8", "pack_mxfp4", "pack_layer_weights"]
 
 ATTENTION_NAMES = ("w_qkv_a", "w_q_b", "w_o_a", "w_o_b")
+# the indexer's query projection, present only on a CSA layer
+OPTIONAL_ATTENTION_NAMES = ("w_i_q_b",)
 EXPERT_NAMES = ("w_ug", "w_dn")
 # hyper-connection mixers: bf16, K = hc_mult * hidden, rows already padded
 HC_NAMES = ("hc_attn_fn", "hc_ffn_fn")
@@ -33,6 +35,7 @@ def pack_layer_weights(
     if missing:
         raise ValueError(f"missing layer weights: {', '.join(missing)}")
     packed = {name: pack_fp8(tensors[name]) for name in ATTENTION_NAMES}
+    packed.update({name: pack_fp8(tensors[name]) for name in OPTIONAL_ATTENTION_NAMES if name in tensors})
     weight = moe_format(moe_mode).weight
     pack_expert = pack_mxfp4 if weight is ExpertWeight.MXFP4_BLOCK32 else pack_fp8
     packed.update({name: pack_expert(tensors[name]) for name in EXPERT_NAMES})

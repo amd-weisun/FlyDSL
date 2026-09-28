@@ -89,6 +89,7 @@ def validate_shard(
     npes: int,
     window: int = WINDOW,
     compress_ratio: int = COMPRESS_SWA,
+    allow_unindexed_csa: bool = False,
 ) -> None:
     """Validate the V4 shard contract before allocating GPU buffers."""
 
@@ -102,9 +103,16 @@ def validate_shard(
         raise ValueError(f"rank must be in [0, {npes}), got {rank}")
     if window <= 0 or window % 64:
         raise ValueError(f"window must be a positive multiple of 64, got {window}")
-    # NOTE: compress_ratio 4 builds CSA's overlapping compressor, but the kernel
-    # does NOT yet run the lightning indexer -- it gathers whatever index list the
-    # caller passes, as it does at every other ratio. That is a valid kernel
-    # configuration; it is not V4's CSA, whose compressed indices are *chosen* from
-    # scores computed inside the layer. Until the indexer lands, a caller wanting
-    # real CSA has to supply the selection itself (reference.indexer_step does it).
+    # compress_ratio 4 builds CSA's overlapping compressor and the indexer's, but
+    # the kernel does not yet run the indexer's SELECTION -- it gathers whatever
+    # index list the caller passes, as it does at every other ratio. That is a
+    # valid kernel configuration and it is not V4's CSA, whose compressed indices
+    # are chosen from scores computed inside the layer. Asking for it has to be
+    # deliberate, so that nobody gets non-V4 semantics by picking a ratio.
+    if compress_ratio == COMPRESS_CSA and not allow_unindexed_csa:
+        raise ValueError(
+            "CSA (compress_ratio 4) needs the lightning indexer to choose its "
+            "compressed keys, and the kernel does not run it yet. Its compressor "
+            "does work: pass allow_unindexed_csa=True to build the layer anyway "
+            "and supply the selection yourself (reference.indexer_step computes it)."
+        )

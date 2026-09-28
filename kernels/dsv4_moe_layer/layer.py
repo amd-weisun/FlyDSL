@@ -45,9 +45,10 @@ class Dsv4MoeLayer:
         group=None,
         timeline: bool = False,
         moe_mode: MoeMode | str = MoeMode.A8W4,
+        allow_unindexed_csa: bool = False,
     ):
         cfg = W.cfg
-        validate_shard(samples, cfg.heads, rank, npes, cfg.window, cfg.compress_ratio)
+        validate_shard(samples, cfg.heads, rank, npes, cfg.window, cfg.compress_ratio, allow_unindexed_csa)
         if cfg.hc_mult > 1 and cfg.hc_mult & (cfg.hc_mult - 1):
             raise ValueError(f"hc_mult must be 1 or a power of two, got {cfg.hc_mult}")
         self.moe_mode = as_moe_mode(moe_mode)
@@ -90,6 +91,7 @@ class Dsv4MoeLayer:
         dims["c_coff"] = cfg.c_coff
         # 0 means "no indexer"; only CSA runs one
         dims["index_head_dim"] = cfg.index_head_dim if cfg.indexed else 0
+        dims["index_heads"] = cfg.index_heads if cfg.indexed else 0
         self.scr_layout, self.sym_layout = layout(samples, cfg.heads, npes, cfg.window, self.moe_mode, **dims)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
@@ -197,6 +199,8 @@ class Dsv4MoeLayer:
             p(t["s_qkv_a"]),
             p(t["w_q_b"]),
             p(t["s_q_b"]),
+            p(t["w_i_q_b"]) if "w_i_q_b" in t else 0,
+            p(t["s_i_q_b"]) if "s_i_q_b" in t else 0,
             p(t["w_o_a"]),
             p(t["s_o_a"]),
             p(t["w_o_b"]),

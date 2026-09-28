@@ -185,7 +185,10 @@ def test_dsv4_csa_shape_is_the_selected_one():
     """
     from kernels.dsv4_moe_layer.config import COMPRESS_CSA, validate_shard
 
-    validate_shard(1, 16, 0, 8, compress_ratio=COMPRESS_CSA)  # no longer refused
+    # refused by default: nobody should get non-V4 semantics by picking a ratio
+    with pytest.raises(ValueError, match="lightning indexer"):
+        validate_shard(1, 16, 0, 8, compress_ratio=COMPRESS_CSA)
+    validate_shard(1, 16, 0, 8, compress_ratio=COMPRESS_CSA, allow_unindexed_csa=True)
 
     csa = V4Config(hc_mult=1, compress_ratio=COMPRESS_CSA, max_seq=4096)
     assert csa.indexed and csa.overlap and csa.c_coff == 2
@@ -759,7 +762,7 @@ def test_dsv4_csa_compressor_in_kernel():
     W, t = None, None
     W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
     t = W.t
-    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode)
+    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
 
     cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
     kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
@@ -833,7 +836,7 @@ def test_dsv4_indexer_compressor_in_kernel():
     ihd, dev, mode = cfg.index_head_dim, "cuda", MoeMode.W8A8
     W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
     t = W.t
-    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode)
+    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
 
     cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
     kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
@@ -884,3 +887,53 @@ def test_dsv4_indexer_compressor_in_kernel():
         assert rel_l2 < 1e-2, f"pos={pos} indexer compressed row rel_l2 {rel_l2:.5f}"
 
     assert emitted >= 4, f"expected several compressed entries, got {emitted}"
+
+
+def test_dsv4_indexer_query_in_kernel():
+    """The indexer's QUERY path in the kernel: projection, RoPE, Hadamard, FP4.
+
+    Unlike the main query there is no per-head RMS -- the indexer's query is
+    rotated and quantized, not normalised. The golden side is spelled out here
+    rather than calling indexer_step, because that also runs the compressor and
+    the scoring; what is under test is only the query.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+    from kernels.dsv4_moe_layer.reference import (
+        dequant,
+        hadamard,
+        quant_dequant_fp4,
+        rope,
+    )
+
+    torch.manual_seed(0)
+    cfg = _cfg(hc_mult=1)
+    cfg.compress_ratio, cfg.max_seq = COMPRESS_CSA, 256
+    ih, ihd, rd = cfg.index_heads, cfg.index_head_dim, cfg.rope_dim
+    dev, mode = "cuda", MoeMode.W8A8
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    t = W.t
+    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
+
+    cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    dq_qkv = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+    dq_iqb = dequant(t["w_i_q_b"], t["s_i_q_b"], 128)
+
+    for pos in range(3):
+        h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
+        cur = torch.tensor([pos], dtype=torch.int32, device=dev)
+        layer.forward(h, cur, kv_k, layer_idxs(pos, 1, cfg, dev), cos, sin)
+        torch.cuda.synchronize()
+
+        x = bf(rmsnorm(h.float(), t["g_in"], cfg.eps))
+        q_a = (x @ dq_qkv.float().T)[:, : cfg.q_lora]
+        q_an = bf(rmsnorm(q_a, t["g_q"], cfg.eps))
+        q = (q_an @ dq_iqb.T).view(ih, ihd)
+        q = torch.stack([torch.cat([q[j, :-rd], bf(rope(q[j, -rd:], cos[pos], sin[pos]))]) for j in range(ih)])
+        ref = quant_dequant_fp4(bf(hadamard(bf(q))))
+
+        got = layer.debug("i_q", (1, ih, ihd))[0]
+        n_diff = int((got != ref).sum())
+        rel_l2 = ((got - ref).norm() / max(ref.norm().item(), 1e-6)).item()
+        assert n_diff <= 4, f"pos={pos}: {n_diff}/{ih * ihd} elements differ"
+        assert rel_l2 < 1e-2, f"pos={pos} indexer query rel_l2 {rel_l2:.5f}"
