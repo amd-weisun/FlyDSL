@@ -414,3 +414,78 @@ def test_v4_compressor_matches_deepseek_directly(ratio):
         assert d < 2e-2 * scale, f"ratio={ratio} pos={pos} compressed entry differs: {d / scale:.5f}"
 
     assert emitted >= 4, f"expected several compressed entries, got {emitted}"
+
+
+def test_v4_indexer_compressor_matches_deepseek():
+    """The INDEXER's compressor, against DeepSeek's `Compressor(..., rotate=True)`.
+
+    CSA's indexer runs a second compressor over the same tokens at its own smaller
+    head_dim, and finishes differently: a Hadamard rotation over the whole row and
+    then FP4, where the attention compressor does FP8 over the nope part only. The
+    rotation is what makes FP4 survivable -- it spreads an outlier across every
+    lane, so a block's amax stops being set by one coordinate.
+
+    Ratio is 4 here because that is CSA, so this also covers the overlapping
+    pooling at the indexer's dimensions.
+    """
+    om = _oracle()
+    device, ratio = "cuda", 4
+    torch.manual_seed(0)
+    cfg = _cfg(hc_mult=1, compress_ratio=ratio, max_seq=256)
+    ihd, coff = 128, cfg.c_coff  # index_head_dim; V4 keeps rope_head_dim at 64
+    assert cfg.overlap, "ratio 4 is the overlapping form"
+
+    args = _oracle_args(om, cfg)
+    with torch.device(device):
+        comp = om.Compressor(args, ratio, ihd, True)
+        n_comp = cfg.max_seq // ratio
+        comp.kv_cache = torch.zeros(1, n_comp, ihd, device=device)
+        comp.freqs_cis = om.precompute_freqs_cis(cfg.rope_dim, 512, 0, cfg.compress_rope_theta, 1.0, 32, 1)
+
+    gen = torch.Generator(device=device).manual_seed(5)
+    wkv = torch.randn(coff * ihd, cfg.hidden, generator=gen, device=device) / cfg.hidden**0.5
+    wgate = torch.randn(coff * ihd, cfg.hidden, generator=gen, device=device) / cfg.hidden**0.5
+    ape = 0.5 * torch.randn(ratio, coff * ihd, generator=gen, device=device)
+    gamma = (1 + 0.1 * torch.randn(ihd, generator=gen, device=device)).to(torch.bfloat16)
+    with torch.no_grad():
+        comp.wkv.weight.copy_(wkv.float())
+        comp.wgate.weight.copy_(wgate.float())
+        comp.ape.copy_(ape.float())
+        comp.norm.weight.copy_(gamma.float())
+
+    cos, sin = rope_table(512, theta=cfg.compress_rope_theta, device=device)
+    cache = torch.zeros(n_comp, ihd, dtype=torch.bfloat16, device=device)
+    kv_state = torch.zeros(cfg.c_rows, coff * ihd, device=device)
+    score_state = torch.full((cfg.c_rows, coff * ihd), float("-inf"), device=device)
+
+    emitted = 0
+    for pos in range(6 * ratio):
+        x = (0.5 * torch.randn(1, cfg.hidden, device=device)).to(torch.bfloat16)
+        ours = compress_step(
+            (x.float() @ wkv.float().T)[0],
+            (x.float() @ wgate.float().T)[0],
+            pos,
+            cfg,
+            None,
+            kv_state,
+            score_state,
+            cache,
+            cos,
+            sin,
+            head_dim=ihd,
+            ape=ape,
+            gamma=gamma,
+            base=0,  # the indexer's cache holds compressed entries only
+            rotate=True,
+        )
+        with torch.device(device):
+            theirs = comp(x.unsqueeze(0), pos)
+        if (pos + 1) % ratio:
+            assert ours is None and theirs is None, f"pos={pos} should emit nothing"
+            continue
+        emitted += 1
+        d = (ours.float() - theirs.reshape(-1).float()).abs().max().item()
+        scale = max(theirs.float().abs().max().item(), 1e-6)
+        assert d < 2e-2 * scale, f"pos={pos} indexer compressed entry differs: {d / scale:.5f}"
+
+    assert emitted >= 4, f"expected several compressed entries, got {emitted}"

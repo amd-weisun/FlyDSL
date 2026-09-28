@@ -274,6 +274,55 @@ def rmsnorm(x: torch.Tensor, g: torch.Tensor | None, eps: float) -> torch.Tensor
     return y if g is None else y * g.float()
 
 
+FP4_MAX = 6.0
+# e2m1 representable magnitudes in code order; the code IS the index
+FP4_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+FP4_BLOCK = 32
+
+
+def hadamard(x: torch.Tensor) -> torch.Tensor:
+    """Fast Walsh-Hadamard transform over the last dim, scaled by n**-0.5.
+
+    V4 rotates the indexer's queries and compressed keys into the Hadamard basis
+    before quantizing them to FP4: the transform spreads any outlier across all
+    lanes, so a block's amax stops being set by one coordinate. Scoring is a dot
+    product and the scaled transform is orthonormal, so it leaves scores intact.
+    """
+    n = x.shape[-1]
+    assert n & (n - 1) == 0, f"hadamard size must be a power of two, got {n}"
+    y = x.float().reshape(-1, n)
+    h = 1
+    while h < n:
+        y = y.reshape(-1, n // (2 * h), 2, h)
+        a, b = y[:, :, 0, :].clone(), y[:, :, 1, :].clone()
+        y[:, :, 0, :], y[:, :, 1, :] = a + b, a - b
+        y = y.reshape(-1, n)
+        h *= 2
+    return (y * n**-0.5).reshape(x.shape)
+
+
+def quant_dequant_fp4(x: torch.Tensor, block: int = FP4_BLOCK) -> torch.Tensor:
+    """FP4 (e2m1) round trip in blocks of ``block``, with power-of-2 scales.
+
+    Unlike the FP8 path, the scale is rounded UP to a power of two, so it is
+    exact in the exponent and costs no mantissa. Ties round to the even code.
+    """
+    n = x.shape[-1]
+    xb = x.float().reshape(*x.shape[:-1], n // block, block)
+    amax = xb.abs().amax(-1, keepdim=True).clamp(min=FP4_MAX * 2.0**-126)
+    # ceil(log2(amax / FP4_MAX)) by exponent arithmetic, as the model does
+    bits = (amax / FP4_MAX).view(torch.int32)
+    e = ((bits >> 23) & 0xFF) - 127 + ((bits & ((1 << 23) - 1)) != 0).to(torch.int32)
+    s = torch.ldexp(torch.ones_like(amax), e)
+    q = (xb / s).clamp(-FP4_MAX, FP4_MAX)
+    lv = torch.tensor(FP4_LEVELS, device=x.device, dtype=torch.float32)
+    mid = (lv[1:] + lv[:-1]) / 2
+    mag = q.abs()
+    down, up = torch.bucketize(mag, mid, right=False), torch.bucketize(mag, mid, right=True)
+    idx = torch.where(up != down, torch.where(down % 2 == 0, down, up), down)
+    return (torch.sign(q) * lv[idx] * s).reshape(x.shape).to(x.dtype)
+
+
 def hc_split_sinkhorn(mixes: torch.Tensor, scale, base, cfg: V4Config):
     """Split the mix vector into hyper-connection coefficients.
 
@@ -318,7 +367,23 @@ def hc_post(x: torch.Tensor, residual: torch.Tensor, post, comb):
     return (post.unsqueeze(-1) * x.unsqueeze(-2).float() + mixed).type_as(x)
 
 
-def compress_step(kv, score, cur_pos, cfg, t, kv_state, score_state, cache, cos_c, sin_c):
+def compress_step(
+    kv,
+    score,
+    cur_pos,
+    cfg,
+    t,
+    kv_state,
+    score_state,
+    cache,
+    cos_c,
+    sin_c,
+    head_dim=None,
+    ape=None,
+    gamma=None,
+    base=None,
+    rotate=False,
+):
     """One decode step of the KV compressor.
 
     Every token feeds a rolling window of ``compress_ratio`` positions; only the
@@ -331,10 +396,19 @@ def compress_step(kv, score, cur_pos, cfg, t, kv_state, score_state, cache, cos_
     When ``cfg.overlap`` (CSA), the windows overlap: each entry pools 2*ratio
     tokens at a stride of ratio, taking the previous window's overlap channels and
     the current window's normal ones.
+
+    The indexer runs a SECOND compressor over the same tokens, at its own (smaller)
+    ``head_dim`` and with its own ``ape`` / ``gamma`` / cache, so those are
+    overridable. ``rotate`` picks that one's tail: Hadamard over the whole row and
+    then FP4, where the attention compressor does FP8 on the nope part only.
     """
-    r, rd, d = cfg.compress_ratio, cfg.rope_dim, cfg.head_dim
+    r, rd = cfg.compress_ratio, cfg.rope_dim
+    d = cfg.head_dim if head_dim is None else head_dim
+    ape = t["ape"] if ape is None else ape
+    gamma = t["g_ckv"] if gamma is None else gamma
+    base = cfg.window if base is None else base
     kv = kv.float()
-    score = score.float() + t["ape"][cur_pos % r]
+    score = score.float() + ape[cur_pos % r]
     if cfg.overlap:
         # the current window fills the second half of the state; the first half
         # still holds the previous window, and a pooled entry spans both
@@ -356,10 +430,17 @@ def compress_step(kv, score, cur_pos, cfg, t, kv_state, score_state, cache, cos_
     # the norm returns bf16 in the model this reproduces, so the RoPE and the FP8
     # round trip below see bf16 -- keeping fp32 here is more precise than the
     # reference and shows up as a systematic offset in the compressed entry
-    v = bf(rmsnorm(pooled.to(torch.bfloat16), t["g_ckv"], cfg.eps))
+    v = bf(rmsnorm(pooled.to(torch.bfloat16), gamma, cfg.eps))
     anchor = cur_pos + 1 - r  # the window's FIRST position carries the rotation
-    v = torch.cat([quant_dequant(v[:-rd], 64), rope(v[-rd:], cos_c[anchor], sin_c[anchor])])
-    cache[cfg.window + cur_pos // r] = v.to(torch.bfloat16)
+    # bf(): the model rotates in place inside a bf16 tensor, so the rotated lanes
+    # are rounded before anything downstream sees them
+    v = torch.cat([v[:-rd], bf(rope(v[-rd:], cos_c[anchor], sin_c[anchor]))])
+    # The rotation spans the rope lanes too, so it has to follow them. bf() is
+    # load-bearing: the model rotates a bf16 tensor and its transform casts back
+    # before quantizing, so FP4 sees bf16 -- staying in fp32 here moves elements
+    # that sit near a level boundary by a whole FP4 step.
+    v = quant_dequant_fp4(bf(hadamard(v))) if rotate else torch.cat([quant_dequant(v[:-rd], 64), v[-rd:]])
+    cache[base + cur_pos // r] = v.to(torch.bfloat16)
     return v
 
 
