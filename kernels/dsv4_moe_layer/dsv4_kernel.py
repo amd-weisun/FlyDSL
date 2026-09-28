@@ -172,6 +172,7 @@ def layout(
     hc_mult: int = 1,
     compress_ratio: int = 0,
     n_keys: int | None = None,
+    c_coff: int = 1,
 ):
     """Byte offsets of the per-rank scratch and of the symmetric buffer.
 
@@ -194,9 +195,10 @@ def layout(
         ("ain", S * hidden * pr if hc_mult > 1 else pr),
         ("q_a", S * q_lora * pr),
         ("kv_a", S * head_dim * pr),  # the single shared KV row, pre-norm
-        # the compressor's own kv / gate, split out of the same fused qkv_a GEMV
-        ("c_kv", S * head_dim * pr if compress_ratio else pr),
-        ("c_gate", S * head_dim * pr if compress_ratio else pr),
+        # The compressor's own kv / gate, split out of the same fused qkv_a GEMV.
+        # c_coff-wide: overlapping windows carry a previous-window half too.
+        ("c_kv", S * c_coff * head_dim * pr if compress_ratio else pr),
+        ("c_gate", S * c_coff * head_dim * pr if compress_ratio else pr),
         # the compressed row this launch just wrote, for the same reason kvnew
         # exists: the gather cannot rely on seeing our own global store
         ("cnew", S * head_dim * pr if compress_ratio else pr),
@@ -381,6 +383,17 @@ def _mxfp4_to_bf16x8(word, scale):
     return fx.Vector.from_elements(parts, fx.BFloat16)
 
 
+def qkv_a_rows(q_lora: int, head_dim: int, compress_ratio: int, c_coff: int) -> int:
+    """Rows of the fused qkv_a GEMV: q_a, kv, and the compressor's c_coff-wide pair.
+
+    Mirrors reference.qkv_a_tail(). Both the task count and the kernel's loop bound
+    come from here -- they disagreed before, so the kernel ran qkv_a tasks the CTA
+    placement had not accounted for.
+    """
+    tail = 2 * c_coff * head_dim if compress_ratio else 0
+    return q_lora + head_dim + tail
+
+
 def stage_tasks(
     S: int,
     heads: int,
@@ -395,12 +408,13 @@ def stage_tasks(
     hc_mult: int = 1,
     compress_ratio: int = 0,
     n_keys: int | None = None,
+    c_coff: int = 1,
 ):
     """[(stage name, task count)] in execution order.
 
     MLA's ``uk`` stage has no V4 counterpart (no absorbed W_UK) and its ``o``
     GEMV splits into the grouped low-rank pair ``o_a`` / ``o_b``."""
-    n_qkv_a = (q_lora + head_dim) // QKV_A_TILE
+    n_qkv_a = qkv_a_rows(q_lora, head_dim, compress_ratio, c_coff) // QKV_A_TILE
     hc_tasks, _, _, _ = hc_shape(hc_mult, hidden)
     return [
         # hyper-connection pre-mix for the attention side, before anything reads
@@ -452,6 +466,7 @@ def build_dsv4_kernel(
     compress_ratio: int = 0,
     window_rows: int | None = None,
     n_keys: int | None = None,
+    c_coff: int = 1,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole V4 layer.
 
@@ -513,7 +528,7 @@ def build_dsv4_kernel(
     NOPE_DIM = HEAD_DIM - ROPE_DIM
     MOE_SLOTS = 1 + TOP_K
     SHARED_EXPERT = N_EXPERTS
-    QKV_A_ROWS = Q_LORA + HEAD_DIM * (3 if compress_ratio else 1)
+    QKV_A_ROWS = qkv_a_rows(Q_LORA, HEAD_DIM, compress_ratio, c_coff)
     N_QKV_A = QKV_A_ROWS // QKV_A_TILE
     N_ROW_TILES = HIDDEN // ROW_TILE
     N_ROUTER = N_EXPERTS // ROUTER_TILE
@@ -530,8 +545,15 @@ def build_dsv4_kernel(
         else (PUBLISH_BLOCKS + N_ROUTER - 1) // N_ROUTER
     )
     assert XQ_WAVES <= WAVES
-    # --- KV compression (HCA). CR == 0 is sliding-window only and compiles out.
+    # --- KV compression. CR == 0 is sliding-window only and compiles out.
+    # CSA's windows OVERLAP: an entry pools 2*CR tokens at a stride of CR, so the
+    # projections carry two halves (C_COFF) and the state holds two windows.
     CR = compress_ratio
+    C_COFF = c_coff
+    CW = C_COFF * HEAD_DIM  # width of one state row
+    C_ROWS = C_COFF * CR  # rows of state
+    OVERLAP = C_COFF > 1
+    CBASE = CR if OVERLAP else 0  # the current window fills the second half
     # the window and the compressed entries share one cache, the compressed half
     # starting at `window`, so the attention gathers both from one index list
     CACHE_ROWS = window if window_rows is None else window_rows
@@ -539,7 +561,6 @@ def build_dsv4_kernel(
     # the gather reaches past the window into the compressed half of the cache
     N_KEYS = window if n_keys is None else n_keys
     if CR:
-        assert CR != 4, "CSA needs the overlapping compressor and the lightning indexer"
         assert CACHE_ROWS > window, "a compressing layer needs cache rows past the window"
         assert HEAD_DIM <= THREADS, "the compressor maps one thread per channel"
 
@@ -584,6 +605,7 @@ def build_dsv4_kernel(
         hc_mult=HC,
         compress_ratio=CR,
         n_keys=N_KEYS,
+        c_coff=C_COFF,
     )
     assert N_KEYS % SPLIT_KEYS == 0, "the index list must be a whole number of key tiles"
     N_SPLIT = N_KEYS // SPLIT_KEYS
@@ -635,6 +657,7 @@ def build_dsv4_kernel(
         hc_mult=HC,
         compress_ratio=CR,
         n_keys=N_KEYS,
+        c_coff=C_COFF,
     )
     base, first, acc = {}, {}, 0
     for name, n in stage_tasks(S, H, **st_args):
@@ -1598,14 +1621,17 @@ def build_dsv4_kernel(
                 s = tid // QKV_A_TILE
                 row = t * QKV_A_TILE + tid % QKV_A_TILE
                 v = lds_ld(outs, tid)
+                # Column ranges of the fused GEMV, in layout order. Must match
+                # reference.qkv_a_split(): the compressor's pair is C_COFF-wide, so
+                # this is not "one head_dim each" once CSA overlaps.
                 if row < Q_LORA:
                     put(mb("q_a"), s * Q_LORA + row, v)
                 elif row < Q_LORA + HEAD_DIM:
                     put(mb("kv_a"), s * HEAD_DIM + row - Q_LORA, v)
-                elif row < Q_LORA + 2 * HEAD_DIM:
-                    put(mb("c_kv"), s * HEAD_DIM + row - Q_LORA - HEAD_DIM, v)
+                elif row < Q_LORA + HEAD_DIM + CW:
+                    put(mb("c_kv"), s * CW + row - Q_LORA - HEAD_DIM, v)
                 else:
-                    put(mb("c_gate"), s * HEAD_DIM + row - Q_LORA - 2 * HEAD_DIM, v)
+                    put(mb("c_gate"), s * CW + row - Q_LORA - HEAD_DIM - CW, v)
             stamp("qkv_a", t, 4)
 
         # ====== 2. KV RMSNorm + RoPE + FP8 round trip -> sliding-window ring cache
@@ -1664,7 +1690,7 @@ def build_dsv4_kernel(
                 live = tid < HEAD_DIM
                 p = pos0 + tt
                 slot = p % CR
-                ap = ld_f32(_rsrc(ape), slot * HEAD_DIM + ch)
+                ap0 = [ld_f32(_rsrc(ape), slot * CW + j * HEAD_DIM + ch) for j in range(C_COFF)]
                 g = ld_bf16(_rsrc(g_ckv), ch)
                 # anchor: the window's FIRST position. Only read on boundary steps,
                 # but the load is unconditional, so clamp it.
@@ -1675,25 +1701,31 @@ def build_dsv4_kernel(
                 # YaRN) for EVERYTHING it rotates, not just the compressed rows.
                 rc = ld_f32(_rsrc(rope_cos), anchor * (ROPE_DIM // 2) + ri)
                 rs = ld_f32(_rsrc(rope_sin), anchor * (ROPE_DIM // 2) + ri)
-                kvv = getf(mb("c_kv"), tt * HEAD_DIM + ch)
-                gtv = getf(mb("c_gate"), tt * HEAD_DIM + ch)
+                kvv = [getf(mb("c_kv"), (tt * C_COFF + j) * HEAD_DIM + ch) for j in range(C_COFF)]
+                gtv = [getf(mb("c_gate"), (tt * C_COFF + j) * HEAD_DIM + ch) for j in range(C_COFF)]
                 stamp("cmp", tt, 2)
                 if live:
-                    bo.buffer_store(kvv, r_kvst, slot * HEAD_DIM + tid)
-                    bo.buffer_store(gtv + ap, r_scst, slot * HEAD_DIM + tid)
+                    for j in range_constexpr(C_COFF):
+                        w = (CBASE + slot) * CW + j * HEAD_DIM + ch
+                        bo.buffer_store(kvv[j], r_kvst, w)
+                        bo.buffer_store(gtv[j] + ap0[j], r_scst, w)
                 if (p + 1) % CR == 0:  # uniform across the CTA
                     # online softmax over the window, one channel per thread, so the
                     # CR positions are a loop rather than CR unrolled copies
                     for _i, acc in range(
                         0,
-                        CR,
+                        C_ROWS,
                         fx.Int32(1),
                         init=[fx.Float32(NEG), fx.Float32(0.0), fx.Float32(0.0)],
                     ):
                         m = fx.Float32(acc[0])
                         den = fx.Float32(acc[1])
                         num = fx.Float32(acc[2])
-                        wi = fx.Int32(_i) * HEAD_DIM + ch
+                        # an overlapped entry takes the previous window's rows from
+                        # their FIRST half and the current window's from their SECOND
+                        i = fx.Int32(_i)
+                        coff = (i >= CR).select(fx.Int32(HEAD_DIM), fx.Int32(0)) if OVERLAP else 0
+                        wi = i * CW + coff + ch
                         sv = ld_f32(r_scst, wi)
                         kv_i = ld_f32(r_kvst, wi)
                         m_new = fx.max(m, sv)
@@ -1718,6 +1750,16 @@ def build_dsv4_kernel(
                     if live:
                         bo.buffer_store(cv.to(fx.BFloat16), _rsrc(kv_cache), (window + p // CR) * HEAD_DIM + tid)
                         put(mb("cnew"), tt * HEAD_DIM + tid, cv)
+                    if const_expr(OVERLAP):
+                        # the current window becomes the previous one. Each thread
+                        # owns channels {ch, HEAD_DIM + ch} of every row it touches,
+                        # and read both before writing either, so no barrier is owed.
+                        for i in range_constexpr(CR):
+                            for j in range_constexpr(C_COFF):
+                                o = j * HEAD_DIM + ch
+                                if live:
+                                    bo.buffer_store(ld_f32(r_kvst, (CR + i) * CW + o), r_kvst, i * CW + o)
+                                    bo.buffer_store(ld_f32(r_scst, (CR + i) * CW + o), r_scst, i * CW + o)
                 stamp("cmp", tt, 4)
 
         # ==================================== 3. q_a RMSNorm -> q_b (raw f32 query)

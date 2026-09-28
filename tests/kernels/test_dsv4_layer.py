@@ -19,16 +19,17 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kernels.dsv4_moe_layer.config import MoeMode
+from kernels.dsv4_moe_layer.config import COMPRESS_CSA, MoeMode
 from kernels.dsv4_moe_layer.reference import (
     V4Config,
     golden_layer,
     golden_moe,
     layer_idxs,
     make_weights,
+    rmsnorm,
     window_idxs,
 )
-from kernels.mla_moe_layer.reference import rope_table
+from kernels.mla_moe_layer.reference import bf, rope_table
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
@@ -171,12 +172,31 @@ def test_dsv4_layer_matches_golden_at_real_dims():
     assert rel_l2 < out_tol, f"x_out diverged: rel_l2 {rel_l2:.5f} >= {out_tol}"
 
 
-def test_dsv4_rejects_unsupported_compress_ratio():
-    """The KV compressor (HCA) and lightning indexer (CSA) are not implemented yet."""
+def test_dsv4_csa_shape_is_the_selected_one():
+    """What compress_ratio 4 does and does not promise.
+
+    It used to be rejected outright. The compressor is implemented now, and the
+    layer gathers whatever index list it is handed at any ratio, so there is
+    nothing left for validate_shard to refuse -- but the SELECTION is still the
+    caller's until the in-kernel indexer lands. What the shape does promise is
+    that it is sized for a selection: the index list carries index_topk
+    compressed slots, not the whole compressed half, which is the difference
+    between CSA and HCA.
+    """
     from kernels.dsv4_moe_layer.config import COMPRESS_CSA, validate_shard
 
-    with pytest.raises(ValueError, match="compress_ratio"):
-        validate_shard(1, 16, 0, 8, compress_ratio=COMPRESS_CSA)
+    validate_shard(1, 16, 0, 8, compress_ratio=COMPRESS_CSA)  # no longer refused
+
+    csa = V4Config(hc_mult=1, compress_ratio=COMPRESS_CSA, max_seq=4096)
+    assert csa.indexed and csa.overlap and csa.c_coff == 2
+    assert csa.n_index == min(csa.index_topk, csa.n_compressed)
+    assert csa.n_keys == csa.window + csa.n_index  # already a multiple of KEY_BLOCK
+
+    # a long enough sequence is where the cap actually bites
+    far = V4Config(hc_mult=1, compress_ratio=COMPRESS_CSA, max_seq=4096 * 16)
+    assert far.n_compressed > far.index_topk
+    assert far.n_index == far.index_topk, "the gather must stay bounded by index_topk"
+    assert far.cache_rows > far.n_keys, "the cache still holds every compressed entry"
 
 
 def test_dsv4_rejects_head_dim_that_would_deadlock():
@@ -345,10 +365,24 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4,
     return ok
 
 
-def _worker(rank, npes, real, iters, hc_mult, compress_ratio, results):
+def _free_port():
+    """A port the parent has just closed, so the children can bind it.
+
+    A fixed port makes back-to-back TP runs collide on a socket still in
+    TIME_WAIT, which fails the rendezvous and looks exactly like a kernel
+    regression -- it cost a debugging round already.
+    """
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _worker(rank, npes, real, iters, hc_mult, compress_ratio, port, results):
     import torch.distributed as dist
 
-    dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29551", rank=rank, world_size=npes)
+    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=npes)
     try:
         results[rank] = run_rank(rank, npes, real=real, iters=iters, hc_mult=hc_mult, compress_ratio=compress_ratio)
     finally:
@@ -361,7 +395,11 @@ def run_tp(npes, real=False, iters=2, hc_mult=1, compress_ratio=0):
     import torch.multiprocessing as mp
 
     results = mp.Manager().dict()
-    mp.spawn(_worker, args=(npes, real, iters, hc_mult, compress_ratio, results), nprocs=npes)
+    mp.spawn(
+        _worker,
+        args=(npes, real, iters, hc_mult, compress_ratio, _free_port(), results),
+        nprocs=npes,
+    )
     return all(results[r] for r in range(npes))
 
 
@@ -696,3 +734,79 @@ def test_dsv4_hca_layer_at_real_dims():
     # an id above 255 is the case the selection key's 8-bit field used to corrupt;
     # over this many steps the routing is certain to reach one
     assert top_id > 255 or cfg.n_experts <= 256
+
+
+def test_dsv4_csa_compressor_in_kernel():
+    """CSA's OVERLAPPING compressor, running in the kernel.
+
+    A whole CSA layer still needs the indexer, so attention here gathers a plain
+    prefix and only the compressed row is under test -- compared against
+    ``compress_step`` directly, the way the reference suite isolates it against
+    DeepSeek's module. What that covers is everything overlap changes: the
+    c_coff-wide projections out of the fused GEMV, two windows of state, an entry
+    pooled from the previous window's first half and the current window's second,
+    and the shift that retires a window.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+    from kernels.dsv4_moe_layer.reference import compress_step, dequant, qkv_a_split
+
+    torch.manual_seed(0)
+    ratio = COMPRESS_CSA
+    cfg = _cfg(hc_mult=1)
+    cfg.compress_ratio, cfg.max_seq = ratio, 256
+    assert cfg.overlap and cfg.c_coff == 2, "ratio 4 is the overlapping form"
+    dev, mode = "cuda", MoeMode.W8A8
+    W, t = None, None
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    t = W.t
+    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode)
+
+    cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    ks = torch.zeros(cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev)
+    ss = torch.full((cfg.c_rows, cfg.c_coff * cfg.head_dim), float("-inf"), device=dev)
+    cache_r = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    dq = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+    cut = qkv_a_split(cfg)
+
+    emitted = 0
+    for pos in range(5 * ratio):
+        h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
+        cur = torch.tensor([pos], dtype=torch.int32, device=dev)
+        idx = layer_idxs(pos, 1, cfg, dev)
+        layer.forward(h, cur, kv_k, idx, cos, sin)
+        torch.cuda.synchronize()
+
+        x = bf(rmsnorm(h.float(), t["g_in"], cfg.eps))
+        proj = x @ dq.float().T
+        ref = compress_step(
+            proj[0, slice(*cut["c_kv"])],
+            proj[0, slice(*cut["c_gate"])],
+            pos,
+            cfg,
+            t,
+            ks,
+            ss,
+            cache_r,
+            cos,
+            sin,
+        )
+        if (pos + 1) % ratio:
+            assert ref is None, f"pos={pos} should emit nothing"
+            continue
+        emitted += 1
+        slot = cfg.window + pos // ratio
+        a, b = kv_k[slot].float(), cache_r[slot].float()
+        # Most boundaries come out bit-exact. The kernel pools with an online
+        # softmax on the hardware exp2 and the golden with a batch softmax, so the
+        # pre-quantization value can differ in the last fp32 bits, and once in a
+        # while that pushes ONE element across an FP8 code boundary -- worth ~9% of
+        # that element. A max-abs bar cannot tell that from a broken pooling, so
+        # bound both: the bulk must agree tightly, and only a couple of elements
+        # may move at all. A wrong overlap moves most of the row.
+        n_diff = int((a != b).sum())
+        rel_l2 = ((a - b).norm() / max(b.norm().item(), 1e-6)).item()
+        assert n_diff <= 4, f"pos={pos}: {n_diff} elements differ, not a quantization tie"
+        assert rel_l2 < 5e-3, f"pos={pos} compressed row rel_l2 {rel_l2:.5f}"
+
+    assert emitted >= 4, f"expected several compressed entries, got {emitted}"

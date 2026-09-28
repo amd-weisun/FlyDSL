@@ -87,6 +87,7 @@ class Dsv4MoeLayer:
         dims["hc_mult"] = cfg.hc_mult
         dims["compress_ratio"] = cfg.compress_ratio
         dims["n_keys"] = cfg.n_keys
+        dims["c_coff"] = cfg.c_coff
         self.scr_layout, self.sym_layout = layout(samples, cfg.heads, npes, cfg.window, self.moe_mode, **dims)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)

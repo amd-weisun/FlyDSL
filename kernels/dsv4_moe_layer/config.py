@@ -70,7 +70,7 @@ COMPRESS_CSA = 4  # compressed sparse attention, needs the lightning indexer
 COMPRESS_HCA = 128  # heavily compressed attention, dense over compressed
 # HCA needs only the KV compressor; CSA additionally needs the lightning indexer
 # (and the compressor in its overlapping form), which is not implemented.
-SUPPORTED_COMPRESS = (COMPRESS_SWA, COMPRESS_HCA)  # informational; see V4Config.validate
+SUPPORTED_COMPRESS = (COMPRESS_SWA, COMPRESS_CSA, COMPRESS_HCA)  # see validate_shard
 COMPRESS_ROPE_THETA = 1.6e5  # compressed layers use their own rope base
 # Lightning indexer (CSA only). 64 global index heads / 8 ranks; each scores the
 # compressed entries with its own 128-dim query, and the weighted head-sum picks
@@ -102,8 +102,9 @@ def validate_shard(
         raise ValueError(f"rank must be in [0, {npes}), got {rank}")
     if window <= 0 or window % 64:
         raise ValueError(f"window must be a positive multiple of 64, got {window}")
-    if compress_ratio == COMPRESS_CSA:
-        raise ValueError(
-            "CSA (compress_ratio 4) needs the overlapping compressor and the lightning "
-            "indexer, neither of which is implemented"
-        )
+    # NOTE: compress_ratio 4 builds CSA's overlapping compressor, but the kernel
+    # does NOT yet run the lightning indexer -- it gathers whatever index list the
+    # caller passes, as it does at every other ratio. That is a valid kernel
+    # configuration; it is not V4's CSA, whose compressed indices are *chosen* from
+    # scores computed inside the layer. Until the indexer lands, a caller wanting
+    # real CSA has to supply the selection itself (reference.indexer_step does it).
