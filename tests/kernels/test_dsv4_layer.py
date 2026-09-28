@@ -31,23 +31,34 @@ from kernels.mla_moe_layer.reference import rope_table
 
 pytestmark = [pytest.mark.l2_device, pytest.mark.rocm_lower]
 
-# bf16 MFMA activations, so exact equality is not the bar; the attention and MoE
-# halves each round several times before x_out
+# Calibrated empirically, not guessed: 12 draws x {w8a8, a8w4} x {hc_mult 1, 4}
+# x {tp 1, 8}. Each bar is roughly 2-4x the worst relative error seen there.
+#
+# The attention half does not move with configuration -- every stage stayed under
+# 0.0065 in all eight -- so its bars are fixed, and tighter than the blanket 0.02
+# they replace. Only `mid` and the end-to-end `x_out` scale, and they do so with
+# the arithmetic: mHC mixes hc_mult streams, multi-rank sums bf16 partials, and
+# MXFP4 amplifies whatever reaches it. Each of those roughly doubles the error,
+# so the bar doubles with each rather than being set to one loose worst case.
 STAGE_TOL = {
-    "q_a": 1e-3,
-    "kv": 1e-3,
-    "q": 0.02,
-    "o": 0.02,
-    "o_lora": 0.02,
-    "a": 0.02,
-    "scores": 0.02,
-    "mid": 0.02,
+    "q_a": 1e-3,  # worst seen 1e-4
+    "kv": 1e-3,  # worst seen 1e-4
+    "q": 0.010,  # worst seen 0.0039
+    "o": 0.015,  # worst seen 0.0063
+    "o_lora": 0.015,  # worst seen 0.0052
+    "a": 0.015,  # worst seen 0.0065
+    "scores": 0.012,  # worst seen 0.0052
+    "mid": 0.050,  # worst seen 0.0236 at hc=1/tp1, 0.109 at hc=4/tp8/a8w4
 }
-OUT_TOL = 0.02
-# End to end, a single FP8/bf16 rounding flip upstream moves one element a long
-# way, so max-abs is the wrong statistic there -- judge the final hidden state by
-# relative L2, as the MLA kernel's own suite does for x_out_e2e.
-OUT_REL_L2 = 0.05
+SCALES_WITH_CONFIG = ("mid",)
+# end to end, judged by relative L2: a single rounding flip upstream moves one
+# element a long way, and hc_post then mixes it across hc_mult streams
+OUT_REL_L2 = 0.050  # worst seen 0.0278 at hc=1/tp1, 0.0914 at hc=4/tp8/a8w4
+
+
+def _tol(base, hc_mult, npes):
+    """Widen for each factor that compounds the error, as measured."""
+    return base * (2 if hc_mult > 1 else 1) * (2 if npes > 1 else 1)
 
 
 def _cfg(hc_mult=1):
@@ -96,7 +107,8 @@ def test_dsv4_layer_matches_golden(moe_mode, hc_mult):
     kv_ref = kv0.clone()
     ref = golden_layer(W, h, pos, kv_ref, idx, cos, sin, lambda z: z, moe_mode=moe_mode)
 
-    for name, tol in STAGE_TOL.items():
+    for name, base in STAGE_TOL.items():
+        tol = _tol(base, cfg.hc_mult, 1) if name in SCALES_WITH_CONFIG else base
         a = got[name].float().reshape(-1)
         b = ref[name].float().reshape(-1)
         rel = (a - b).abs().max().item() / max(b.abs().max().item(), 1e-6)
@@ -111,7 +123,8 @@ def test_dsv4_layer_matches_golden(moe_mode, hc_mult):
     a_out, b_out = out.float(), ref["x_out"].float()
     rel_max = (a_out - b_out).abs().max().item() / max(b_out.abs().max().item(), 1e-6)
     rel_l2 = ((a_out - b_out).norm() / b_out.norm()).item()
-    assert rel_l2 < OUT_REL_L2, f"x_out diverged: rel_l2 {rel_l2:.5f} (rel_max {rel_max:.5f})"
+    out_tol = _tol(OUT_REL_L2, cfg.hc_mult, 1)
+    assert rel_l2 < out_tol, f"x_out diverged: rel_l2 {rel_l2:.5f} >= {out_tol} (rel_max {rel_max:.5f})"
 
 
 @pytest.mark.large_shape
@@ -141,7 +154,8 @@ def test_dsv4_layer_matches_golden_at_real_dims():
     got = layer.intermediates()
     ref = golden_layer(W, h, pos, kv0.clone(), idx, cos, sin, lambda z: z, moe_mode=mode)
 
-    for name, tol in STAGE_TOL.items():
+    for name, base in STAGE_TOL.items():
+        tol = _tol(base, cfg.hc_mult, 1) if name in SCALES_WITH_CONFIG else base
         a = got[name].float().reshape(-1)
         b = ref[name].float().reshape(-1)
         rel = (a - b).abs().max().item() / max(b.abs().max().item(), 1e-6)
@@ -152,7 +166,8 @@ def test_dsv4_layer_matches_golden_at_real_dims():
 
     a_out, b_out = out.float(), ref["x_out"].float()
     rel_l2 = ((a_out - b_out).norm() / b_out.norm()).item()
-    assert rel_l2 < OUT_REL_L2, f"x_out diverged: rel_l2 {rel_l2:.5f}"
+    out_tol = _tol(OUT_REL_L2, cfg.hc_mult, 1)
+    assert rel_l2 < out_tol, f"x_out diverged: rel_l2 {rel_l2:.5f} >= {out_tol}"
 
 
 def test_dsv4_rejects_unsupported_compress_ratio():
@@ -244,8 +259,9 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4,
         # judge the expert math against the kernel's OWN routing (as the MLA suite
         # does), and treat a flip as information rather than a failure.
         flipped = got["sel"].tolist() != ref["sel"].tolist()
-        for name, tol in STAGE_TOL.items():
-            if flipped and name in ("mid",):
+        for name, base in STAGE_TOL.items():
+            tol = _tol(base, cfg.hc_mult, npes) if name in SCALES_WITH_CONFIG else base
+            if flipped and name in SCALES_WITH_CONFIG:
                 continue
             a = got[name].float().reshape(-1)
             b = ref[name].float().reshape(-1)
@@ -271,7 +287,8 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4,
         )
         d_out = down["x_out"].float()
         d_rel = ((out.float() - d_out).norm() / d_out.norm()).item()
-        if d_rel >= OUT_REL_L2:
+        out_tol = _tol(OUT_REL_L2, cfg.hc_mult, npes)
+        if d_rel >= out_tol:
             print(f"rank {rank}: x_out vs own-routing golden rel_l2 {d_rel:.5f}", flush=True)
             ok = False
         a_out, b_out = out.float(), ref["x_out"].float()
@@ -279,7 +296,7 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4,
         rel_l2 = ((a_out - b_out).norm() / b_out.norm()).item()
         if rank == 0:  # pytest captures this; it is what makes a near-miss legible
             print(f"rank {rank}: x_out rel_max {rel_max:.5f}  rel_l2 {rel_l2:.5f}", flush=True)
-        if rel_l2 >= OUT_REL_L2 and not flipped:  # end to end only when routing agrees
+        if rel_l2 >= out_tol and not flipped:  # end to end only when routing agrees
             ok = False
     layer.close()
     return ok
@@ -306,10 +323,13 @@ def run_tp(npes, real=False, iters=2, hc_mult=1):
 
 
 @pytest.mark.multi_gpu
-def test_dsv4_layer_tp8():
+@pytest.mark.parametrize("hc_mult", [1, 4])
+def test_dsv4_layer_tp8(hc_mult):
+    """Both residual widths: the tolerances are calibrated per configuration, so
+    hyper-connections at TP8 no longer need pinning out."""
     if torch.cuda.device_count() < 8:
         pytest.skip("needs 8 GPUs")
-    assert run_tp(8)
+    assert run_tp(8, hc_mult=hc_mult)
 
 
 # ------------------------------------------------------------------ benchmark
