@@ -90,6 +90,11 @@ class V4Config:
         return (2 + self.hc_mult) * self.hc_mult
 
     @property
+    def hc_rows(self) -> int:
+        """hc_mix padded to the MFMA row group (24 -> 32 at hc_mult 4)."""
+        return (self.hc_mix + 15) // 16 * 16
+
+    @property
     def nope_dim(self) -> int:
         return self.head_dim - self.rope_dim
 
@@ -165,10 +170,14 @@ def make_weights(
         # hyper-connection mixers, fp32 in the checkpoint. Replicated: every rank
         # must derive the same pre/post/comb or the residual streams diverge.
         for side in ("attn", "ffn"):
-            t[f"hc_{side}_fn"] = (
+            # stored bf16 and row-padded: the kernel consumes this as a packed
+            # MFMA operand, and halving the bytes matters because K is hc*hidden
+            fn = torch.zeros(cfg.hc_rows, cfg.hc_mult * cfg.hidden, device=device)
+            fn[: cfg.hc_mix] = (
                 torch.randn(cfg.hc_mix, cfg.hc_mult * cfg.hidden, generator=rep, device=device)
                 / (cfg.hc_mult * cfg.hidden) ** 0.5
             )
+            t[f"hc_{side}_fn"] = fn.to(bfl)
             t[f"hc_{side}_base"] = torch.randn(cfg.hc_mix, generator=rep, device=device) * 0.5
             t[f"hc_{side}_scale"] = torch.rand(3, generator=rep, device=device) + 0.5
 
@@ -233,7 +242,8 @@ def hc_pre(x: torch.Tensor, fn: torch.Tensor, scale, base, cfg: V4Config):
     shape, dtype = x.size(), x.dtype
     xf = x.flatten(-2).float()
     rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + cfg.eps)
-    mixes = torch.nn.functional.linear(xf, fn.float()) * rsqrt
+    # bf16 weights, matching what the kernel's MFMA actually consumes
+    mixes = torch.nn.functional.linear(xf, fn[: cfg.hc_mix].float()) * rsqrt
     pre, post, comb = hc_split_sinkhorn(mixes, scale, base, cfg)
     y = (pre.unsqueeze(-1) * xf.view(shape)).sum(dim=-2)
     return y.to(dtype), post, comb

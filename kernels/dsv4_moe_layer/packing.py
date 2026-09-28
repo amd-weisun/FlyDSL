@@ -20,6 +20,8 @@ __all__ = ["pack_bf16", "pack_fp8", "pack_mxfp4", "pack_layer_weights"]
 
 ATTENTION_NAMES = ("w_qkv_a", "w_q_b", "w_o_a", "w_o_b")
 EXPERT_NAMES = ("w_ug", "w_dn")
+# hyper-connection mixers: bf16, K = hc_mult * hidden, rows already padded
+HC_NAMES = ("hc_attn_fn", "hc_ffn_fn")
 
 
 def pack_layer_weights(
@@ -35,4 +37,7 @@ def pack_layer_weights(
     pack_expert = pack_mxfp4 if weight is ExpertWeight.MXFP4_BLOCK32 else pack_fp8
     packed.update({name: pack_expert(tensors[name]) for name in EXPERT_NAMES})
     packed["w_r"] = pack_bf16(tensors["w_r"])
+    for name in HC_NAMES:
+        if name in tensors:
+            packed[name] = pack_bf16(tensors[name])
     return packed

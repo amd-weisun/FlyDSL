@@ -223,7 +223,8 @@ def _load_block_weights(block, W, cfg, weight_fmt):
     block.attn_norm.weight.copy_(t["g_in"].float())
     block.ffn_norm.weight.copy_(t["g_post"].float())
     for side in ("attn", "ffn"):
-        getattr(block, f"hc_{side}_fn").copy_(t[f"hc_{side}_fn"].float())
+        # ours is row-padded to the MFMA group; the oracle's is exactly hc_mix
+        getattr(block, f"hc_{side}_fn").copy_(t[f"hc_{side}_fn"][: cfg.hc_mix].float())
         getattr(block, f"hc_{side}_base").copy_(t[f"hc_{side}_base"].float())
         getattr(block, f"hc_{side}_scale").copy_(t[f"hc_{side}_scale"].float())
 
