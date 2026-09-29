@@ -23,7 +23,7 @@ rounded to bf16 (the MFMA operand precision). ``tests/kernels/`` checks the
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -103,6 +103,20 @@ class V4Config:
     @property
     def hc_mix(self) -> int:
         return (2 + self.hc_mult) * self.hc_mult
+
+    def for_layer(self, layer_id: int, ratios=None) -> "V4Config":
+        """This shard with the attention variant layer ``layer_id`` uses.
+
+        Every ratio-dependent field is a pure property of the scalar, so picking
+        the variant is a copy with one field changed. ``ratios`` defaults to
+        V4-Pro's own schedule; pass a checkpoint's own list to follow it instead.
+        """
+        from kernels.dsv4_moe_layer.config import compress_ratios
+
+        ratios = compress_ratios() if ratios is None else ratios
+        if not 0 <= layer_id < len(ratios):
+            raise ValueError(f"layer {layer_id} is outside a schedule of {len(ratios)}")
+        return replace(self, compress_ratio=ratios[layer_id])
 
     @property
     def rope_base(self) -> float:

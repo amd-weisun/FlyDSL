@@ -25,15 +25,151 @@ from kernels.dsv4_moe_layer.packing import pack_layer_weights
 from kernels.dsv4_moe_layer.reference import LayerWeights
 from kernels.mla_moe_layer.runtime import SymmetricPeerBuffer
 
-__all__ = ["MoeMode", "Dsv4MoeLayer"]
+__all__ = ["MoeMode", "Dsv4MoeLayer", "Dsv4Variant", "shape_dims"]
+
+
+def shape_dims(cfg) -> dict:
+    """The shape arguments layout(), stage_tasks() and build_dsv4_kernel() share.
+
+    They MUST see identical values: the host derives scratch offsets and its size
+    from one and the kernel from the other, so any drift both misreads every
+    mailbox and undersizes the buffer. Deriving them once, here, is what stops a
+    new shape reaching two of the three. Note the JIT disk cache does not key on
+    layout()/stage_tasks(), so editing either needs FLYDSL_RUNTIME_ENABLE_CACHE=0
+    to take effect.
+    """
+    return dict(
+        hidden=cfg.hidden,
+        q_lora=cfg.q_lora,
+        head_dim=cfg.head_dim,
+        o_groups=cfg.o_groups,
+        o_lora=cfg.o_lora,
+        hc_mult=cfg.hc_mult,
+        compress_ratio=cfg.compress_ratio,
+        n_keys=cfg.n_keys,
+        c_coff=cfg.c_coff,
+        # 0 means "no indexer"; only CSA runs one
+        index_head_dim=cfg.index_head_dim if cfg.indexed else 0,
+        index_heads=cfg.index_heads if cfg.indexed else 0,
+        max_seq=cfg.max_seq,
+        index_heads_total=cfg.index_heads_total if cfg.indexed else 0,
+        index_topk=cfg.index_topk if cfg.indexed else 0,
+    )
+
+
+def _variant_key(cfg, samples, npes, moe_mode, timeline):
+    """Everything the compiled kernel and the scratch layout depend on."""
+    return (
+        tuple(sorted(shape_dims(cfg).items())),
+        samples,
+        cfg.heads,
+        npes,
+        cfg.window,
+        cfg.cache_rows,
+        cfg.n_experts,
+        cfg.top_k,
+        cfg.inter,
+        cfg.softmax_scale,
+        cfg.swiglu_limit,
+        cfg.hc_sinkhorn_iters,
+        cfg.hc_eps,
+        moe_mode,
+        timeline,
+    )
+
+
+class Dsv4Variant:
+    """The compiled kernel and the buffers every layer of one attention variant shares.
+
+    V4 alternates its attention variant per layer -- at V4-Pro, HCA on layers 0, 1
+    and then odd ids, CSA on even ids from 2 -- and the shape is structural, not a
+    runtime branch: the stage task counts differ, which moves every stage's
+    CTA-to-task base, and the mailbox offsets differ, which moves every scratch
+    region. So a stack needs one compiled kernel per variant.
+
+    What it does NOT need is one per LAYER. The kernel, the scratch and the
+    symmetric buffer depend only on the shape, so all 31 HCA layers share one of
+    these and all 30 CSA layers another; only the weights and the rolling
+    compressor state are per layer. That matters at 61 layers, where a symmetric
+    buffer each would mean 61 IPC exchanges, in the same order on every rank.
+
+    Scratch CANNOT be shared ACROSS variants: the layouts differ, so two kernels
+    would read the same bytes as different mailboxes. Within a variant it is safe
+    because every launch stamps a fresh epoch tag -- which is why ``step`` lives
+    here too, one per scratch, advanced once per decode step. A second step
+    counter on the same scratch would let two layers mint the same tag.
+    """
+
+    _cache: dict = {}
+
+    def __init__(
+        self,
+        cfg,
+        samples: int,
+        rank: int = 0,
+        npes: int = 1,
+        group=None,
+        timeline: bool = False,
+        moe_mode: MoeMode | str = MoeMode.A8W4,
+        allow_unindexed_csa: bool = False,
+    ):
+        moe_mode = as_moe_mode(moe_mode)
+        validate_shard(samples, cfg.heads, rank, npes, cfg.window, cfg.compress_ratio, allow_unindexed_csa)
+        self.key = _variant_key(cfg, samples, npes, moe_mode, timeline)
+        dims = shape_dims(cfg)
+        dev = torch.device("cuda", torch.cuda.current_device())
+        self.scr_layout, self.sym_layout = layout(samples, cfg.heads, npes, cfg.window, moe_mode, **dims)
+        self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
+        self.peer_buffer = SymmetricPeerBuffer(self.sym_layout["_bytes"], rank=rank, npes=npes, group=group)
+        self.sym_storage = self.peer_buffer.storage
+        self.sym = self.peer_buffer.local_address
+        self.peers = self.peer_buffer.addresses
+        self.step = torch.zeros(1, dtype=torch.int32, device=dev)  # decode-step counter
+        # Tracing is the expensive part and depends only on the key, so two variants
+        # of the same shape (or a stack built one layer at a time) reuse it.
+        built = Dsv4Variant._cache.get(self.key)
+        if built is None:
+            built = build_dsv4_kernel(
+                samples,
+                cfg.heads,
+                npes,
+                cfg.window,
+                scale=cfg.softmax_scale,
+                timeline=timeline,
+                moe_mode=moe_mode,
+                n_experts=cfg.n_experts,
+                top_k=cfg.top_k,
+                inter=cfg.inter,
+                swiglu_limit=cfg.swiglu_limit,
+                hc_sinkhorn_iters=cfg.hc_sinkhorn_iters,
+                hc_eps=cfg.hc_eps,
+                window_rows=cfg.cache_rows,
+                **dims,
+            )
+            Dsv4Variant._cache[self.key] = built
+        self.launch = built
+        self.stages = stage_tasks(samples, cfg.heads, window=cfg.window, top_k=cfg.top_k, inter=cfg.inter, **dims)
+
+    def advance_step(self):
+        """One decode step done on this scratch. Stream-ordered, so graph-capturable."""
+        self.step.add_(1)
+
+    def close(self):
+        self.peer_buffer.close()
 
 
 class Dsv4MoeLayer:
-    """One rank of the TP layer. ``group`` is a torch.distributed group (None for npes=1).
+    """One rank of one transformer layer: its weights and its rolling state.
 
-    The symmetric buffer is a torch allocation exported to every peer through
-    HIP IPC; scratch and symmetric buffers may be shared by all
-    layers because every launch uses a fresh ``tag``.
+    Everything that depends only on the SHAPE -- the compiled kernel, the scratch
+    and the symmetric buffer -- lives in a ``Dsv4Variant``, which layers of the
+    same attention variant share; pass one to build a stack. Left out, the layer
+    makes its own, which is what a single-layer test or benchmark wants.
+
+    Layers sharing a variant share its scratch, so they must pass distinct
+    ``layer`` values (the epoch tag is ``step * MAX_LAYERS_PER_STEP + layer + 1``)
+    and advance the step exactly once per decode step. Note ``debug()`` and
+    ``intermediates()`` then read whichever layer ran last.
     """
 
     def __init__(
@@ -46,6 +182,7 @@ class Dsv4MoeLayer:
         timeline: bool = False,
         moe_mode: MoeMode | str = MoeMode.A8W4,
         allow_unindexed_csa: bool = False,
+        variant: "Dsv4Variant | None" = None,
     ):
         cfg = W.cfg
         validate_shard(samples, cfg.heads, rank, npes, cfg.window, cfg.compress_ratio, allow_unindexed_csa)
@@ -65,13 +202,7 @@ class Dsv4MoeLayer:
                 ).contiguous()
             else:
                 self.hc_sb[side] = torch.zeros(1, device=dev0)
-        dims = dict(
-            hidden=cfg.hidden,
-            q_lora=cfg.q_lora,
-            head_dim=cfg.head_dim,
-            o_groups=cfg.o_groups,
-            o_lora=cfg.o_lora,
-        )
+        dims = shape_dims(cfg)
         # layout() and build_dsv4_kernel() MUST see identical shape arguments: the
         # host derives scratch offsets and its size from one and the kernel from the
         # other, so any drift both misreads every mailbox and undersizes the buffer.
@@ -85,41 +216,27 @@ class Dsv4MoeLayer:
         # compressing layer builds the table on compress_rope_theta with YaRN, a
         # pure sliding-window layer on rope_theta without. That is the caller's
         # choice; see V4Config.compress_rope_theta.
-        dims["hc_mult"] = cfg.hc_mult
-        dims["compress_ratio"] = cfg.compress_ratio
-        dims["n_keys"] = cfg.n_keys
-        dims["c_coff"] = cfg.c_coff
-        # 0 means "no indexer"; only CSA runs one
-        dims["index_head_dim"] = cfg.index_head_dim if cfg.indexed else 0
-        dims["index_heads"] = cfg.index_heads if cfg.indexed else 0
-        dims["max_seq"] = cfg.max_seq
-        dims["index_heads_total"] = cfg.index_heads_total if cfg.indexed else 0
-        dims["index_topk"] = cfg.index_topk if cfg.indexed else 0
-        self.scr_layout, self.sym_layout = layout(samples, cfg.heads, npes, cfg.window, self.moe_mode, **dims)
         dev = torch.device("cuda", torch.cuda.current_device())
-        self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
-        self.peer_buffer = SymmetricPeerBuffer(self.sym_layout["_bytes"], rank=rank, npes=npes, group=group)
-        self.sym_storage = self.peer_buffer.storage
-        self.sym = self.peer_buffer.local_address
-        self.peers = self.peer_buffer.addresses
-        self.launch = build_dsv4_kernel(
-            samples,
-            cfg.heads,
-            npes,
-            cfg.window,
-            scale=cfg.softmax_scale,
-            timeline=timeline,
-            moe_mode=self.moe_mode,
-            n_experts=cfg.n_experts,
-            top_k=cfg.top_k,
-            inter=cfg.inter,
-            swiglu_limit=cfg.swiglu_limit,
-            hc_sinkhorn_iters=cfg.hc_sinkhorn_iters,
-            hc_eps=cfg.hc_eps,
-            window_rows=cfg.cache_rows,
-            **dims,
-        )
-        self.stages = stage_tasks(samples, cfg.heads, window=cfg.window, top_k=cfg.top_k, inter=cfg.inter, **dims)
+        if variant is None:
+            variant = Dsv4Variant(
+                cfg,
+                samples,
+                rank=rank,
+                npes=npes,
+                group=group,
+                timeline=timeline,
+                moe_mode=self.moe_mode,
+                allow_unindexed_csa=allow_unindexed_csa,
+            )
+        elif variant.key != _variant_key(cfg, samples, npes, self.moe_mode, timeline):
+            raise ValueError(
+                "this layer's shape is not the one the variant was compiled for; a variant is shared "
+                "only by layers of the SAME attention variant (compress_ratio, n_keys, max_seq, ...)"
+            )
+        self.variant = variant
+        self.scr_layout, self.sym_layout = variant.scr_layout, variant.sym_layout
+        self.scratch, self.sym, self.peers = variant.scratch, variant.sym, variant.peers
+        self.launch, self.stages = variant.launch, variant.stages
         # the compressor carries a rolling window across decode steps, so its state
         # lives here rather than being rebuilt per call. The leading `samples` is
         # the batch axis: each sample is its own sequence, so it carries its own
@@ -153,7 +270,7 @@ class Dsv4MoeLayer:
         self.st_ic = self.i_cache[0].numel() if cfg.indexed else 0
         n_tasks = sum(n for _, n in self.stages)
         self.timeline = torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev) if timeline else None
-        self.step = torch.zeros(1, dtype=torch.int32, device=dev)  # decode-step counter
+        self.step = variant.step
 
     def debug(self, name: str, shape, dtype=torch.float32, pairs=True, bf2=False) -> torch.Tensor:
         """Values of a scratch mailbox (``(value, tag)`` pairs unless ``pairs=False``;
@@ -265,12 +382,15 @@ class Dsv4MoeLayer:
         return x_out
 
     def advance_step(self):
-        self.step.add_(1)
+        self.variant.advance_step()
 
     def close(self):
-        """Release this rank's remote HIP IPC mappings."""
+        """Release this rank's remote HIP IPC mappings.
 
-        self.peer_buffer.close()
+        The mappings belong to the variant, so this is only the layer's to call
+        when it made its own; a shared variant is the caller's to close.
+        """
+        self.variant.close()
 
     def __enter__(self):
         return self

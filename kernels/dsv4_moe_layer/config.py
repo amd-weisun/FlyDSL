@@ -60,12 +60,29 @@ SUPPORTED_PEERS = (1, 2, 4, 8)
 SUPPORTED_HEADS = (8, 16)
 MAX_LAYERS_PER_STEP = 128
 
-# Per-layer attention variants. V4-Pro ships 31 HCA + 30 CSA layers and one
-# ratio-0 entry for the MTP block; `compress_ratios` in the HF config carries
-# one entry per layer PLUS one for MTP.
+# Per-layer attention variants. Verified against DeepSeek-V4-Pro's own
+# config.json: `compress_ratios` is [128, 128] + [4, 128] * 29 + [4] + [0], so
+# 61 main layers of 31 HCA + 30 CSA and NO ratio-0 layer, plus one trailing 0
+# for the MTP block. Layers 0 and 1 are both HCA -- the only break -- and from
+# id 2 it is strict parity: CSA iff even, HCA iff odd. A decode step therefore
+# alternates variant on almost every layer, with no run to amortize over.
 COMPRESS_SWA = 0  # sliding window only (the MTP block's shape)
 COMPRESS_CSA = 4  # compressed sparse attention, needs the lightning indexer
 COMPRESS_HCA = 128  # heavily compressed attention, dense over compressed
+
+
+def compress_ratios(n_layers: int = 61, n_mtp: int = 1) -> tuple[int, ...]:
+    """V4-Pro's per-layer schedule, MTP entries included.
+
+    The MTP block indexes the same tuple past the main layers, so it is one
+    sequence and not two. Checkpoints may ship MORE entries than layers: the
+    -0813 revision carries 64 for the same 61 + 1, slack for up to three MTP
+    heads, so anything validating this must use >= rather than ==.
+    """
+    main = [COMPRESS_HCA, COMPRESS_HCA] + [COMPRESS_CSA if i % 2 == 0 else COMPRESS_HCA for i in range(2, n_layers)]
+    return tuple(main + [COMPRESS_SWA] * n_mtp)
+
+
 COMPRESS_ROPE_THETA = 1.6e5  # compressed layers use their own rope base
 # Lightning indexer (CSA only). 64 global index heads / 8 ranks; each scores the
 # compressed entries with its own 128-dim query, and the weighted head-sum picks

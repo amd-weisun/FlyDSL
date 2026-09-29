@@ -19,7 +19,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from kernels.dsv4_moe_layer.config import COMPRESS_CSA, MoeMode
+from kernels.dsv4_moe_layer.config import COMPRESS_CSA, COMPRESS_HCA, MoeMode
 from kernels.dsv4_moe_layer.reference import (
     V4Config,
     golden_layer,
@@ -97,11 +97,15 @@ def _routing_flipped(got, ref, W, cfg, S):
     if got["sel"].tolist() == ref["sel"].tolist():
         return False
     for s in range(S):
-        if got["sel"][s].tolist() == ref["sel"][s].tolist():
-            continue
+        a, b = got["sel"][s].tolist(), ref["sel"][s].tolist()
+        if set(a) == set(b):
+            continue  # same experts in a different slot order: two near-equal
+            # scores traded places. `mid` is per slot so the caller still rebases,
+            # but there is no membership change to explain and the cut margin is
+            # not the gap that moved.
         sc = (got["scores"][s].float() + W.t["bias"].float()).sort(descending=True).values
         margin = (sc[cfg.top_k - 1] - sc[cfg.top_k]).item()
-        assert margin < 1e-4, f"sample {s} picked different experts on a {margin:.3e} margin"
+        assert margin < 1e-4, f"sample {s} chose a different expert SET on a {margin:.3e} margin"
     return True
 
 
@@ -1544,3 +1548,149 @@ def test_dsv4_state_slots_place_the_rolling_state():
     for pos in range(steps):
         d = (packed[pos].float() - scattered[pos].float()).abs().max().item()
         assert d == 0.0, f"pos={pos}: moving the state to other slots changed the answer by {d:.3e}"
+
+
+def test_dsv4_compress_schedule_is_the_checkpoints():
+    """The per-layer variant schedule, against DeepSeek-V4-Pro's own config.
+
+    Structural first, so this runs anywhere: 62 entries for 61 main layers plus
+    MTP, 31 HCA and 30 CSA among the main ones and no ratio-0 there, layers 0 and
+    1 both HCA, and strict parity from id 2. Then, when a copy of the config
+    happens to be on the box, byte-for-byte -- the artifact is not always
+    present, and a test that silently skipped its only real check would be worse
+    than one that states what it checked.
+    """
+    import json
+    import os
+
+    from kernels.dsv4_moe_layer.config import COMPRESS_CSA as CSA
+    from kernels.dsv4_moe_layer.config import COMPRESS_HCA as HCA
+    from kernels.dsv4_moe_layer.config import compress_ratios
+
+    r = compress_ratios()
+    assert len(r) == 62, f"61 layers plus one MTP entry, got {len(r)}"
+    main, mtp = r[:61], r[61:]
+    assert main.count(HCA) == 31 and main.count(CSA) == 30, f"31 HCA + 30 CSA, got {main}"
+    assert 0 not in main, "V4-Pro has no sliding-window-only main layer"
+    assert mtp == (0,), "the MTP block is the ratio-0 entry"
+    assert main[0] == main[1] == HCA, "layers 0 and 1 are the one break in the alternation"
+    for i in range(2, 61):
+        want = CSA if i % 2 == 0 else HCA
+        assert main[i] == want, f"layer {i} should be {want}, schedule says {main[i]}"
+
+    path = "/tmp/dsv4_ref/config.json"
+    if os.path.exists(path):
+        assert list(r) == json.load(open(path))["compress_ratios"], "schedule differs from the config"
+
+
+@pytest.mark.parametrize("n_layers", [4])
+def test_dsv4_alternating_stack_matches_golden(n_layers):
+    """A stack whose attention variant changes per layer, against the golden.
+
+    This is what per-layer variants is for. Layers of one variant SHARE a
+    compiled kernel, its scratch and its symmetric buffer -- only the weights and
+    the rolling compressor state are per layer -- so the stack builds one
+    Dsv4Variant per distinct ratio and hands it to every layer that uses it.
+    Sharing scratch is why the layers must pass distinct `layer` tags.
+
+    Four layers is the smallest prefix of V4-Pro's own schedule that exercises
+    the alternation AND the repeat: [HCA, HCA, CSA, HCA], so the HCA variant is
+    shared by three layers with three different weight sets and three different
+    rolling states, which is exactly the case a per-layer object would get right
+    by accident and a shared one has to get right on purpose.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer, Dsv4Variant
+
+    torch.manual_seed(0)
+    dev, mode, S = "cuda", MoeMode.W8A8, 1
+    base = _cfg(hc_mult=4)
+    base.max_seq = 256
+    cfgs = []
+    for i in range(n_layers):
+        c = base.for_layer(i)
+        if c.indexed:
+            c.index_topk = 4
+        c.validate()
+        cfgs.append(c)
+    assert {c.compress_ratio for c in cfgs} == {COMPRESS_HCA, COMPRESS_CSA}, "the prefix must alternate"
+
+    Ws = [make_weights(rank=0, cfg=c, device=dev, seed=100 + i, moe_mode=mode) for i, c in enumerate(cfgs)]
+    variants, layers = {}, []
+    for i, c in enumerate(cfgs):
+        if c.compress_ratio not in variants:
+            variants[c.compress_ratio] = Dsv4Variant(c, S, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
+        layers.append(
+            Dsv4MoeLayer(
+                Ws[i],
+                S,
+                rank=0,
+                npes=1,
+                moe_mode=mode,
+                allow_unindexed_csa=True,
+                variant=variants[c.compress_ratio],
+            )
+        )
+    assert len(variants) == 2, "three HCA layers must share one compiled kernel"
+
+    tables = {c.rope_base: rope_table(2048, theta=c.rope_base, device=dev) for c in cfgs}
+    # separate caches: the two sides each evolve their own, or the golden would
+    # gather rows the kernel wrote and the comparison would stop being one
+    kvs_k = [torch.zeros(c.cache_rows, c.head_dim, dtype=torch.bfloat16, device=dev) for c in cfgs]
+    kvs_r = [torch.zeros(c.cache_rows, c.head_dim, dtype=torch.bfloat16, device=dev) for c in cfgs]
+
+    # each layer keeps its OWN rolling compressor state, as every layer of a real
+    # stack does; sharing the variant shares the kernel, never the state
+    def fresh_states():
+        st_all = []
+        for c in cfgs:
+            coff, ihd = c.c_coff, c.index_head_dim
+            st = dict(
+                kv_state=torch.zeros(S, c.c_rows, coff * c.head_dim, device=dev),
+                score_state=torch.full((S, c.c_rows, coff * c.head_dim), float("-inf"), device=dev),
+            )
+            if c.indexed:
+                st |= dict(
+                    i_state=torch.zeros(S, c.c_rows, coff * ihd, device=dev),
+                    i_score_state=torch.full((S, c.c_rows, coff * ihd), float("-inf"), device=dev),
+                    i_cache=torch.zeros(S, c.n_compressed, ihd, dtype=torch.bfloat16, device=dev),
+                )
+            st_all.append(st)
+        return st_all
+
+    # the kernel's rolling state is the layer object's; the golden threads its own
+    k_states, states = fresh_states(), fresh_states()
+    for lay, st in zip(layers, k_states):
+        for k, v in st.items():
+            setattr(lay, {"i_state": "i_kv_state"}.get(k, k), v)
+
+    # Each layer is judged against the golden fed THIS layer's kernel input, not
+    # against a golden chained end to end. The chain is still what produced that
+    # input, so variant dispatch, weights and state are all under test -- but a
+    # single routing flip at any layer's top-k cut would otherwise dominate the
+    # end-to-end number and stop it measuring any of them. Same reason the
+    # single-layer tests rebase on the kernel's own routing.
+    for pos in range(3 * COMPRESS_CSA):
+        h = (0.5 * torch.randn(S, base.hc_mult, base.hidden, device=dev)).bfloat16()
+        cur = torch.tensor([pos] * S, dtype=torch.int32, device=dev)
+        hk = h
+        for i, (c, lay) in enumerate(zip(cfgs, layers)):
+            cos, sin = tables[c.rope_base]
+            idx, dest = contiguous_pool([pos] * S, c, dev)
+            h_in = hk
+            hk = lay.forward(h_in, cur, kvs_k[i], dest, idx, cos, sin, layer=i, advance=False)
+            torch.cuda.synchronize()
+            got = lay.intermediates()
+            kw = dict(states[i])
+            if c.compress_ratio:
+                kw |= dict(cos_c=cos, sin_c=sin)
+            ref = golden_layer(Ws[i], h_in, [pos] * S, kvs_r[i], dest, idx, cos, sin, lambda z: z, moe_mode=mode, **kw)
+            if _routing_flipped(got, ref, Ws[i], c, S):
+                ref = _rebase_on_own_routing(got, ref, Ws[i], mode)
+            a, b = hk.float(), ref["x_out"].float()
+            rel = ((a - b).norm() / b.norm()).item()
+            tol = _tol(OUT_REL_L2, c.hc_mult, 1)
+            assert rel < tol, f"pos={pos} layer {i} (ratio {c.compress_ratio}): rel_l2 {rel:.4f} >= {tol}"
+        for v in variants.values():
+            v.advance_step()
+    for v in variants.values():
+        v.close()
