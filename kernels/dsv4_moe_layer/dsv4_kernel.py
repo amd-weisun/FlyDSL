@@ -730,6 +730,9 @@ def build_dsv4_kernel(
     # This binds the context: n_keys <= 4096, so HCA (whose key list grows with
     # the sequence) tops out near max_seq 508K, while CSA is unaffected at any
     # length because index_topk pins its n_keys at 1152.
+    # Largest chunk up to 8 that divides the split count: bounds how many
+    # per-split words the `uv` merge holds live at once (see the loop below).
+    UV_CHUNK = max(c for c in range(1, 9) if N_SPLIT % c == 0)
     assert N_SPLIT <= THREADS // WAVES, (
         f"{N_SPLIT} key splits needs a block-wide merge in `uv`; one wave holds {THREADS // WAVES}. "
         f"n_keys {N_KEYS} = window {window} + the compressed list, so this is a max_seq limit"
@@ -2740,18 +2743,11 @@ def build_dsv4_kernel(
             dp = fx.min(tid, UV_PAIRS - 1)  # dim pair within this tile
             spi = fx.min(lane, N_SPLIT - 1)
             ml = (s * N_SPLIT + spi) * H + head
-            got = poll(
-                [
-                    (mb("sp_acc"), ((s * N_SPLIT + j) * H + head) * (HEAD_DIM // 2) + doff // 2 + dp, 1)
-                    for j in range(N_SPLIT)
-                ]
-                + [(mb("sp_m"), ml, 1), (mb("sp_l"), ml, 1)],
-                batch=N_SPLIT + 2,
-            )
+            got = poll([(mb("sp_m"), ml, 1), (mb("sp_l"), ml, 1)], batch=2)
             if wave == 0:  # per-split weights exp(m - M) / L for this head -> misc[sp]
                 ok_sp = lane < N_SPLIT
-                m_sp = ok_sp.select(got[N_SPLIT][0].bitcast(fx.Float32), fx.Float32(NEG))
-                l_sp = ok_sp.select(got[N_SPLIT + 1][0].bitcast(fx.Float32), fx.Float32(0.0))
+                m_sp = ok_sp.select(got[0][0].bitcast(fx.Float32), fx.Float32(NEG))
+                l_sp = ok_sp.select(got[1][0].bitcast(fx.Float32), fx.Float32(0.0))
                 mx = wave_max(m_sp)
                 w_sp = _exp(m_sp - mx)
                 den = wave_sum(l_sp * w_sp) + _exp(sink - mx)
@@ -2759,13 +2755,39 @@ def build_dsv4_kernel(
                     lds_st(misc, lane, w_sp * _rcp(den))
             stamp("uv", tt, 2)
             gpu.barrier()
-            o0 = fx.Float32(0.0)
-            o1 = fx.Float32(0.0)
-            for j in range_constexpr(N_SPLIT):
-                wj = lds_ld(misc, j)
-                a0, a1 = bf2_f32(got[j][0])
-                o0 = o0 + a0 * wj
-                o1 = o1 + a1 * wj
+            # Accumulate the per-split values a CHUNK at a time, in a runtime
+            # loop. Polling all N_SPLIT of them up front and consuming them in a
+            # constexpr loop keeps N_SPLIT + 2 words live at once: fine at 18
+            # splits, but at 64 it overruns the 256-VGPR budget and spills 113
+            # registers into 368 bytes of scratch (measured, and worth ~26 us).
+            # The chunk keeps one iteration live while still issuing UV_CHUNK
+            # loads at a time, so the waits do not serialise. Same shape of fix
+            # as the i_score loop above.
+            for _c, acc in range(
+                0, N_SPLIT // UV_CHUNK, fx.Int32(1), init=[fx.Float32(0.0), fx.Float32(0.0)]
+            ):
+                cb = fx.Int32(_c) * UV_CHUNK
+                gc = poll(
+                    [
+                        (
+                            mb("sp_acc"),
+                            ((s * N_SPLIT + cb + e) * H + head) * (HEAD_DIM // 2) + doff // 2 + dp,
+                            1,
+                        )
+                        for e in range(UV_CHUNK)
+                    ],
+                    batch=UV_CHUNK,
+                )
+                o0 = fx.Float32(acc[0])
+                o1 = fx.Float32(acc[1])
+                for e in range_constexpr(UV_CHUNK):
+                    wj = lds_ld(misc, cb + e)
+                    a0, a1 = bf2_f32(gc[e][0])
+                    o0 = o0 + a0 * wj
+                    o1 = o1 + a1 * wj
+                res = yield [o0, o1]
+            o0 = fx.Float32(res[0])
+            o1 = fx.Float32(res[1])
             # de-rotate the RoPE lanes (inverse rotation: sin negated)
             d0 = doff + dp * 2
             ri = fx.max(d0 - NOPE_DIM, fx.Int32(0)) // 2
