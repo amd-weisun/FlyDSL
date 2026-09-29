@@ -95,8 +95,11 @@ def dn_tile(S: int, hidden: int = HIDDEN) -> int:
     """Hidden rows per expert-down / FFN peer-reduce task: 32 at S = 1 (192 tasks,
     placed off the router CTAs, whose up/gate task finishes last, so every down task
     streams its weights during the mid wait); 24 above (one task per CTA), where
-    each down task already streams S x 9 experts."""
-    return 32 if S == 1 else hidden // BLOCKS
+    each down task already streams S x 9 experts.  The down stage assumes a tile starts
+    at row 0 or 8 of a 16-row MFMA group, so any other ``hidden // BLOCKS`` (e.g. 28 for
+    hidden=7168, whose tiles can span three groups) falls back to the 32-row tile."""
+    tile = hidden // BLOCKS
+    return tile if S > 1 and hidden % BLOCKS == 0 and tile in (8, 16, 24, 32) else 32
 
 
 N_ROUTER = N_EXPERTS // ROUTER_TILE
@@ -338,8 +341,18 @@ def build_shared_reuse_kernel(
     q_lora: int = Q_LORA,
     nope_dim: int = NOPE_DIM,
     v_dim: int = V_DIM,
+    paged: bool = False,
+    eps: float = EPS,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer.
+
+    ``paged=True`` is the serving (ATOM) decode mode: the S samples are S *independent*
+    sequences with one new token each.  ``cur_pos`` is then an int32[S] array of rope
+    positions, ``slot_map`` int32[S] the cache row of each new token, and
+    ``kv_indptr``/``indices`` the CSR list of every sample's cache rows (its own new row
+    included); the cache is a paged pool of 576-wide bf16 rows (512 latent | 64 k_pe,
+    ``pe_cache`` = ``kv_cache`` + 512 elements).  ``paged=False`` keeps the one-sequence,
+    S-consecutive-tokens contract with separate contiguous kv/pe caches.
 
     ``n_groups``/``topk_groups`` add DeepSeek-V3-style group-limited routing (see
     ``reference.route``'s docstring for the exact selection semantics this mirrors);
@@ -383,6 +396,7 @@ def build_shared_reuse_kernel(
     # function as local to the whole function (so this block must run first, or
     # any earlier read raises UnboundLocalError instead of silently using the
     # module default).
+    EPS = eps
     HIDDEN = hidden
     Q_LORA = q_lora
     NOPE_DIM = nope_dim
@@ -411,6 +425,8 @@ def build_shared_reuse_kernel(
     TG = topk_groups
     SC, SY = layout(S, H, W, topk, moe_mode, hidden=HIDDEN, q_lora=Q_LORA, nope_dim=NOPE_DIM, v_dim=V_DIM)
     N_SPLIT = topk // SPLIT_KEYS
+    KV_ROW = KV_LORA + PE_DIM if paged else KV_LORA  # cache row stride in bf16 elements
+    PE_ROW = KV_LORA + PE_DIM if paged else PE_DIM
     QB_ROWS = H * (NOPE_DIM + PE_DIM)
     N_QB = QB_ROWS // Q_B_TILE
     QB_PER_HEAD = (NOPE_DIM + PE_DIM) // Q_B_TILE
@@ -462,6 +478,8 @@ def build_shared_reuse_kernel(
         kv_cache: Int64,
         pe_cache: Int64,
         indices: Int64,
+        slot_map: Int64,
+        kv_indptr: Int64,
         rope_cos: Int64,
         rope_sin: Int64,
         g_in: Int64,
@@ -514,6 +532,19 @@ def build_shared_reuse_kernel(
         # makes it unique per layer within the step.
         tag = _uniform(bo.buffer_load(_rsrc(step), 0, vec_width=1, dtype=T.i32)) * LAYER_SLOTS + layer + 1
         pos0 = _uniform(bo.buffer_load(_rsrc(cur_pos), 0, vec_width=1, dtype=T.i32))
+
+        def pos_of(s):
+            """Rope position of sample ``s``."""
+            if const_expr(paged):
+                # not readfirstlane'd: ``s`` may differ per lane (the q RoPE tile)
+                return fx.Int32(bo.buffer_load(_rsrc(cur_pos), s, vec_width=1, dtype=T.i32))
+            return pos0 + s
+
+        def slot_of(s):
+            """Cache row this launch writes sample ``s``'s new token to."""
+            if const_expr(paged):
+                return fx.Int32(bo.buffer_load(_rsrc(slot_map), s, vec_width=1, dtype=T.i32))
+            return pos0 + s
         r_peers = _rsrc(peers)
         # Each wave sends to one peer, so retain only that wave's destination.
         pv = fx.Vector(bo.buffer_load(r_peers, fx.min(wave, W - 1) * 2, vec_width=2, dtype=T.i32))
@@ -1244,8 +1275,8 @@ def build_shared_reuse_kernel(
             # gamma and the RoPE factors are issued ahead of the wait
             g = ld_bf16(_rsrc(g_kv), tid)
             tpe = tid % (PE_DIM // 2)
-            cs = [ld_f32(_rsrc(rope_cos), (pos0 + s) * (PE_DIM // 2) + tpe) for s in range(S)]
-            sns = [ld_f32(_rsrc(rope_sin), (pos0 + s) * (PE_DIM // 2) + tpe) for s in range(S)]
+            cs = [ld_f32(_rsrc(rope_cos), pos_of(s) * (PE_DIM // 2) + tpe) for s in range(S)]
+            sns = [ld_f32(_rsrc(rope_sin), pos_of(s) * (PE_DIM // 2) + tpe) for s in range(S)]
             hint_wait(
                 (KV_LORA + PE_DIM) // QKV_A_TILE,
                 lambda k: (mb("kv_a"), (S - 1) * (KV_LORA + PE_DIM) + k * QKV_A_TILE + QKV_A_TILE - 1),
@@ -1259,17 +1290,17 @@ def build_shared_reuse_kernel(
             stamp("cache", t, 2)
             ssq = block_sums([v * v for v in vs])
             for s in range_constexpr(S):
-                pos = pos0 + s
+                pos = slot_of(s)
                 kvn = bf16_round(vs[s] * _rsq(ssq[s] * (1.0 / KV_LORA) + EPS) * g)
-                bo.buffer_store(kvn.to(fx.BFloat16), r_kv, pos * KV_LORA + tid)
+                bo.buffer_store(kvn.to(fx.BFloat16), r_kv, pos * KV_ROW + tid)
                 put(mb("kvnew"), s * KV_LORA + tid, kvn)
                 if tid < PE_DIM // 2:
                     x0, x1 = pes[s]
                     c, sn = cs[s], sns[s]
                     p0 = bf16_round(x0 * c - x1 * sn)
                     p1 = bf16_round(x0 * sn + x1 * c)
-                    bo.buffer_store(p0.to(fx.BFloat16), r_pe, pos * PE_DIM + tid * 2)
-                    bo.buffer_store(p1.to(fx.BFloat16), r_pe, pos * PE_DIM + tid * 2 + 1)
+                    bo.buffer_store(p0.to(fx.BFloat16), r_pe, pos * PE_ROW + tid * 2)
+                    bo.buffer_store(p1.to(fx.BFloat16), r_pe, pos * PE_ROW + tid * 2 + 1)
                     put2(mb("penew"), s * PE_DIM + tid * 2, p0, p1)
             stamp("cache", t, 4)
 
@@ -1320,8 +1351,8 @@ def build_shared_reuse_kernel(
                     i = hoff - NOPE_DIM + pr * 2
                     x0 = lds_ld(outs, s * Q_B_TILE + pr * 2)
                     x1 = lds_ld(outs, s * Q_B_TILE + pr * 2 + 1)
-                    c = ld_f32(_rsrc(rope_cos), (pos0 + s) * (PE_DIM // 2) + i // 2)
-                    sn = ld_f32(_rsrc(rope_sin), (pos0 + s) * (PE_DIM // 2) + i // 2)
+                    c = ld_f32(_rsrc(rope_cos), pos_of(s) * (PE_DIM // 2) + i // 2)
+                    sn = ld_f32(_rsrc(rope_sin), pos_of(s) * (PE_DIM // 2) + i // 2)
                     put_bf(mb("q_pe"), (s * H + head) * PE_DIM + i, [x0 * c - x1 * sn, x0 * sn + x1 * c])
             stamp("q_b", t, 4)
 
@@ -1370,6 +1401,17 @@ def build_shared_reuse_kernel(
 
         def split_keys(t, s):
             """(nkeys, sparse) of sample s; wave 0 writes this split's 64 cache rows to LDS keys."""
+            if const_expr(paged):
+                # every key row comes from the sample's CSR list (its own new row last)
+                base = _uniform(bo.buffer_load(_rsrc(kv_indptr), s, vec_width=1, dtype=T.i32))
+                kv_len = _uniform(bo.buffer_load(_rsrc(kv_indptr), s + 1, vec_width=1, dtype=T.i32)) - base
+                sparse = kv_len > topk
+                nkeys = sparse.select(fx.Int32(topk), kv_len)
+                if wave == 0:
+                    k_pos = t * SPLIT_KEYS + lane
+                    k_cl = (k_pos < nkeys).select(k_pos, 0)
+                    lds_st(keys, lane, fx.Int32(bo.buffer_load(r_idx, base + k_cl, vec_width=1, dtype=T.i32)))
+                return nkeys, sparse
             kv_len = pos0 + s + 1
             sparse = kv_len > topk
             nkeys = sparse.select(fx.Int32(topk), kv_len)
@@ -1389,18 +1431,24 @@ def build_shared_reuse_kernel(
             krows = [lds_ld(keys, wave * KPW + jj) for jj in range(KPW)]
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
-                kv8 = fx.Vector(bo.buffer_load(r_kv, krows[jj] * (KV_LORA // 2) + lane * 4, vec_width=4, dtype=T.i32))
+                kv8 = fx.Vector(bo.buffer_load(r_kv, krows[jj] * (KV_ROW // 2) + lane * 4, vec_width=4, dtype=T.i32))
                 fx.ptr_store(kv8.bitcast(fx.Float32), ktile + (j * KS + lane * 4))
                 if lane < PE_DIM // 2:
-                    lds_st(petile, j * PS + lane, ld_f32(r_pe, krows[jj] * (PE_DIM // 2) + lane))
+                    lds_st(petile, j * PS + lane, ld_f32(r_pe, krows[jj] * (PE_ROW // 2) + lane))
 
-        def patch_new_kv():
+        def patch_new_kv(s):
             """Rows appended by this launch come from the cache task's kvnew / penew pairs."""
+            own = slot_of(s)  # paged: sample s's only new row
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
                 kr = lds_ld(keys, j)
-                if kr >= pos0:
+                if const_expr(paged):
+                    hit = kr == own
+                    sn = s
+                else:
+                    hit = kr >= pos0
                     sn = kr - pos0
+                if hit:
                     kvp = get2_many([(mb("kvnew"), sn * KV_LORA + lane * 8 + m * 2) for m in range(4)])
                     w = [bf16_pair(a0, a1) for a0, a1 in kvp]
                     fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * 4))
@@ -1456,7 +1504,7 @@ def build_shared_reuse_kernel(
                 qw = hh * QS + KV_LORA // 2 + (tid % (PE_DIM // 4)) * 2
                 lds_st(xs, qw, qv[NQ][0].bitcast(fx.Float32))
                 lds_st(xs, qw + 1, qv[NQ][1].bitcast(fx.Float32))
-            patch_new_kv()
+            patch_new_kv(s)
             if const_expr(True):
                 stamp("split", tt, 2)
             gpu.barrier()
@@ -2165,6 +2213,8 @@ def build_shared_reuse_kernel(
         kv_cache: Int64,
         pe_cache: Int64,
         indices: Int64,
+        slot_map: Int64,
+        kv_indptr: Int64,
         rope_cos: Int64,
         rope_sin: Int64,
         g_in: Int64,
@@ -2203,6 +2253,8 @@ def build_shared_reuse_kernel(
             kv_cache,
             pe_cache,
             indices,
+            slot_map,
+            kv_indptr,
             rope_cos,
             rope_sin,
             g_in,
