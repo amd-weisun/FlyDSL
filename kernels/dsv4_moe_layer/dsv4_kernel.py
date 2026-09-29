@@ -661,6 +661,11 @@ def build_dsv4_kernel(
     CW = C_COFF * HEAD_DIM  # width of one state row
     C_ROWS = C_COFF * CR  # rows of state
     OVERLAP = C_COFF > 1
+    # Rows of state the pooling loop folds per trip. Its online softmax carries
+    # (max, den, num) serially, but the LOADS do not depend on the carry, so
+    # issuing a trip's worth together is what keeps the loop off memory latency:
+    # one row at a time, HCA's 128 rows cost 270 ns each and 37% of the layer.
+    CMP_CHUNK = max(c for c in range(1, 9) if C_ROWS % c == 0) if C_ROWS else 1
     CBASE = CR if OVERLAP else 0  # the current window fills the second half
     # the window and the compressed entries share one cache, the compressed half
     # starting at `window`, so the attention gathers both from one index list
@@ -2052,28 +2057,40 @@ def build_dsv4_kernel(
                         bo.buffer_store(kvv[j], r_kvst, w)
                         bo.buffer_store(gtv[j] + ap0[j], r_scst, w)
                 if (p + 1) % CR == 0:  # uniform across the CTA
-                    # online softmax over the window, one channel per thread, so the
-                    # CR positions are a loop rather than CR unrolled copies
+                    # Online softmax over the window, one channel per thread, so the
+                    # CR positions are a loop rather than CR unrolled copies -- a
+                    # CMP_CHUNK of them per trip, all their loads issued before any
+                    # is consumed. Keeping the loop runtime is what stops the whole
+                    # window being hoisted into registers; keeping a chunk of loads
+                    # in flight is what stops each row costing a round trip.
                     for _i, acc in range(
                         0,
-                        C_ROWS,
+                        C_ROWS // CMP_CHUNK,
                         fx.Int32(1),
                         init=[fx.Float32(NEG), fx.Float32(0.0), fx.Float32(0.0)],
                     ):
+                        ib = fx.Int32(_i) * CMP_CHUNK
+                        svs, kvs = [], []
+                        for e in range_constexpr(CMP_CHUNK):
+                            # an overlapped entry takes the previous window's rows
+                            # from their FIRST half and the current window's from
+                            # their SECOND
+                            i = ib + e
+                            coff = (i >= CR).select(fx.Int32(HEAD_DIM), fx.Int32(0)) if OVERLAP else 0
+                            wi = sb + i * CW + coff + ch
+                            svs.append(ld_f32(r_scst, wi))
+                            kvs.append(ld_f32(r_kvst, wi))
                         m = fx.Float32(acc[0])
                         den = fx.Float32(acc[1])
                         num = fx.Float32(acc[2])
-                        # an overlapped entry takes the previous window's rows from
-                        # their FIRST half and the current window's from their SECOND
-                        i = fx.Int32(_i)
-                        coff = (i >= CR).select(fx.Int32(HEAD_DIM), fx.Int32(0)) if OVERLAP else 0
-                        wi = sb + i * CW + coff + ch
-                        sv = ld_f32(r_scst, wi)
-                        kv_i = ld_f32(r_kvst, wi)
-                        m_new = fx.max(m, sv)
-                        rescale = _exp(m - m_new)
-                        w = _exp(sv - m_new)
-                        res = yield [m_new, den * rescale + w, num * rescale + w * kv_i]
+                        for e in range_constexpr(CMP_CHUNK):
+                            m_new = fx.max(m, svs[e])
+                            rescale = _exp(m - m_new)
+                            w = _exp(svs[e] - m_new)
+                            den = den * rescale + w
+                            num = num * rescale + w * kvs[e]
+                            m = m_new
+                        res = yield [m, den, num]
                     pooled = fx.Float32(res[2]) * _rcp(fx.Float32(res[1]))
                     pooled = bf16_round(pooled)
                     ssq = block_sum(live.select(pooled * pooled, fx.Float32(0.0)))
