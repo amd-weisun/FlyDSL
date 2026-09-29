@@ -1292,15 +1292,19 @@ def build_shared_reuse_kernel(
             for s in range_constexpr(S):
                 pos = slot_of(s)
                 kvn = bf16_round(vs[s] * _rsq(ssq[s] * (1.0 / KV_LORA) + EPS) * g)
-                bo.buffer_store(kvn.to(fx.BFloat16), r_kv, pos * KV_ROW + tid)
+                # paged: a padded sample (CUDA-graph batch padding) has slot -1 and stores nothing;
+                # its mailbox rows below are still produced so consumers never wait forever
+                if pos >= 0:
+                    bo.buffer_store(kvn.to(fx.BFloat16), r_kv, pos * KV_ROW + tid)
                 put(mb("kvnew"), s * KV_LORA + tid, kvn)
                 if tid < PE_DIM // 2:
                     x0, x1 = pes[s]
                     c, sn = cs[s], sns[s]
                     p0 = bf16_round(x0 * c - x1 * sn)
                     p1 = bf16_round(x0 * sn + x1 * c)
-                    bo.buffer_store(p0.to(fx.BFloat16), r_pe, pos * PE_ROW + tid * 2)
-                    bo.buffer_store(p1.to(fx.BFloat16), r_pe, pos * PE_ROW + tid * 2 + 1)
+                    if pos >= 0:
+                        bo.buffer_store(p0.to(fx.BFloat16), r_pe, pos * PE_ROW + tid * 2)
+                        bo.buffer_store(p1.to(fx.BFloat16), r_pe, pos * PE_ROW + tid * 2 + 1)
                     put2(mb("penew"), s * PE_DIM + tid * 2, p0, p1)
             stamp("cache", t, 4)
 
@@ -1405,6 +1409,7 @@ def build_shared_reuse_kernel(
                 # every key row comes from the sample's CSR list (its own new row last)
                 base = _uniform(bo.buffer_load(_rsrc(kv_indptr), s, vec_width=1, dtype=T.i32))
                 kv_len = _uniform(bo.buffer_load(_rsrc(kv_indptr), s + 1, vec_width=1, dtype=T.i32)) - base
+                kv_len = (kv_len > 0).select(kv_len, fx.Int32(1))  # padded sample: one dummy key, no NaN softmax
                 sparse = kv_len > topk
                 nkeys = sparse.select(fx.Int32(topk), kv_len)
                 if wave == 0:

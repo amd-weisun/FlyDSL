@@ -33,7 +33,7 @@ MAX_SEQ = 4096
 POOL_ROWS = 16384
 
 
-def run(S, lens, seed=1234, dev="cuda:0"):
+def run(S, lens, seed=1234, dev="cuda:0", pad=0):
     from kernels.mla_moe_layer.layer import SharedReuseMlaMoeLayer
 
     torch.cuda.set_device(dev)
@@ -50,8 +50,8 @@ def run(S, lens, seed=1234, dev="cuda:0"):
         o += L
     indptr = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device=dev)
     indices = torch.cat(slots).to(torch.int32)
-    positions = torch.tensor([L - 1 for L in lens], dtype=torch.int32, device=dev)
-    slot_map = torch.stack([sl[-1] for sl in slots]).to(torch.int32)
+    positions = torch.tensor([max(L - 1, 0) for L in lens], dtype=torch.int32, device=dev)
+    slot_map = torch.stack([sl[-1] if len(sl) else torch.tensor(-1, device=dev) for sl in slots]).to(torch.int32)
     h = torch.randn(S, DS["hidden"], generator=gen, device=dev).to(torch.bfloat16)
     pool0 = pool.clone()
 
@@ -66,6 +66,9 @@ def run(S, lens, seed=1234, dev="cuda:0"):
     worst = 0.0
     for b in range(S):
         L = lens[b]
+        if L == 0:  # padded sample: finite output, and (checked below) it stored nothing
+            assert torch.isfinite(out[b].float()).all(), "padded sample produced non-finite output"
+            continue
         kv = torch.zeros(MAX_SEQ, KV_LORA, dtype=torch.bfloat16, device=dev)
         pe = torch.zeros(MAX_SEQ, PE_DIM, dtype=torch.bfloat16, device=dev)
         kv[: L - 1] = pool0[slots[b][:-1].long(), :KV_LORA]
@@ -101,7 +104,7 @@ def run(S, lens, seed=1234, dev="cuda:0"):
         torch.testing.assert_close(new[KV_LORA:].float(), pe[L - 1].float(), atol=2e-2, rtol=1e-2)
     # only the new rows may change
     mask = torch.ones(POOL_ROWS, dtype=torch.bool, device=dev)
-    mask[slot_map.long()] = False
+    mask[slot_map[slot_map >= 0].long()] = False
     assert torch.equal(pool[mask], pool0[mask]), "paged kernel wrote outside the new-token rows"
     op.close()
     return worst
@@ -110,6 +113,11 @@ def run(S, lens, seed=1234, dev="cuda:0"):
 @pytest.mark.parametrize("lens", [[37], [1500], [200, 2000], [1, 64, 65, 700], [3, 10, 999, 2048, 5, 640, 1, 2000]])
 def test_paged_layer(lens):
     assert run(len(lens), lens) < 5e-2
+
+
+def test_paged_padded_samples():
+    """CUDA-graph batch padding: slot -1 and an empty CSR range must store nothing and stay finite."""
+    assert run(4, [120, 300, 0, 0], pad=2) < 5e-2
 
 
 if __name__ == "__main__":
