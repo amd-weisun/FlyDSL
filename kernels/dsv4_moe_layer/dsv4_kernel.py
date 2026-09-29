@@ -2275,7 +2275,10 @@ def build_dsv4_kernel(
                     # Push to every peer, then sum all ranks' partials in rank order
                     # from our own buffer: same order everywhere, so the totals are
                     # bit-identical and the top-k below cannot disagree.
-                    stamp("i_score", tt, 5)
+                    # mark 3, not 5: the report reads marks 0..4, so this is what
+                    # splits `compute` (the scoring loop) from `epi` (the exchange).
+                    # Stamping outside that range lumped them together.
+                    stamp("i_score", tt, 3)
                     for p in range_constexpr(W):
                         pv2 = fx.Vector(bo.buffer_load(r_peers, p * 2, vec_width=2, dtype=T.i32))
                         dst = (fx.Int64(_uniform(pv2[1])) << 32) | fx.Int64(fx.Uint32(_uniform(pv2[0])))

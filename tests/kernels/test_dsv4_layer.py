@@ -222,12 +222,17 @@ def test_dsv4_rejects_head_dim_that_would_deadlock():
 TP_SEED = 1234
 
 
-def _tp_cfg(real: bool, hc_mult: int = 1, compress_ratio: int = 0):
+def _tp_cfg(real: bool, hc_mult: int = 1, compress_ratio: int = 0, max_seq: int | None = None):
     # NOT a module global: mp.spawn re-imports this module in each child, so
     # anything set under __main__ never reaches the workers
     cfg = V4Config(hc_mult=hc_mult) if real else _cfg(hc_mult)
     if compress_ratio:
-        cfg.compress_ratio, cfg.max_seq = compress_ratio, 256
+        # 256 keeps the correctness runs short. It also decides n_compressed and
+        # so the whole compressed shape, so a benchmark MUST pass the length it
+        # means to report -- measuring one shape and printing another is a way to
+        # publish a number for a configuration that never ran.
+        cfg.compress_ratio = compress_ratio
+        cfg.max_seq = 256 if max_seq is None else max_seq
     return cfg
 
 
@@ -439,23 +444,43 @@ def test_dsv4_hca_layer_tp8():
 BENCH_LAYERS = 16
 
 
-def bench_rank(rank, npes, real=True, iters=320, group=None, timeline=False, moe_mode=MoeMode.A8W4, hc_mult=1):
-    """Returns us per layer."""
+def bench_rank(
+    rank,
+    npes,
+    real=True,
+    iters=320,
+    group=None,
+    timeline=False,
+    moe_mode=MoeMode.A8W4,
+    hc_mult=1,
+    compress_ratio=0,
+    max_seq=None,
+):
+    """Returns (us per layer, the config it was measured on).
+
+    ``compress_ratio`` picks the attention variant: 0 sliding-window, 128 HCA,
+    4 CSA. The cost is position-independent by construction -- the gather walks a
+    compile-time ``n_keys`` and the indexer scores the whole compressed cache with
+    the unwritten entries masked -- so one fixed position measures the steady
+    state.
+    """
     import torch.distributed as dist
 
     from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
 
     dev = torch.device("cuda", rank)
     torch.cuda.set_device(dev)
-    cfg = _tp_cfg(real, hc_mult)
+    cfg = _tp_cfg(real, hc_mult, compress_ratio, max_seq)
     cfg.validate()
     W = make_weights(rank, cfg=cfg, device=dev, seed=TP_SEED, moe_mode=moe_mode)
-    cos, sin = rope_table(4096, theta=cfg.rope_theta, device=dev)
-    kv = torch.randn(cfg.window, cfg.head_dim, device=dev).to(torch.bfloat16)
-    pos = cfg.window
-    idx = window_idxs(pos, 1, cfg.window, dev)
+    cos, sin = rope_table(max(4096, cfg.max_seq), theta=cfg.rope_base, device=dev)
+    kv = torch.randn(cfg.cache_rows, cfg.head_dim, device=dev).to(torch.bfloat16)
+    # deep enough that the compressed half of the cache is full, which is the
+    # steady state a decode spends nearly all of its time in
+    pos = (cfg.max_seq - 1) if compress_ratio else cfg.window
+    idx = layer_idxs(pos, 1, cfg, dev) if compress_ratio else window_idxs(pos, 1, cfg.window, dev)
     cur = torch.tensor([pos], dtype=torch.int32, device=dev)
-    op = Dsv4MoeLayer(W, 1, rank=rank, npes=npes, group=group, moe_mode=moe_mode)
+    op = Dsv4MoeLayer(W, 1, rank=rank, npes=npes, group=group, moe_mode=moe_mode, allow_unindexed_csa=True)
     hshape = (1, cfg.hidden) if cfg.hc_mult == 1 else (1, cfg.hc_mult, cfg.hidden)
     h = torch.randn(*hshape, device=dev).to(torch.bfloat16)
     x = torch.empty_like(h)
@@ -466,7 +491,16 @@ def bench_rank(rank, npes, real=True, iters=320, group=None, timeline=False, moe
         dist.barrier()
 
     if timeline:
-        top = Dsv4MoeLayer(W, 1, rank=rank, npes=npes, group=group, timeline=True, moe_mode=moe_mode)
+        top = Dsv4MoeLayer(
+            W,
+            1,
+            rank=rank,
+            npes=npes,
+            group=group,
+            timeline=True,
+            moe_mode=moe_mode,
+            allow_unindexed_csa=True,
+        )
         for _ in range(3):
             top.forward(h, cur, kv, idx, cos, sin, x_out=x)
         torch.cuda.synchronize()
@@ -492,26 +526,49 @@ def bench_rank(rank, npes, real=True, iters=320, group=None, timeline=False, moe
     torch.cuda.synchronize()
     us = t0.elapsed_time(t1) * 1e3 / (iters // BENCH_LAYERS * BENCH_LAYERS)
     op.close()
-    return us
+    # the shape travels with the number, so a report cannot describe a run that
+    # did not happen
+    return us, dict(n_keys=cfg.n_keys, n_comp=cfg.n_compressed, max_seq=cfg.max_seq)
 
 
-def _bench_worker(rank, npes, real, timeline, moe_mode, hc_mult, results):
+def _bench_worker(rank, npes, real, timeline, moe_mode, hc_mult, compress_ratio, max_seq, port, results):
     import torch.distributed as dist
 
-    dist.init_process_group("gloo", init_method="tcp://127.0.0.1:29552", rank=rank, world_size=npes)
+    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=npes)
     try:
-        results[rank] = bench_rank(rank, npes, real=real, timeline=timeline, moe_mode=moe_mode, hc_mult=hc_mult)
+        results[rank] = bench_rank(
+            rank,
+            npes,
+            real=real,
+            timeline=timeline,
+            moe_mode=moe_mode,
+            hc_mult=hc_mult,
+            compress_ratio=compress_ratio,
+            max_seq=max_seq,
+        )
     finally:
         dist.destroy_process_group()
 
 
-def run_bench(npes, real=True, timeline=False, moe_mode=MoeMode.A8W4, hc_mult=1):
+def run_bench(npes, real=True, timeline=False, moe_mode=MoeMode.A8W4, hc_mult=1, compress_ratio=0, max_seq=None):
+    kw = dict(
+        real=real,
+        timeline=timeline,
+        moe_mode=moe_mode,
+        hc_mult=hc_mult,
+        compress_ratio=compress_ratio,
+        max_seq=max_seq,
+    )
     if npes == 1:
-        return {0: bench_rank(0, 1, real=real, timeline=timeline, moe_mode=moe_mode, hc_mult=hc_mult)}
+        return {0: bench_rank(0, 1, **kw)}
     import torch.multiprocessing as mp
 
     results = mp.Manager().dict()
-    mp.spawn(_bench_worker, args=(npes, real, timeline, moe_mode, hc_mult, results), nprocs=npes)
+    mp.spawn(
+        _bench_worker,
+        args=(npes, real, timeline, moe_mode, hc_mult, compress_ratio, max_seq, _free_port(), results),
+        nprocs=npes,
+    )
     return dict(results)
 
 
@@ -529,7 +586,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
     if a.bench:
         res = run_bench(a.npes, a.real, a.timeline, MoeMode(a.moe_mode), a.hc_mult)
-        us = [res[r] for r in sorted(res)]
+        us = [res[r][0] for r in sorted(res)]
         tag = "real V4-Pro" if a.real else "reduced"
         print(
             f"{tag} shard, {a.moe_mode}, hc={a.hc_mult}, npes={a.npes}: {max(us):7.1f} us/layer  (per rank: "

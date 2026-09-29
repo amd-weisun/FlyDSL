@@ -251,6 +251,8 @@ class Dsv4MoeLayer:
         t0 = tl[:, 0].min()
         rows, i = [], 0
         for name, n in self.stages:
+            if not n:  # a stage this configuration compiles out has no rows to report
+                continue
             st = tl[i : i + n].clone()
             i += n
             for c in (1, 2, 3):  # missing marks inherit the previous one
