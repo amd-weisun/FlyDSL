@@ -746,10 +746,21 @@ def build_dsv4_kernel(
     IH_TOTAL = index_heads_total or index_heads
     N_COMP = (max_seq // CR) if (IHD and CR) else 0
     N_INDEX = n_index(max_seq, compress_ratio, index_head_dim, index_topk)
-    # candidates per thread in the top-k. They are re-read each radix pass rather
-    # than held, so this bounds a loop trip count, not a register budget.
-    TOPK_PER = max(1, (N_COMP + THREADS - 1) // THREADS) if N_COMP else 1
+    # The top-k re-reads its candidates each radix pass rather than holding them,
+    # so these bound a loop trip count, not a register budget. A thread takes
+    # TK_PER CONSECUTIVE candidates per trip -- two 16-byte loads, the widest the
+    # ISA has -- and the threads stride over those groups, so a wave's trip is one
+    # contiguous run.
+    TK_PER = 4
     TK_BINS = 256  # 8-bit radix digit; 4 passes cover the key
+    # Copies of the bin array, one per lane group. A score's top digit is its sign
+    # and exponent, which barely vary across a context's worth of logits, so nearly
+    # every lane of a wave bins to the SAME counter and the read-modify-writes
+    # serialize -- that one conflict was 700 of the 1113 us the select took at 1M.
+    # Splitting by lane spreads them over consecutive words, so over banks.
+    TK_REP = 16
+    TK_BC = TK_BINS * TK_REP  # the two words past the bins that broadcast a pass's result
+    TK_TRIPS = max(1, -(-N_COMP // (THREADS * TK_PER))) if N_COMP else 1
     # the index list pads to a whole key tile, so its compressed half has room for
     # more than the indexer will ever pick; the surplus is filled with -1
     N_ISEL = N_KEYS - window
@@ -758,6 +769,10 @@ def build_dsv4_kernel(
         assert window % SPLIT_KEYS == 0, "a key tile must fall wholly inside or outside the window"
         assert N_KEYS >= window + N_INDEX, "the index list must hold the window and the pick"
         assert IHD % 8 == 0 and N_COMP > 0
+        # Load-bearing twice: it makes the clamped base 16-byte aligned for the
+        # wide read, and it puts a clamped group wholly past n_live, so the wrong
+        # candidates it then reads are all masked off.
+        assert N_COMP % TK_PER == 0, "the top-k reads whole groups of TK_PER candidates"
         assert IHD == 128, "the indexer's Hadamard is written for a 128-wide head"
         assert IH % WAVES == 0, "one wave takes a whole index head"
         assert IHD - ROPE_DIM == 64, "rope must fall entirely in the head's second half"
@@ -857,8 +872,8 @@ def build_dsv4_kernel(
         p: fx.Array[fx.Float32, H * SPLIT_KEYS, 16]
         keys: fx.Array[fx.Int32, SPLIT_KEYS, 16]
         dnw: fx.Array[fx.Float32, S * MOE_SLOTS, 16]  # expert-down route weights
-        # radix-select bins, plus two words to broadcast the winning digit
-        hist: fx.Array[fx.Int32, (TK_BINS + 2) if IHD else 1, 16]
+        # radix-select bins, replicated, plus two words to broadcast the winning digit
+        hist: fx.Array[fx.Int32, (TK_BC + 2) if IHD else 1, 16]
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def dsv4_kernel(
@@ -1098,6 +1113,25 @@ def build_dsv4_kernel(
         def getf(base_addr, i):
             return get(base_addr, i).bitcast(fx.Float32)
 
+        def get_raw(base_addr, i, n):
+            """``n`` mailbox value words from pair ``i`` on, with NO tag check.
+
+            Only ever a RE-read: this thread has already polled exactly these pairs
+            and passed a barrier since, so the values are known to have landed and
+            are still in the cache level the loads read. Re-checking the tag costs a
+            serialized round trip per candidate -- the load cannot issue until the
+            previous one's tag has been compared -- and at a 1M context that spin,
+            not the bandwidth, was most of what the top-k spent."""
+            out = []
+            for g in range_constexpr(n // 2):  # dwordx4 is the widest buffer load
+                v = fx.Vector(
+                    bo.buffer_load(
+                        _rsrc(base_addr), (fx.Int32(i) + 2 * g) * 2, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV
+                    )
+                )
+                out += [v[0], v[2]]
+            return out
+
         def getf_many(specs):
             """[(base, i)] single pairs -> list of f32."""
             return [v[0].bitcast(fx.Float32) for v in poll([(b, i, 1) for b, i in specs])]
@@ -1128,6 +1162,27 @@ def build_dsv4_kernel(
             for off in (8, 4, 2, 1):
                 v = _xred(v, off, fx.max)
             return v
+
+        def score_keys(sbase, cb, first):
+            """``TK_PER`` candidate scores from ``cb`` on, as order-preserving keys.
+
+            f32 bits -> a signed int32 whose ORDER matches the float's (flip the low
+            31 bits of negatives, which puts -2 below -1 and both below 0), then ^
+            MIN_I32 into the unsigned domain, where MSB-first prefixes work.
+
+            ``first`` on the pass that reads a sequence's scores for the first time,
+            where the producer may still be landing; every later pass re-reads the
+            same pairs from the same thread and takes them untagged. The base is
+            clamped so a whole vector stays in range -- the caller masks on the
+            UNCLAMPED candidate index, which is past the end exactly when it was
+            clamped, so a clamped trip contributes nothing."""
+            a = fx.min(cb, fx.Int32(N_COMP - TK_PER))
+            if const_expr(first):
+                specs = [(mb("i_score"), sbase + a + 2 * q, 2) for q in range(TK_PER // 2)]
+                ws = [w[e] for w in poll(specs) for e in range(2)]
+            else:
+                ws = get_raw(mb("i_score"), sbase + a, TK_PER)
+            return [(w ^ ((w >> 31) & 0x7FFFFFFF)) ^ MIN_I32 for w in ws]
 
         def block_isum(v):
             """Block-wide sum of a per-thread int32."""
@@ -2462,13 +2517,16 @@ def build_dsv4_kernel(
         # running count crosses what the pick still needs. Four passes cover a
         # 32-bit key where a bit-at-a-time select needs 32.
         #
-        # Two properties carry the cost, and both are about NOT holding the scores.
-        # The scans are runtime loops, so the compiler cannot hoist a context's
-        # worth of loads into registers -- doing so spilled 5387 slots at 1M. And a
-        # thread's candidates are strided by THREADS rather than a contiguous run
-        # each: mailbox loads bypass the cache by design, since they have to observe
-        # a remote CTA's write, so a wave whose lanes sit 4 KB apart pays a whole
-        # line per lane. Striding turns one wave's read into one run of lines.
+        # Three properties carry the cost, and all are about how the scores are read
+        # rather than about the select. The scans are runtime loops, so the compiler
+        # cannot hoist a context's worth of loads into registers -- doing so spilled
+        # 5387 slots at 1M. A thread takes TK_PER consecutive candidates and the
+        # threads stride over those groups, so a wave's trip is one contiguous run:
+        # mailbox loads bypass the cache by design, since they have to observe a
+        # remote CTA's write, so a wave whose lanes sit 4 KB apart pays a whole line
+        # per lane. And only the first pass checks the tag. Every later one re-reads
+        # pairs this thread has already polled, and a tag check serializes the walk
+        # -- the next load cannot issue until the last one's tag has been compared.
         if const_expr(IHD):
             for tt in range(start("i_topk"), S, G):
                 tt = fx.Int32(tt)
@@ -2489,26 +2547,25 @@ def build_dsv4_kernel(
                     # 32-wide shift ever reaches the ISA.
                     mk = (~((1 << (sh + 8)) - 1)) & 0xFFFFFFFF
                     hi = fx.Int32(mk - (1 << 32) if mk >= (1 << 31) else mk)
-                    if tid < TK_BINS + 2:
-                        lds_st(hist, tid, fx.Int32(0))
+                    for z in range_constexpr(-(-(TK_BC + 2) // THREADS)):
+                        zi = fx.Int32(tid) + z * THREADS
+                        if zi < TK_BC + 2:
+                            lds_st(hist, zi, fx.Int32(0))
                     gpu.barrier()
-                    for _j in range(0, TOPK_PER, fx.Int32(1)):
-                        c = fx.Int32(_j) * THREADS + tid
-                        ok = c < n_live
-                        # f32 bits -> a signed int32 whose ORDER matches the float's
-                        # (flip the low 31 bits of negatives, which puts -2 below -1
-                        # and both below 0), then into the unsigned domain, where
-                        # MSB-first prefixes work. A dead candidate reads slot 0 and
-                        # keys as 0, the very bottom.
-                        b = getf(mb("i_score"), sbase + fx.min(c, fx.Int32(N_COMP - 1)))
-                        bi = b.bitcast(fx.Int32)
-                        u = ok.select((bi ^ ((bi >> 31) & 0x7FFFFFFF)) ^ MIN_I32, fx.Int32(0))
-                        if ok & (((u ^ pfx) & hi) == 0):
-                            fx.atomic_add(
-                                hist + ((u >> sh) & (TK_BINS - 1)),
-                                fx.Int32(1),
-                                syncscope=fx.rocdl.SyncScope.Workgroup,
-                            )
+                    for _j in range(0, TK_TRIPS, fx.Int32(1)):
+                        cb = (fx.Int32(_j) * THREADS + tid) * TK_PER
+                        ks = score_keys(sbase, cb, d == 0)
+                        for q in range_constexpr(TK_PER):
+                            c = cb + q
+                            ok = c < n_live
+                            # a dead candidate keys as 0, the very bottom
+                            u = ok.select(ks[q], fx.Int32(0))
+                            if ok & (((u ^ pfx) & hi) == 0):
+                                fx.atomic_add(
+                                    hist + ((u >> sh) & (TK_BINS - 1)) * TK_REP + (tid & (TK_REP - 1)),
+                                    fx.Int32(1),
+                                    syncscope=fx.rocdl.SyncScope.Workgroup,
+                                )
                     gpu.barrier()
                     # Thread t takes bin TK_BINS - 1 - t, so an ascending exclusive
                     # scan over threads is a descending suffix sum over bins: every
@@ -2519,14 +2576,15 @@ def build_dsv4_kernel(
                     need = k_want - gt
                     cnt = fx.Int32(0)
                     if tid < TK_BINS:
-                        cnt = lds_ld(hist, TK_BINS - 1 - tid)
+                        for r in range_constexpr(TK_REP):
+                            cnt = cnt + lds_ld(hist, (TK_BINS - 1 - tid) * TK_REP + r)
                     above, _tot = block_excl_scan(cnt)
                     if (tid < TK_BINS) & (above < need) & ((above + cnt) >= need):
-                        lds_st(hist, TK_BINS, TK_BINS - 1 - tid)
-                        lds_st(hist, TK_BINS + 1, above)
+                        lds_st(hist, TK_BC, TK_BINS - 1 - tid)
+                        lds_st(hist, TK_BC + 1, above)
                     gpu.barrier()
-                    pfx = pfx | (lds_ld(hist, TK_BINS) << sh)
-                    gt = gt + lds_ld(hist, TK_BINS + 1)
+                    pfx = pfx | (lds_ld(hist, TK_BC) << sh)
+                    gt = gt + lds_ld(hist, TK_BC + 1)
                     gpu.barrier()
                 thr = pfx ^ MIN_I32  # back to the signed-comparable domain
 
@@ -2548,26 +2606,27 @@ def build_dsv4_kernel(
                 w_base = fx.Int32(0)
                 for phase in range_constexpr(2):
                     if tid == 0:
-                        lds_st(hist, TK_BINS, fx.Int32(0))
+                        lds_st(hist, TK_BC, fx.Int32(0))
                     gpu.barrier()
                     room = k_want - w_base
-                    for _j in range(0, TOPK_PER, fx.Int32(1)):
-                        c = fx.Int32(_j) * THREADS + tid
-                        ok = c < n_live
-                        b = getf(mb("i_score"), sbase + fx.min(c, fx.Int32(N_COMP - 1)))
-                        bi = b.bitcast(fx.Int32)
-                        sk = bi ^ ((bi >> 31) & 0x7FFFFFFF)
-                        hit = (sk > thr) if phase == 0 else (sk == thr)
-                        if ok & hit:
-                            w = fx.Int32(
-                                fx.atomic_add(
-                                    hist + TK_BINS, fx.Int32(1), syncscope=fx.rocdl.SyncScope.Workgroup
+                    for _j in range(0, TK_TRIPS, fx.Int32(1)):
+                        cb = (fx.Int32(_j) * THREADS + tid) * TK_PER
+                        ks = score_keys(sbase, cb, False)
+                        for q in range_constexpr(TK_PER):
+                            c = cb + q
+                            ok = c < n_live
+                            sk = ks[q] ^ MIN_I32  # back to the signed-comparable domain
+                            hit = (sk > thr) if phase == 0 else (sk == thr)
+                            if ok & hit:
+                                w = fx.Int32(
+                                    fx.atomic_add(
+                                        hist + TK_BC, fx.Int32(1), syncscope=fx.rocdl.SyncScope.Workgroup
+                                    )
                                 )
-                            )
-                            if w < room:
-                                put(mb("i_sel"), s * N_ISEL + w_base + w, c0 + c)
+                                if w < room:
+                                    put(mb("i_sel"), s * N_ISEL + w_base + w, c0 + c)
                     gpu.barrier()
-                    w_base = w_base + fx.min(lds_ld(hist, TK_BINS), room)
+                    w_base = w_base + fx.min(lds_ld(hist, TK_BC), room)
                 for j in range_constexpr((N_ISEL + THREADS - 1) // THREADS):
                     o = fx.Int32(tid) + j * THREADS
                     if o < N_ISEL:
