@@ -746,9 +746,10 @@ def build_dsv4_kernel(
     IH_TOTAL = index_heads_total or index_heads
     N_COMP = (max_seq // CR) if (IHD and CR) else 0
     N_INDEX = n_index(max_seq, compress_ratio, index_head_dim, index_topk)
-    # the top-k holds every candidate in registers across the radix passes, so one
-    # thread's share is bounded rather than the sequence length
+    # candidates per thread in the top-k. They are re-read each radix pass rather
+    # than held, so this bounds a loop trip count, not a register budget.
     TOPK_PER = max(1, (N_COMP + THREADS - 1) // THREADS) if N_COMP else 1
+    TK_BINS = 256  # 8-bit radix digit; 4 passes cover the key
     # the index list pads to a whole key tile, so its compressed half has room for
     # more than the indexer will ever pick; the surplus is filled with -1
     N_ISEL = N_KEYS - window
@@ -856,6 +857,8 @@ def build_dsv4_kernel(
         p: fx.Array[fx.Float32, H * SPLIT_KEYS, 16]
         keys: fx.Array[fx.Int32, SPLIT_KEYS, 16]
         dnw: fx.Array[fx.Float32, S * MOE_SLOTS, 16]  # expert-down route weights
+        # radix-select bins, plus two words to broadcast the winning digit
+        hist: fx.Array[fx.Int32, (TK_BINS + 2) if IHD else 1, 16]
 
     @flyc.kernel(known_block_size=[THREADS, 1, 1])
     def dsv4_kernel(
@@ -926,6 +929,7 @@ def build_dsv4_kernel(
         pl = lds.p.ptr
         keys = lds.keys.ptr
         dnw = lds.dnw.ptr
+        hist = lds.hist.ptr
         ktile = xs + KT_OFF  # f32-typed view holding raw bf16 pairs
         v4f = fx.Vector.make_type(4, fx.Float32)
 
@@ -2452,9 +2456,19 @@ def build_dsv4_kernel(
         # same set without a second exchange. An approximate or order-dependent
         # pick would let the ranks attend to different skey.
         #
-        # Radix select, MSB first, on the score's order-preserving bits. Each pass
-        # counts the candidates whose remaining prefix matches a trial, so it needs
-        # only equality tests -- no unsigned compare.
+        # Radix select over 8-bit digits, most significant first. Each pass
+        # histograms the digit of every candidate whose higher bits already match
+        # the winning prefix, then walks the 256 bins downwards to the one where the
+        # running count crosses what the pick still needs. Four passes cover a
+        # 32-bit key where a bit-at-a-time select needs 32.
+        #
+        # Two properties carry the cost, and both are about NOT holding the scores.
+        # The scans are runtime loops, so the compiler cannot hoist a context's
+        # worth of loads into registers -- doing so spilled 5387 slots at 1M. And a
+        # thread's candidates are strided by THREADS rather than a contiguous run
+        # each: mailbox loads bypass the cache by design, since they have to observe
+        # a remote CTA's write, so a wave whose lanes sit 4 KB apart pays a whole
+        # line per lane. Striding turns one wave's read into one run of lines.
         if const_expr(IHD):
             for tt in range(start("i_topk"), S, G):
                 tt = fx.Int32(tt)
@@ -2463,65 +2477,97 @@ def build_dsv4_kernel(
                 c0 = ld_dest(1, s)  # plane row of this sequence's compressed entry 0
                 n_live = fx.min((ld_pos(s) + 1) // CR, fx.Int32(N_COMP))
                 k_want = fx.min(n_live, fx.Int32(N_INDEX))
-                mine = [fx.Int32(tid) * TOPK_PER + j for j in range(TOPK_PER)]
-                ok_c = [(c < n_live) for c in mine]
-                # f32 bits -> signed int32 whose ORDER matches the float's: flip the
-                # low 31 bits of negatives, which puts -2 below -1 and both below 0
-                skey = []
-                for j in range_constexpr(TOPK_PER):
-                    b = getf(mb("i_score"), s * N_COMP + fx.min(mine[j], fx.Int32(N_COMP - 1)))
-                    bi = b.bitcast(fx.Int32)
-                    skey.append(bi ^ ((bi >> 31) & 0x7FFFFFFF))
-                # ... and to the unsigned domain, where MSB-first prefixes work
-                us = [ok_c[j].select(skey[j] ^ MIN_I32, fx.Int32(0)) for j in range(TOPK_PER)]
+                sbase = s * N_COMP
                 stamp("i_topk", tt, 2)
 
-                pfx = fx.Int32(0)
-                gt = fx.Int32(0)
-                for bit in range_constexpr(32):
-                    b = 31 - bit
-                    trial = pfx | fx.Int32(1 << b)
+                pfx = fx.Int32(0)  # the digits already fixed, in the unsigned domain
+                gt = fx.Int32(0)  # candidates ranking strictly above that prefix
+                for d in range_constexpr(4):
+                    sh = 24 - 8 * d
+                    # the bits above this digit: zero on the first pass, where every
+                    # candidate is still in the running. Folded at trace time, so no
+                    # 32-wide shift ever reaches the ISA.
+                    mk = (~((1 << (sh + 8)) - 1)) & 0xFFFFFFFF
+                    hi = fx.Int32(mk - (1 << 32) if mk >= (1 << 31) else mk)
+                    if tid < TK_BINS + 2:
+                        lds_st(hist, tid, fx.Int32(0))
+                    gpu.barrier()
+                    for _j in range(0, TOPK_PER, fx.Int32(1)):
+                        c = fx.Int32(_j) * THREADS + tid
+                        ok = c < n_live
+                        # f32 bits -> a signed int32 whose ORDER matches the float's
+                        # (flip the low 31 bits of negatives, which puts -2 below -1
+                        # and both below 0), then into the unsigned domain, where
+                        # MSB-first prefixes work. A dead candidate reads slot 0 and
+                        # keys as 0, the very bottom.
+                        b = getf(mb("i_score"), sbase + fx.min(c, fx.Int32(N_COMP - 1)))
+                        bi = b.bitcast(fx.Int32)
+                        u = ok.select((bi ^ ((bi >> 31) & 0x7FFFFFFF)) ^ MIN_I32, fx.Int32(0))
+                        if ok & (((u ^ pfx) & hi) == 0):
+                            fx.atomic_add(
+                                hist + ((u >> sh) & (TK_BINS - 1)),
+                                fx.Int32(1),
+                                syncscope=fx.rocdl.SyncScope.Workgroup,
+                            )
+                    gpu.barrier()
+                    # Thread t takes bin TK_BINS - 1 - t, so an ascending exclusive
+                    # scan over threads is a descending suffix sum over bins: every
+                    # thread learns how many candidates outrank its own bin. Exactly
+                    # one bin has that count below what is still needed and its own
+                    # count enough to reach it -- unless nothing is wanted at all,
+                    # which the pre-zeroed broadcast slots cover.
+                    need = k_want - gt
                     cnt = fx.Int32(0)
-                    for j in range_constexpr(TOPK_PER):
-                        hit = ok_c[j] & (((us[j] ^ trial) >> b) == 0)
-                        cnt = cnt + hit.select(fx.Int32(1), fx.Int32(0))
-                    tot = block_isum(cnt)
-                    take = (gt + tot) >= k_want
-                    pfx = take.select(trial, pfx)
-                    gt = take.select(gt, gt + tot)
+                    if tid < TK_BINS:
+                        cnt = lds_ld(hist, TK_BINS - 1 - tid)
+                    above, _tot = block_excl_scan(cnt)
+                    if (tid < TK_BINS) & (above < need) & ((above + cnt) >= need):
+                        lds_st(hist, TK_BINS, TK_BINS - 1 - tid)
+                        lds_st(hist, TK_BINS + 1, above)
+                    gpu.barrier()
+                    pfx = pfx | (lds_ld(hist, TK_BINS) << sh)
+                    gt = gt + lds_ld(hist, TK_BINS + 1)
+                    gpu.barrier()
                 thr = pfx ^ MIN_I32  # back to the signed-comparable domain
-                need = k_want - gt  # how many of the ties at thr to keep
 
-                # Two compactions in index order: everything strictly above the
-                # threshold, then as many of the ties as the count still needs. One
-                # pass over `>=` would not do -- ties early in index order would
-                # crowd out strict-greaters that must all be kept.
-                # Each phase appends from wherever the last one ended, and the -1
-                # fill starts from what was ACTUALLY written, not from k_want. That
-                # matters beyond tidiness: the gather polls every slot of this
-                # mailbox, so a slot the compaction skips is not a wrong answer, it
-                # is a kernel that never finishes. Deriving the fill from the real
-                # count makes any error in the threshold above show up as a bad
-                # selection, which a test can see.
+                # Two compactions: everything strictly above the threshold, then as
+                # many of the ties as the count still needs. One pass over `>=`
+                # would not do -- ties early in index order would crowd out
+                # strict-greaters that must all be kept.
+                #
+                # Each phase appends through one LDS counter, which is cheaper than
+                # a block scan and costs only the order inside i_sel, and selection
+                # is a set. Phase two starts from what phase one ACTUALLY wrote, not
+                # from the `gt` the radix predicted, and the -1 fill starts from the
+                # real total: that matters beyond tidiness, because the gather polls
+                # every slot of this mailbox, so a slot the compaction skips is not
+                # a wrong answer, it is a kernel that never finishes. Deriving both
+                # from the count makes a bad threshold show up as a bad selection,
+                # which a test can see.
                 stamp("i_topk", tt, 3)
                 w_base = fx.Int32(0)
                 for phase in range_constexpr(2):
-                    sel = []
-                    for j in range_constexpr(TOPK_PER):
-                        hit = skey[j] > thr if phase == 0 else skey[j] == thr
-                        sel.append(ok_c[j] & hit)
-                    mycnt = fx.Int32(0)
-                    for j in range_constexpr(TOPK_PER):
-                        mycnt = mycnt + sel[j].select(fx.Int32(1), fx.Int32(0))
-                    off, tot = block_excl_scan(mycnt)
-                    room = k_want - w_base
-                    w = w_base + off
-                    for j in range_constexpr(TOPK_PER):
-                        if sel[j] & ((w - w_base) < room):
-                            put(mb("i_sel"), s * N_ISEL + w, c0 + mine[j])
-                        w = w + sel[j].select(fx.Int32(1), fx.Int32(0))
-                    w_base = w_base + fx.min(tot, room)
+                    if tid == 0:
+                        lds_st(hist, TK_BINS, fx.Int32(0))
                     gpu.barrier()
+                    room = k_want - w_base
+                    for _j in range(0, TOPK_PER, fx.Int32(1)):
+                        c = fx.Int32(_j) * THREADS + tid
+                        ok = c < n_live
+                        b = getf(mb("i_score"), sbase + fx.min(c, fx.Int32(N_COMP - 1)))
+                        bi = b.bitcast(fx.Int32)
+                        sk = bi ^ ((bi >> 31) & 0x7FFFFFFF)
+                        hit = (sk > thr) if phase == 0 else (sk == thr)
+                        if ok & hit:
+                            w = fx.Int32(
+                                fx.atomic_add(
+                                    hist + TK_BINS, fx.Int32(1), syncscope=fx.rocdl.SyncScope.Workgroup
+                                )
+                            )
+                            if w < room:
+                                put(mb("i_sel"), s * N_ISEL + w_base + w, c0 + c)
+                    gpu.barrier()
+                    w_base = w_base + fx.min(lds_ld(hist, TK_BINS), room)
                 for j in range_constexpr((N_ISEL + THREADS - 1) // THREADS):
                     o = fx.Int32(tid) + j * THREADS
                     if o < N_ISEL:

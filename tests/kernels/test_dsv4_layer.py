@@ -1407,6 +1407,60 @@ def test_dsv4_indexer_topk_compaction_spans_waves():
     layer.close()
 
 
+def test_dsv4_indexer_topk_spans_many_candidates_per_thread():
+    """The top-k holds when a thread owns several candidates, not one.
+
+    Every other indexer test runs at a shape where the candidate count fits the
+    block, so each thread owns exactly one and the radix's per-thread scan never
+    iterates. That hides the whole strided walk: a loop that ran once, or an
+    index that folded back onto j = 0, would still pass them. Here 8192 / 4
+    compressed entries give four candidates per thread and the live set reaches
+    three of those rounds, so the later rounds carry picks of their own.
+
+    Judged against the kernel's OWN scores, like the other compaction tests --
+    what is under test is the selection, and the scoring has its own test.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    torch.manual_seed(0)
+    ratio = COMPRESS_CSA
+    cfg = _cfg(hc_mult=1)
+    cfg.compress_ratio, cfg.max_seq, cfg.index_topk = ratio, 8192, 300
+    dev, mode = "cuda", MoeMode.W8A8
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
+    cos, sin = rope_table(8192, theta=cfg.rope_base, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+
+    last = 5999  # 1500 live candidates: rounds 0, 1 and part of 2
+    checks = [2500, 4000, last]
+    reach = 0
+    for pos in range(last + 1):
+        h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
+        cur = torch.tensor([pos], dtype=torch.int32, device=dev)
+        idx, dest = contiguous_pool([pos], cfg, dev)
+        layer.forward(h, cur, kv_k, dest, idx, cos, sin)
+        if pos not in checks:
+            continue
+        torch.cuda.synchronize()
+        n = (pos + 1) // ratio
+        k = min(cfg.index_topk, n)
+        got = layer.debug("i_sel", (1, cfg.n_keys - cfg.window), torch.int32)[0]
+        sel = got[got >= 0].tolist()
+        assert len(sel) == k, f"pos={pos}: wrote {len(sel)} slots, want {k}"
+        assert len(set(sel)) == k, f"pos={pos}: {k - len(set(sel))} picks collided on a slot"
+        sc = layer.debug("i_score", (1, cfg.n_compressed))[0][:n]
+        srt = sc.sort(descending=True).values
+        margin = (srt[k - 1] - srt[k]).item() if n > k else 1.0
+        want = set((cfg.window + sc.topk(k).indices).tolist())
+        if set(sel) != want and margin > 1e-6:
+            raise AssertionError(f"pos={pos}: picked {len(set(sel) - want)} entries the scores do not rank")
+        reach = max(reach, max(s - cfg.window for s in sel))
+    # the point of the shape: without this only the first round is ever read
+    assert reach >= 2 * 512, f"picks stopped at candidate {reach}, so the later rounds are untested"
+    layer.close()
+
+
 @pytest.mark.parametrize("ratio", [0, COMPRESS_CSA])
 def test_dsv4_batching_is_independent_sequences(ratio):
     """The kernel at S=2 must equal the kernel run twice at S=1.
