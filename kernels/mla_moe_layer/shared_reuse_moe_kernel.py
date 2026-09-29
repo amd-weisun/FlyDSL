@@ -344,6 +344,7 @@ def build_shared_reuse_kernel(
     paged: bool = False,
     eps: float = EPS,
     kv_fp8: bool = False,
+    q_per_seq: int = 1,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer.
 
@@ -354,6 +355,11 @@ def build_shared_reuse_kernel(
     included); the cache is a paged pool of 576-wide bf16 rows (512 latent | 64 k_pe,
     ``pe_cache`` = ``kv_cache`` + 512 elements).  ``paged=False`` keeps the one-sequence,
     S-consecutive-tokens contract with separate contiguous kv/pe caches.
+
+    ``q_per_seq=Q`` (paged only, speculative-decode verification): the S samples are S // Q sequences of Q
+    consecutive tokens each (sample s = token s % Q of sequence s // Q).  ``kv_indptr`` then has one entry
+    per SEQUENCE (its list holds every row incl. all Q new ones); token i attends the first
+    ``len - (Q - 1 - i)`` rows and sees the sequence's earlier new rows patched in like its own.
 
     ``kv_fp8=True`` (paged only) makes the pool rows 576 bytes of E4M3FN (unit scale, ATOM's
     ``--kv_cache_dtype fp8``): key rows are converted to bf16 when gathered, the new token's
@@ -433,6 +439,8 @@ def build_shared_reuse_kernel(
     N_SPLIT = topk // SPLIT_KEYS
     assert N_SPLIT <= 64, "the split merge holds one split per lane: topk // 64 <= 64 (in paged mode topk only sets the split count)"
     assert not kv_fp8 or paged, "kv_fp8 is a paged-mode option"
+    assert q_per_seq == 1 or (paged and S % q_per_seq == 0), "q_per_seq needs paged mode and S % q_per_seq == 0"
+    Q = q_per_seq
     KV_ROW = KV_LORA + PE_DIM if paged else KV_LORA  # cache row stride in bf16 (fp8: byte) elements
     PE_ROW = KV_LORA + PE_DIM if paged else PE_DIM
     QB_ROWS = H * (NOPE_DIM + PE_DIM)
@@ -1434,8 +1442,11 @@ def build_shared_reuse_kernel(
             """Keys sample ``s`` attends over.  Paged mode: its whole CSR row list (any length, each
             of the N_SPLIT split tasks walks its share of the 64-key chunks); otherwise at most ``topk``."""
             if const_expr(paged):
-                base = _uniform(bo.buffer_load(_rsrc(kv_indptr), s, vec_width=1, dtype=T.i32))
-                kv_len = _uniform(bo.buffer_load(_rsrc(kv_indptr), s + 1, vec_width=1, dtype=T.i32)) - base
+                q = s // Q  # sequence of sample s
+                base = _uniform(bo.buffer_load(_rsrc(kv_indptr), q, vec_width=1, dtype=T.i32))
+                kv_len = _uniform(bo.buffer_load(_rsrc(kv_indptr), q + 1, vec_width=1, dtype=T.i32)) - base
+                if const_expr(Q > 1):
+                    kv_len = kv_len - (Q - 1 - s % Q)  # token i must not see the sequence's later new tokens
                 return (kv_len > 0).select(kv_len, fx.Int32(1))  # padded sample: one dummy key, no NaN softmax
             kv_len = pos0 + s + 1
             return (kv_len > topk).select(fx.Int32(topk), kv_len)
@@ -1446,8 +1457,8 @@ def build_shared_reuse_kernel(
                 k_pos = c * SPLIT_KEYS + lane
                 k_cl = (k_pos < nkeys).select(k_pos, 0)
                 if const_expr(paged):
-                    base = _uniform(bo.buffer_load(_rsrc(kv_indptr), s, vec_width=1, dtype=T.i32))
-                    end = _uniform(bo.buffer_load(_rsrc(kv_indptr), s + 1, vec_width=1, dtype=T.i32))
+                    base = _uniform(bo.buffer_load(_rsrc(kv_indptr), s // Q, vec_width=1, dtype=T.i32))
+                    end = _uniform(bo.buffer_load(_rsrc(kv_indptr), s // Q + 1, vec_width=1, dtype=T.i32))
                     # a padded sample's CSR range is empty: read entry 0 (valid memory) for its dummy key
                     at = (end > base).select(base + k_cl, fx.Int32(0))
                     lds_st(keys, lane, fx.Int32(bo.buffer_load(r_idx, at, vec_width=1, dtype=T.i32)))
@@ -1484,24 +1495,39 @@ def build_shared_reuse_kernel(
                         lds_st(petile, j * PS + lane, ld_f32(r_pe, krows[jj] * (PE_ROW // 2) + lane))
 
         def patch_new_kv(s):
-            """Rows appended by this launch come from the cache task's kvnew / penew pairs."""
-            own = slot_of(s)  # paged: sample s's only new row
+            """Rows appended by this launch come from the cache task's kvnew / penew pairs.  Paged mode: the
+            rows of the sample's own sequence up to and including itself (Q > 1: earlier draft/verify tokens)."""
+            if const_expr(paged):
+                cands = [(s // Q) * Q + j for j in range_constexpr(Q)]  # samples of this sequence
+                owns = [slot_of(c) for c in cands]
+            else:
+                own = slot_of(s)  # unused
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
                 kr = lds_ld(keys, j)
                 if const_expr(paged):
-                    hit = kr == own
-                    sn = s
+                    for cj in range_constexpr(Q):
+                        if const_expr(Q > 1):
+                            hit = (kr == owns[cj]) & ((s % Q) >= cj)
+                        else:
+                            hit = kr == owns[cj]
+                        if hit:
+                            sn = cands[cj]
+                            kvp = get2_many([(mb("kvnew"), sn * KV_LORA + lane * 8 + m * 2) for m in range(4)])
+                            w = [bf16_pair(a0, a1) for a0, a1 in kvp]
+                            fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * 4))
+                            if lane < PE_DIM // 2:
+                                a0, a1 = get2(mb("penew"), sn * PE_DIM + lane * 2)
+                                lds_st(petile, j * PS + lane, bf16_pair(a0, a1))
                 else:
-                    hit = kr >= pos0
-                    sn = kr - pos0
-                if hit:
-                    kvp = get2_many([(mb("kvnew"), sn * KV_LORA + lane * 8 + m * 2) for m in range(4)])
-                    w = [bf16_pair(a0, a1) for a0, a1 in kvp]
-                    fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * 4))
-                    if lane < PE_DIM // 2:
-                        a0, a1 = get2(mb("penew"), sn * PE_DIM + lane * 2)
-                        lds_st(petile, j * PS + lane, bf16_pair(a0, a1))
+                    if kr >= pos0:
+                        sn = kr - pos0
+                        kvp = get2_many([(mb("kvnew"), sn * KV_LORA + lane * 8 + m * 2) for m in range(4)])
+                        w = [bf16_pair(a0, a1) for a0, a1 in kvp]
+                        fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * 4))
+                        if lane < PE_DIM // 2:
+                            a0, a1 = get2(mb("penew"), sn * PE_DIM + lane * 2)
+                            lds_st(petile, j * PS + lane, bf16_pair(a0, a1))
 
         NH = H // WAVES  # heads per wave in the softmax step
         NACC = 2 * (KV_LORA // 32 // WAVES)  # (c0, c1) accumulators per wave

@@ -61,6 +61,7 @@ class SharedReuseMlaMoeLayer:
         reuse: "SharedReuseMlaMoeLayer | None" = None,
         packed: dict | None = None,
         kv_fp8: bool = False,
+        q_per_seq: int = 1,
     ):
         """``paged``: serving mode (S independent sequences over a paged 576-wide cache, see
         ``build_shared_reuse_kernel``).  ``reuse``: another layer built with identical
@@ -73,6 +74,7 @@ class SharedReuseMlaMoeLayer:
         self.W, self.S, self.rank, self.npes, self.topk = W, samples, rank, npes, topk
         self.paged = paged
         self.kv_fp8 = kv_fp8
+        self.q_per_seq = q_per_seq
         if packed is not None:  # weights already packed by a sibling layer object (another S)
             self.packed = packed
         else:
@@ -83,13 +85,14 @@ class SharedReuseMlaMoeLayer:
         dims = dict(hidden=W.hidden, q_lora=W.q_lora, nope_dim=W.nope_dim, v_dim=W.v_dim)
         dev = torch.device("cuda", torch.cuda.current_device())
         if reuse is not None:
-            assert (reuse.S, reuse.W.heads, reuse.npes, reuse.topk, reuse.paged, reuse.kv_fp8) == (
+            assert (reuse.S, reuse.W.heads, reuse.npes, reuse.topk, reuse.paged, reuse.kv_fp8, reuse.q_per_seq) == (
                 samples,
                 W.heads,
                 npes,
                 topk,
                 paged,
                 kv_fp8,
+                q_per_seq,
             ), "reuse= needs identical static arguments"
             self.scr_layout, self.sym_layout = reuse.scr_layout, reuse.sym_layout
             self.scratch, self.peer_buffer = reuse.scratch, reuse.peer_buffer
@@ -111,6 +114,7 @@ class SharedReuseMlaMoeLayer:
                 paged=paged,
                 eps=eps,
                 kv_fp8=kv_fp8,
+                q_per_seq=q_per_seq,
                 **dims,
             )
             self.stages = stage_tasks(samples, W.heads, topk, **dims)

@@ -126,6 +126,84 @@ def run(S, lens, seed=1234, dev="cuda:0", pad=0, pad_value=None, kv_fp8=False):
     return worst
 
 
+def run_verify(Q, lens, seed=1234, dev="cuda:0", kv_fp8=False):
+    """Speculative-decode verification: len(lens) sequences of Q consecutive new tokens each (lens = total kv length
+    incl. the Q new rows).  Token i of a sequence attends the context plus the sequence's earlier new tokens."""
+    from kernels.mla_moe_layer.layer import SharedReuseMlaMoeLayer
+
+    torch.cuda.set_device(dev)
+    dev = torch.device(dev)
+    reference.EPS, reference.SOFTMAX_SCALE = EPS, SCALE
+    nseq, S = len(lens), len(lens) * Q
+    W = make_weights(0, device=dev, seed=seed, **DS)
+    cos, sin = rope_table(MAX_SEQ, device=dev)
+    gen = torch.Generator(device=dev).manual_seed(seed + 11)
+    pool = torch.randn(POOL_ROWS, KV_LORA + PE_DIM, generator=gen, device=dev).to(torch.bfloat16)
+    if kv_fp8:
+        pool = pool.to(torch.float8_e4m3fn)
+    perm = torch.randperm(POOL_ROWS, generator=gen, device=dev)
+    slots, o = [], 0
+    for L in lens:
+        slots.append(perm[o : o + L].to(torch.int32))
+        o += L
+    indptr = torch.tensor([0] + list(torch.tensor(lens).cumsum(0)), dtype=torch.int32, device=dev)
+    indices = torch.cat(slots).to(torch.int32)
+    positions = torch.tensor([L - Q + i for L in lens for i in range(Q)], dtype=torch.int32, device=dev)
+    slot_map = torch.stack([slots[b][L - Q + i] for b, L in enumerate(lens) for i in range(Q)]).to(torch.int32)
+    h = torch.randn(S, DS["hidden"], generator=gen, device=dev).to(torch.bfloat16)
+    pool0 = pool.clone()
+    pool0_bf = pool0.to(torch.bfloat16) if kv_fp8 else pool0
+    op = SharedReuseMlaMoeLayer(
+        W, S, npes=1, topk=TOPK, paged=True, kv_fp8=kv_fp8, q_per_seq=Q, eps=EPS, softmax_scale=SCALE,
+        n_groups=N_GROUPS, topk_groups=TOPK_GROUPS,
+    )
+    out = op.forward_paged(h, positions, pool, slot_map, indptr, indices, cos, sin)
+    torch.cuda.synchronize()
+    stages = op.intermediates()
+    ident = lambda x, bf16_partials=False: x  # noqa: E731
+    worst = 0.0
+    for b, L in enumerate(lens):
+        kv = torch.zeros(MAX_SEQ, KV_LORA, dtype=torch.bfloat16, device=dev)
+        pe = torch.zeros(MAX_SEQ, PE_DIM, dtype=torch.bfloat16, device=dev)
+        kv[: L - Q] = pool0_bf[slots[b][: L - Q].long(), :KV_LORA]
+        pe[: L - Q] = pool0_bf[slots[b][: L - Q].long(), KV_LORA:]
+        ref = golden_layer(W, h[b * Q : (b + 1) * Q], L - Q, kv, pe, None, cos, sin, ident, topk=10**9)
+        for i in range(Q):
+            t = b * Q + i
+            for name in ("q_pe", "q_lat", "o", "a"):
+                g, r = stages[name][t].float(), ref[name][i].float()
+                rel = ((g - r).norm() / r.norm()).item()
+                assert rel < (4e-2 if kv_fp8 else 2e-2), f"{name} of seq {b} token {i} diverges (rel_l2={rel:.2e})"
+            own = golden_moe(
+                W, stages["a"][t : t + 1].clone(),
+                lambda x, bf16_partials=False: x.to(torch.bfloat16).float() if bf16_partials else x,
+                stages["mid"][t : t + 1].clone(), stages["sel"][t : t + 1].clone(), stages["prob"][t : t + 1].clone(),
+            )
+            e_own = ((out[t].float() - own["x_out"][0].float()).norm() / own["x_out"][0].float().norm()).item()
+            assert e_own == e_own, f"seq {b} token {i}: NaN output"
+            worst = max(worst, e_own)
+            new = pool[slot_map[t].long()].to(torch.bfloat16)
+            tol = dict(atol=0.03, rtol=0.13) if kv_fp8 else dict(atol=2e-2, rtol=1e-2)
+            torch.testing.assert_close(new[:KV_LORA].float(), kv[L - Q + i].float(), **tol)
+            torch.testing.assert_close(new[KV_LORA:].float(), pe[L - Q + i].float(), **tol)
+    mask = torch.ones(POOL_ROWS, dtype=torch.bool, device=dev)
+    mask[slot_map.long()] = False
+    assert torch.equal(pool[mask].view(torch.uint8), pool0[mask].view(torch.uint8)), "wrote outside the new-token rows"
+    op.close()
+    return worst
+
+
+@pytest.mark.parametrize("Q,lens", [(2, [40, 300]), (4, [200, 9000]), (2, [129, 2100, 64, 300])])
+def test_paged_verify_tokens(Q, lens):
+    """Q tokens per sequence (MTP verification), incl. Q new rows patched in for the later tokens."""
+    assert run_verify(Q, lens) < 5e-2
+
+
+@pytest.mark.parametrize("Q,lens", [(2, [77, 4000]), (4, [1000])])
+def test_paged_verify_tokens_fp8(Q, lens):
+    assert run_verify(Q, lens, kv_fp8=True) < 5e-2
+
+
 @pytest.mark.parametrize("lens", [[37], [1500], [200, 2000], [1, 64, 65, 700], [3, 10, 999, 2048, 5, 640, 1, 2000]])
 def test_paged_layer(lens):
     assert run(len(lens), lens) < 5e-2
