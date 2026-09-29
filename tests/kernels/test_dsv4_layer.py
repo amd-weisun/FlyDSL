@@ -1193,8 +1193,19 @@ def test_dsv4_indexer_topk_in_kernel():
         proj = x @ dq_qkv.float().T
         q_an = bf(rmsnorm(proj[:, : cfg.q_lora], t["g_q"], cfg.eps))
         ref = indexer_step(
-            x[0], q_an[0], proj[0, slice(*cut["i_kv"])], proj[0, slice(*cut["i_gate"])],
-            pos, cfg, t, i_ks, i_ss, i_ref, cos, sin, lambda z: z,
+            x[0],
+            q_an[0],
+            proj[0, slice(*cut["i_kv"])],
+            proj[0, slice(*cut["i_gate"])],
+            pos,
+            cfg,
+            t,
+            i_ks,
+            i_ss,
+            i_ref,
+            cos,
+            sin,
+            lambda z: z,
         )
         got = layer.debug("i_sel", (1, cfg.n_keys - cfg.window), torch.int32)[0]
 
