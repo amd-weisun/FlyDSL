@@ -695,7 +695,8 @@ def build_dsv4_kernel(
     # mailbox once hyper-connections widen `a`
     A_IN = "ain" if hc_mult > 1 else "a"
     HC_MISC = 8 + max(S * XQ_BLOCKS, down_scale_words)
-    misc_words = HC_MISC + S * max(HC_COEF, 1)
+    # `uv` stores one per-split weight in misc, so it must hold N_SPLIT of them
+    misc_words = max(HC_MISC + S * max(HC_COEF, 1), n_keys // SPLIT_KEYS)
     H = heads
     W = npes
     G = BLOCKS
@@ -721,6 +722,18 @@ def build_dsv4_kernel(
     )
     assert N_KEYS % SPLIT_KEYS == 0, "the index list must be a whole number of key tiles"
     N_SPLIT = N_KEYS // SPLIT_KEYS
+    # The flash merge in `uv` gives each split ONE LANE of one wave: wave 0
+    # computes every split's exp(m - M)/L into misc[split], and the merge then
+    # reads misc[0 .. N_SPLIT). Past 64 splits the lanes run out, so the splits
+    # above 64 get no weight, the softmax normalises over a prefix, and the read
+    # runs past misc -- NaN at every position, silently. Reject it here.
+    # This binds the context: n_keys <= 4096, so HCA (whose key list grows with
+    # the sequence) tops out near max_seq 508K, while CSA is unaffected at any
+    # length because index_topk pins its n_keys at 1152.
+    assert N_SPLIT <= THREADS // WAVES, (
+        f"{N_SPLIT} key splits needs a block-wide merge in `uv`; one wave holds {THREADS // WAVES}. "
+        f"n_keys {N_KEYS} = window {window} + the compressed list, so this is a max_seq limit"
+    )
     N_QB = H * HEAD_DIM // Q_B_TILE
     QB_PER_HEAD = HEAD_DIM // Q_B_TILE
     # the indexer's query: its own per-head projection off the SAME normed q_lora
