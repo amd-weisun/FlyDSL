@@ -850,6 +850,10 @@ def golden_layer(
     # thing ATOM's DeepseekV4Attention.forward_impl returns, so the two can be
     # compared without modelling either side's residual path.
     res = dict(q_a=q_a, kv=kv, q=q, o=o, o_lora=o_lora, attn_out=attn_out, a=a, xin=xin)
+    if cfg.indexed:
+        # the indexer's own choice, seq-local (entry indices, -1 padded) -- the
+        # only part of a CSA layer a caller cannot recover from the outputs
+        res["picks"] = picks
     res.update(moe)
     return res
 
