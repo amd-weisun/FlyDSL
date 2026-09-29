@@ -668,6 +668,38 @@ def route(scores: torch.Tensor, bias: torch.Tensor, cfg: V4Config):
     return idx, p / p.sum() * cfg.route_scale
 
 
+def sparse_attention(q, kv_cache, keys, sink, scale, split=64):
+    """One sample's gather-sparse attention: [H, head_dim] from the rows ``keys``.
+
+    ``keys`` are absolute rows of the ``kv_cache`` plane, -1 meaning "not
+    written" (masked out). K and V are the same tensor -- V4 shares them -- and
+    the per-head ``sink`` enters the DENOMINATOR only, as an extra
+    ``exp(sink - M)`` term, so a head can attend to nothing at all.
+
+    Split into ``split``-key chunks and merged flash-style, because that is what
+    the kernel does: the unnormalized probabilities are rounded to bf16 before
+    the P V product, and merging in a different order would not reproduce it.
+    Shared with the comparison harnesses so they check this code, not a copy.
+    """
+    valid = keys >= 0
+    k = kv_cache.float()[keys.clamp(min=0).long()]
+    sc = (bf(q) @ k.T) * scale
+    sc = sc.masked_fill(~valid.unsqueeze(0), float("-inf"))
+    ms, ls, accs = [], [], []
+    for k0 in range(0, keys.numel(), split):
+        scs = sc[:, k0 : k0 + split]
+        m = scs.amax(-1, keepdim=True)
+        m = torch.where(torch.isneginf(m), torch.zeros_like(m), m)
+        p = torch.exp(scs - m)
+        ms.append(m)
+        ls.append(p.sum(-1, keepdim=True))
+        accs.append(bf(p) @ k[k0 : k0 + split])
+    mx = torch.stack(ms).amax(0)
+    w = [torch.exp(m - mx) for m in ms]
+    denom = sum(li * wi for li, wi in zip(ls, w)) + torch.exp(sink.unsqueeze(-1) - mx)
+    return sum(a * wi for a, wi in zip(accs, w)) / denom
+
+
 def golden_layer(
     W: LayerWeights,
     h,
@@ -793,27 +825,7 @@ def golden_layer(
 
     # gather-sparse attention with a per-head sink in the denominator
     sink = t["attn_sink"].float()
-    o = torch.empty(S, H, hd, device=h.device)
-    for s in range(S):
-        keys = indices[s].long()
-        valid = keys >= 0
-        k = kv_cache.float()[keys.clamp(min=0)]
-        sc = (bf(q[s]) @ k.T) * cfg.softmax_scale
-        sc = sc.masked_fill(~valid.unsqueeze(0), float("-inf"))
-        # split softmax over 64-key splits: bf16 unnormalized probs feed P V (MFMA)
-        ms, ls, accs = [], [], []
-        for k0 in range(0, keys.numel(), 64):
-            scs = sc[:, k0 : k0 + 64]
-            m = scs.amax(-1, keepdim=True)
-            m = torch.where(torch.isneginf(m), torch.zeros_like(m), m)
-            p = torch.exp(scs - m)
-            ms.append(m)
-            ls.append(p.sum(-1, keepdim=True))
-            accs.append(bf(p) @ k[k0 : k0 + 64])
-        mx = torch.stack(ms).amax(0)
-        w = [torch.exp(m - mx) for m in ms]
-        denom = sum(li * wi for li, wi in zip(ls, w)) + torch.exp(sink.unsqueeze(-1) - mx)
-        o[s] = sum(a * wi for a, wi in zip(accs, w)) / denom
+    o = torch.stack([sparse_attention(q[s], kv_cache, indices[s], sink, cfg.softmax_scale) for s in range(S)])
 
     # V shares the RoPE'd K, so the output has to be de-rotated
     o = torch.stack(
