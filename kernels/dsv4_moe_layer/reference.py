@@ -846,7 +846,10 @@ def golden_layer(
         a = (h.float() + attn_out).to(torch.bfloat16)
 
     moe = golden_moe(W, a, allreduce, moe_mode=moe_mode)
-    res = dict(q_a=q_a, kv=kv, q=q, o=o, o_lora=o_lora, a=a, xin=xin)
+    # attn_out is the attention half BEFORE the residual/hc mix -- the exact
+    # thing ATOM's DeepseekV4Attention.forward_impl returns, so the two can be
+    # compared without modelling either side's residual path.
+    res = dict(q_a=q_a, kv=kv, q=q, o=o, o_lora=o_lora, attn_out=attn_out, a=a, xin=xin)
     res.update(moe)
     return res
 
