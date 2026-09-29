@@ -568,17 +568,19 @@ def layer_idxs(cur_pos: int, samples: int, cfg: V4Config, device) -> torch.Tenso
     Both live in one cache -- window first, compressed after -- which is what lets
     the attention gather span both from a single index list. Unwritten slots are -1.
 
+    The S samples are independent sequences at the SAME position, so every row is
+    identical: the rows index into each sample's own cache slice, and the kernel
+    adds that sample's base.
+
     On a CSA layer the compressed half is left empty: the indexer picks it inside
     the layer, from scores that do not exist until the layer runs.
     """
     win = window_idxs(cur_pos, samples, cfg.window, device)
     if not cfg.compress_ratio:
         return win
-    rows = []
-    for s in range(samples):
-        n = 0 if cfg.indexed else (cur_pos + s + 1) // cfg.compress_ratio
-        rows.append([cfg.window + i for i in range(n)] + [-1] * (cfg.n_index - n))
-    comp = torch.tensor(rows, dtype=torch.int32, device=device)
+    n = 0 if cfg.indexed else (cur_pos + 1) // cfg.compress_ratio
+    row = [cfg.window + i for i in range(n)] + [-1] * (cfg.n_index - n)
+    comp = torch.tensor([row] * samples, dtype=torch.int32, device=device)
     idx = torch.cat([win, comp], dim=1)
     pad = cfg.n_keys - idx.shape[1]
     if pad:
@@ -591,17 +593,15 @@ def window_idxs(cur_pos: int, samples: int, window: int, device) -> torch.Tensor
 
     Mirrors ``get_window_topk_idxs`` in DeepSeek's reference: once the ring is
     full the slots are a rotation of ``range(window)``; before that they are the
-    written prefix, right-padded with -1.
+    written prefix, right-padded with -1. All ``samples`` rows are the same --
+    they are separate sequences at one position, one cache slice each.
     """
-    rows = []
-    for s in range(samples):
-        p = cur_pos + s
-        if p + 1 >= window:
-            start = (p + 1) % window
-            rows.append([(start + i) % window for i in range(window)])
-        else:
-            rows.append(list(range(p + 1)) + [-1] * (window - p - 1))
-    return torch.tensor(rows, dtype=torch.int32, device=device)
+    if cur_pos + 1 >= window:
+        start = (cur_pos + 1) % window
+        row = [(start + i) % window for i in range(window)]
+    else:
+        row = list(range(cur_pos + 1)) + [-1] * (window - cur_pos - 1)
+    return torch.tensor([row] * samples, dtype=torch.int32, device=device)
 
 
 def route(scores: torch.Tensor, bias: torch.Tensor, cfg: V4Config):
@@ -649,7 +649,11 @@ def golden_layer(
     ``h`` is [S, hidden] when ``cfg.hc_mult == 1`` (plain residual) and
     [S, hc_mult, hidden] otherwise -- V4 carries hc_mult parallel residual
     streams, contracted to one by ``hc_pre`` and re-expanded by ``hc_post``.
-    ``kv_cache`` is a ring of ``cfg.window`` rows of ``head_dim`` (K and V both).
+    The S samples are INDEPENDENT sequences at one shared ``cur_pos``, so every
+    per-sequence buffer carries a leading S: ``kv_cache`` [S, cache_rows, head_dim]
+    (a ring of ``cfg.window`` window rows and the compressed entries after them),
+    and likewise ``kv_state`` / ``score_state`` / ``i_state`` / ``i_score_state`` /
+    ``i_cache``. Each sample's attention sees only its own slice.
     ``indices`` [S, n_keys] are ring slots, -1 meaning "not yet written". On a CSA
     layer only its window half is used: the compressed half is chosen here, by the
     indexer, because the scores it ranks are computed inside the layer.
@@ -680,21 +684,22 @@ def golden_layer(
     q_an = bf(rmsnorm(q_a, t["g_q"], cfg.eps))
     q = (q_an @ dq["q_b"].T).view(S, H, hd)
     q = rmsnorm(q, None, cfg.eps)
-    pos = [cur_pos + s for s in range(S)]
     q = torch.stack(
-        [torch.cat([q[s, :, :-rd], rope(q[s, :, -rd:], cos[pos[s]], sin[pos[s]])], dim=-1) for s in range(S)]
+        [torch.cat([q[s, :, :-rd], rope(q[s, :, -rd:], cos[cur_pos], sin[cur_pos])], dim=-1) for s in range(S)]
     )
 
-    # shared KV: one row per token, rope in the tail, nope part FP8 round-tripped
+    # shared KV: one row per token, rope in the tail, nope part FP8 round-tripped.
+    # Every sample is its OWN sequence at the same position, so they share the row
+    # and differ only in which cache slice they write.
+    slot = cur_pos % cfg.window
     for s in range(S):
         v = rmsnorm(kv[s], t["g_kv"], cfg.eps)
-        v = torch.cat([quant_dequant(v[:-rd], 64), rope(v[-rd:], cos[pos[s]], sin[pos[s]])])
-        kv_cache[pos[s] % cfg.window] = v.to(torch.bfloat16)
+        v = torch.cat([quant_dequant(v[:-rd], 64), rope(v[-rd:], cos[cur_pos], sin[cur_pos])])
+        kv_cache[s, slot] = v.to(torch.bfloat16)
         if cfg.compress_ratio:
             # the compressor sees the same normed input the projections do, and
             # writes into the compressed half of the same cache
-            compress_step(c_kv[s], c_gate[s], pos[s], cfg, t, kv_state, score_state, kv_cache, cos_c, sin_c)
-    kvf = kv_cache.float()
+            compress_step(c_kv[s], c_gate[s], cur_pos, cfg, t, kv_state[s], score_state[s], kv_cache[s], cos_c, sin_c)
 
     if cfg.indexed:
         # CSA picks its compressed entries rather than taking a prefix, so the
@@ -706,12 +711,12 @@ def golden_layer(
                     q_an[s],
                     i_kv[s],
                     i_gate[s],
-                    pos[s],
+                    cur_pos,
                     cfg,
                     t,
-                    i_state,
-                    i_score_state,
-                    i_cache,
+                    i_state[s],
+                    i_score_state[s],
+                    i_cache[s],
                     cos_c,
                     sin_c,
                     allreduce,
@@ -729,7 +734,7 @@ def golden_layer(
     for s in range(S):
         keys = indices[s].long()
         valid = keys >= 0
-        k = kvf[keys.clamp(min=0)]
+        k = kv_cache[s].float()[keys.clamp(min=0)]
         sc = (bf(q[s]) @ k.T) * cfg.softmax_scale
         sc = sc.masked_fill(~valid.unsqueeze(0), float("-inf"))
         # split softmax over 64-key splits: bf16 unnormalized probs feed P V (MFMA)
@@ -749,7 +754,7 @@ def golden_layer(
 
     # V shares the RoPE'd K, so the output has to be de-rotated
     o = torch.stack(
-        [torch.cat([o[s, :, :-rd], rope(o[s, :, -rd:], cos[pos[s]], sin[pos[s]], True)], dim=-1) for s in range(S)]
+        [torch.cat([o[s, :, :-rd], rope(o[s, :, -rd:], cos[cur_pos], sin[cur_pos], True)], dim=-1) for s in range(S)]
     )
 
     # grouped low-rank output projection: per-group o_a, then a row-parallel o_b

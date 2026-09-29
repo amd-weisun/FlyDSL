@@ -167,7 +167,7 @@ def test_v4_layer_matches_deepseek_reference(steps):
     _load_oracle_weights(attn, moe, W, cfg, moe_format(MoeMode.W8A16).weight)
 
     cos, sin = rope_table(256, theta=cfg.rope_theta, device=device)
-    kv_cache = torch.zeros(cfg.window, cfg.head_dim, dtype=torch.bfloat16, device=device)
+    kv_cache = torch.zeros(1, cfg.window, cfg.head_dim, dtype=torch.bfloat16, device=device)
 
     for pos in range(steps):
         h = (0.5 * torch.randn(1, cfg.hidden, device=device)).to(torch.bfloat16)
@@ -275,7 +275,7 @@ def test_v4_block_with_hyper_connections_matches_deepseek(steps):
     _load_block_weights(block, W, cfg, moe_format(MoeMode.W8A16).weight)
 
     cos, sin = rope_table(256, theta=cfg.rope_theta, device=device)
-    kv_cache = torch.zeros(cfg.window, cfg.head_dim, dtype=torch.bfloat16, device=device)
+    kv_cache = torch.zeros(1, cfg.window, cfg.head_dim, dtype=torch.bfloat16, device=device)
 
     for pos in range(steps):
         h = (0.5 * torch.randn(1, cfg.hc_mult, cfg.hidden, device=device)).to(torch.bfloat16)
@@ -313,9 +313,9 @@ def test_v4_hca_compressor_matches_deepseek(steps):
     _load_block_weights(block, W, cfg, moe_format(MoeMode.W8A16).weight)
 
     cos, sin = rope_table(512, theta=cfg.rope_base, device=device)
-    kv_cache = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device)
-    kv_state = torch.zeros(ratio, cfg.head_dim, device=device)
-    score_state = torch.zeros(ratio, cfg.head_dim, device=device)
+    kv_cache = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device)
+    kv_state = torch.zeros(1, ratio, cfg.head_dim, device=device)
+    score_state = torch.zeros(1, ratio, cfg.head_dim, device=device)
 
     compressed_seen = 0
     near_ties = 0
@@ -628,12 +628,12 @@ def test_v4_csa_layer_matches_deepseek(steps):
 
     cos, sin = rope_table(512, theta=cfg.rope_base, device=device)
     ihd, coff = cfg.index_head_dim, cfg.c_coff
-    kv_cache = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device)
-    kv_state = torch.zeros(cfg.c_rows, coff * cfg.head_dim, device=device)
-    score_state = torch.full((cfg.c_rows, coff * cfg.head_dim), float("-inf"), device=device)
-    i_cache = torch.zeros(cfg.n_compressed, ihd, dtype=torch.bfloat16, device=device)
-    i_state = torch.zeros(cfg.c_rows, coff * ihd, device=device)
-    i_score = torch.full((cfg.c_rows, coff * ihd), float("-inf"), device=device)
+    kv_cache = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device)
+    kv_state = torch.zeros(1, cfg.c_rows, coff * cfg.head_dim, device=device)
+    score_state = torch.full((1, cfg.c_rows, coff * cfg.head_dim), float("-inf"), device=device)
+    i_cache = torch.zeros(1, cfg.n_compressed, ihd, dtype=torch.bfloat16, device=device)
+    i_state = torch.zeros(1, cfg.c_rows, coff * ihd, device=device)
+    i_score = torch.full((1, cfg.c_rows, coff * ihd), float("-inf"), device=device)
 
     selected, near_ties = 0, 0
     for pos in range(steps):
@@ -673,3 +673,76 @@ def test_v4_csa_layer_matches_deepseek(steps):
 
     assert selected >= 5, f"the indexer never had to discard anything ({selected})"
     assert near_ties < steps // 4, f"too many near-ties to have tested much: {near_ties}/{steps}"
+
+
+@pytest.mark.parametrize("ratio", [0, 4])
+def test_v4_golden_batches_independent_sequences(ratio):
+    """S samples are S independent sequences: batching must change nothing.
+
+    This is the definition of the batch axis, so it is worth asserting directly
+    rather than inferring it from a per-stage comparison. Two sequences are run
+    together at S=2 and again separately at S=1, each with its own cache and
+    compressor state; sample s of the batched run must equal run s.
+
+    It is the test that would catch a stage reading sample 0's state for every
+    sample -- a real defect class here, since the whole design keeps rolling
+    compressor state per sequence. ratio 4 covers the CSA path, where the
+    indexer carries three more per-sequence buffers than the window does.
+    """
+    device = "cuda"
+    torch.manual_seed(0)
+    cfg = _cfg(hc_mult=4, compress_ratio=ratio, max_seq=256)
+    if ratio:
+        cfg.index_topk = 4
+    cfg.validate()
+    W = make_weights(rank=0, cfg=cfg, device=device, seed=7, moe_mode=MoeMode.W8A16)
+    cos, sin = rope_table(512, theta=cfg.rope_base, device=device)
+    ihd, coff, S = cfg.index_head_dim, cfg.c_coff, 2
+
+    def state(n):
+        """The per-sequence buffers golden_layer threads, for a batch of n."""
+        d = dict(kv_cache=torch.zeros(n, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device))
+        if not ratio:
+            return d
+        d |= dict(
+            kv_state=torch.zeros(n, cfg.c_rows, coff * cfg.head_dim, device=device),
+            score_state=torch.full((n, cfg.c_rows, coff * cfg.head_dim), float("-inf"), device=device),
+            cos_c=cos,
+            sin_c=sin,
+        )
+        if cfg.indexed:
+            d |= dict(
+                i_state=torch.zeros(n, cfg.c_rows, coff * ihd, device=device),
+                i_score_state=torch.full((n, cfg.c_rows, coff * ihd), float("-inf"), device=device),
+                i_cache=torch.zeros(n, cfg.n_compressed, ihd, dtype=torch.bfloat16, device=device),
+            )
+        return d
+
+    def run(st, h, pos):
+        n = h.shape[0]
+        kw = dict(st)
+        return golden_layer(
+            W,
+            h,
+            pos,
+            kw.pop("kv_cache"),
+            layer_idxs(pos, n, cfg, device),
+            cos,
+            sin,
+            lambda z: z,
+            moe_mode=MoeMode.W8A16,
+            **kw,
+        )
+
+    batched, alone = state(S), [state(1) for _ in range(S)]
+    steps = 4 * cfg.window // 3
+    for pos in range(steps):
+        h = (0.5 * torch.randn(S, cfg.hc_mult, cfg.hidden, device=device)).to(torch.bfloat16)
+        got = run(batched, h, pos)["x_out"]
+        for s in range(S):
+            want = run(alone[s], h[s : s + 1], pos)["x_out"]
+            d = (got[s].float() - want[0].float()).abs().max().item()
+            assert d < 2e-3, f"pos={pos} sample {s}: batched differs from its own run by {d:.3e}"
+    # the run has to be deep enough that the compressor and its state actually ran
+    if ratio:
+        assert steps > 2 * ratio, "too shallow to have crossed a compression boundary"

@@ -122,8 +122,18 @@ N_ROW_TILES = HIDDEN // ROW_TILE
 def dn_tile(S: int, hidden: int = HIDDEN) -> int:
     """Hidden rows per expert-down / FFN peer-reduce task: 32 at S = 1 (placed off
     the router CTAs, whose up/gate task finishes last, so every down task streams
-    its weights during the mid wait); one task per CTA above."""
-    return 32 if S == 1 else hidden // BLOCKS
+    its weights during the mid wait); about one task per CTA above.
+
+    A MULTIPLE OF 16, which the plain ``hidden // BLOCKS`` is not. ``emit_dn``
+    keeps tile rows ``dn_off .. dn_off + DN_TILE`` of the ``DN_R * 16`` rows
+    ``reduce_rows`` produces, where ``dn_off = t * DN_TILE % 16``; that only covers
+    the tile when ``dn_off + DN_TILE <= DN_R * 16``. GLM-5's 6144 / 256 = 24 gives
+    dn_off in {0, 8} and just fits, which is why the MLA parent never saw this.
+    V4-Pro's 7168 / 256 = 28 gives dn_off in {0, 4, 8, 12}, and a tile at 12 needs
+    40 rows out of 32 -- eight hidden rows never written, then pushed to the peers
+    as whatever LDS held. Rounding up makes every tile 16-aligned, so dn_off is 0.
+    """
+    return 32 if S == 1 else max(16, -(-(hidden // BLOCKS) // 16) * 16)
 
 
 N_ROUTER = N_EXPERTS // ROUTER_TILE
@@ -576,7 +586,16 @@ def build_dsv4_kernel(
     assert (
         heads % WAVES == 0 and heads <= 16
     ), "the split-attention mapping needs a whole number of wave-groups per head, heads <= 16"
-    assert window % SPLIT_KEYS == 0 and 1 <= S <= 8
+    assert window % SPLIT_KEYS == 0
+    # What actually bounds the sample count, rather than one opaque `S <= 8`. Each
+    # is satisfied at every shipped shape; they are here so a future one fails the
+    # build instead of hanging or quietly producing zeros on the GPU.
+    assert 1 <= S <= 16, "n_sel / reduce_rows put the samples in the MFMA's 16 B columns"
+    assert S <= WAVES, f"dn_route routes sample s on wave s, and there are {WAVES} waves"
+    assert S * (1 + top_k) <= SPLIT_KEYS, (
+        f"dn_route packs S * MOE_SLOTS = {S * (1 + top_k)} expert ids into Smem.keys, "
+        f"which the split stage sizes at SPLIT_KEYS = {SPLIT_KEYS}"
+    )
     assert head_dim % 64 == 0, "the score MFMA walks HEAD_DIM in 32-wide steps over 2 wave halves"
     # The PV MFMA gives each wave HEAD_DIM / 32 / WAVES dim-pair groups and the KV
     # gather gives each lane HEAD_DIM / 64 elements; both silently produce no work at
@@ -586,12 +605,6 @@ def build_dsv4_kernel(
         head_dim % (32 * WAVES) == 0
     ), f"head_dim must be a multiple of {32 * WAVES} for the PV MFMA's per-wave dim groups, got {head_dim}"
     assert head_dim >= 128, "the KV gather needs at least one packed word per lane"
-    if S > 1:
-        # the S > 1 up/gate path still places exactly one tile per CTA per sample
-        assert top_k * (inter // UG8) == BLOCKS, (
-            f"S > 1 needs top_k * (inter / {UG8}) == {BLOCKS}, got {top_k} * {inter // UG8}; "
-            "only S == 1 is wired up for shapes that do not divide (see the ug stage)"
-        )
     assert (head_dim - ROPE_DIM) % 64 == 0, "the KV row's FP8 round-trip blocks the nope part by 64"
     assert heads % o_groups == 0, "o_a groups partition the concatenated heads"
     assert o_lora % ROW_TILE == 0 and (heads * head_dim // o_groups) % 64 == 0
@@ -1564,7 +1577,7 @@ def build_dsv4_kernel(
         def start(name):
             return (bid + (G - base[name])) & (G - 1)
 
-        def stamp(name, t, which, lead=0):
+        def stamp(name, t, which, lead=0, pred=None):
             if const_expr(timeline):
                 # Nothing may cross the clock read. Without this the scheduler
                 # sinks plain VALU work past the stamp -- it only has to respect
@@ -1575,7 +1588,11 @@ def build_dsv4_kernel(
                 # does constrain the scheduler in the timeline build, so read the
                 # phase SPLIT from here and the layer total from a timeline-off run.
                 rocdl.sched_barrier(0)
-                if tid == lead:
+                # ``pred`` false means this task is a masked-off rep that shares a
+                # row with a live one; letting it stamp would overwrite that task's
+                # real timing with a time it never spent.
+                ok = (tid == lead) if const_expr(pred is None) else ((tid == lead) & pred)
+                if ok:
                     now = fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
                     fx.generic_store(
                         fx.inttoptr(
@@ -1838,8 +1855,12 @@ def build_dsv4_kernel(
             # gamma and the RoPE factors are issued ahead of the wait
             g = ld_bf16(_rsrc(g_kv), fx.min(tid, HEAD_DIM - 1))
             ri = fx.max(tid - NOPE_DIM, fx.Int32(0)) // 2
-            cs = [ld_f32(_rsrc(rope_cos), (pos0 + s) * (ROPE_DIM // 2) + ri) for s in range(S)]
-            sns = [ld_f32(_rsrc(rope_sin), (pos0 + s) * (ROPE_DIM // 2) + ri) for s in range(S)]
+            # every sample is a separate sequence at the SAME position, so one
+            # rotation and one ring slot serve them all; they differ only in which
+            # cache slice they land in
+            cs = ld_f32(_rsrc(rope_cos), pos0 * (ROPE_DIM // 2) + ri)
+            sns = ld_f32(_rsrc(rope_sin), pos0 * (ROPE_DIM // 2) + ri)
+            slot = pos0 % window
             hint_wait(
                 HEAD_DIM // QKV_A_TILE,
                 lambda k: (mb("kv_a"), (S - 1) * HEAD_DIM + k * QKV_A_TILE + QKV_A_TILE - 1),
@@ -1850,12 +1871,11 @@ def build_dsv4_kernel(
             live = tid < HEAD_DIM
             ssq = block_sums([live.select(v * v, fx.Float32(0.0)) for v in vs])
             for s in range_constexpr(S):
-                slot = (pos0 + s) % window
                 nv = vs[s] * _rsq(ssq[s] * (1.0 / HEAD_DIM) + EPS) * g
                 # rope tail: lane ^ 1 is the other half of this interleaved (2i, 2i+1) pair
                 partner = _xshfl(nv, 1)
                 even = tid % 2 == 0
-                rot = even.select(nv * cs[s] - partner * sns[s], partner * sns[s] + nv * cs[s])
+                rot = even.select(nv * cs - partner * sns, partner * sns + nv * cs)
                 # nope head: one 64-wide FP8 block per wave
                 amax = wave_max(fmath.absf(nv))
                 nz = amax > 0.0
@@ -1864,7 +1884,7 @@ def build_dsv4_kernel(
                 d0, _ = _fp8_roundtrip(fx.min(fx.max(nv * inv, -FP8_MAX), FP8_MAX), fx.Float32(0.0))
                 kvn = bf16_round((tid < NOPE_DIM).select(d0 * qs, rot))
                 if live:
-                    bo.buffer_store(kvn.to(fx.BFloat16), r_kv, slot * HEAD_DIM + tid)
+                    bo.buffer_store(kvn.to(fx.BFloat16), r_kv, (s * CACHE_ROWS + slot) * HEAD_DIM + tid)
                     put(mb("kvnew"), s * HEAD_DIM + tid, kvn)
             stamp("cache", t, 4)
 
@@ -1882,7 +1902,12 @@ def build_dsv4_kernel(
                 stamp("cmp", tt, 0)
                 ch = fx.min(tid, HEAD_DIM - 1)
                 live = tid < HEAD_DIM
-                p = pos0 + tt
+                # tt is the sample: its own sequence, at the shared position, with
+                # its own rolling state. That per-sample state is also what keeps
+                # these S tasks -- one per CTA, nothing ordering them -- from racing.
+                p = pos0
+                sb = tt * C_ROWS * CW  # this sequence's slice of the rolling state
+                cb = tt * CACHE_ROWS * HEAD_DIM  # ... and of the KV cache
                 slot = p % CR
                 ap0 = [ld_f32(_rsrc(ape), slot * CW + j * HEAD_DIM + ch) for j in range(C_COFF)]
                 g = ld_bf16(_rsrc(g_ckv), ch)
@@ -1900,7 +1925,7 @@ def build_dsv4_kernel(
                 stamp("cmp", tt, 2)
                 if live:
                     for j in range_constexpr(C_COFF):
-                        w = (CBASE + slot) * CW + j * HEAD_DIM + ch
+                        w = sb + (CBASE + slot) * CW + j * HEAD_DIM + ch
                         bo.buffer_store(kvv[j], r_kvst, w)
                         bo.buffer_store(gtv[j] + ap0[j], r_scst, w)
                 if (p + 1) % CR == 0:  # uniform across the CTA
@@ -1919,7 +1944,7 @@ def build_dsv4_kernel(
                         # their FIRST half and the current window's from their SECOND
                         i = fx.Int32(_i)
                         coff = (i >= CR).select(fx.Int32(HEAD_DIM), fx.Int32(0)) if OVERLAP else 0
-                        wi = i * CW + coff + ch
+                        wi = sb + i * CW + coff + ch
                         sv = ld_f32(r_scst, wi)
                         kv_i = ld_f32(r_kvst, wi)
                         m_new = fx.max(m, sv)
@@ -1942,7 +1967,7 @@ def build_dsv4_kernel(
                     d0, _ = _fp8_roundtrip(fx.min(fx.max(nv * inv, -FP8_MAX), FP8_MAX), fx.Float32(0.0))
                     cv = bf16_round((tid < NOPE_DIM).select(d0 * qs, rot))
                     if live:
-                        bo.buffer_store(cv.to(fx.BFloat16), _rsrc(kv_cache), (window + p // CR) * HEAD_DIM + tid)
+                        bo.buffer_store(cv.to(fx.BFloat16), _rsrc(kv_cache), cb + (window + p // CR) * HEAD_DIM + tid)
                         put(mb("cnew"), tt * HEAD_DIM + tid, cv)
                     if const_expr(OVERLAP):
                         # the current window becomes the previous one. Each thread
@@ -1952,8 +1977,8 @@ def build_dsv4_kernel(
                             for j in range_constexpr(C_COFF):
                                 o = j * HEAD_DIM + ch
                                 if live:
-                                    bo.buffer_store(ld_f32(r_kvst, (CR + i) * CW + o), r_kvst, i * CW + o)
-                                    bo.buffer_store(ld_f32(r_scst, (CR + i) * CW + o), r_scst, i * CW + o)
+                                    bo.buffer_store(ld_f32(r_kvst, sb + (CR + i) * CW + o), r_kvst, sb + i * CW + o)
+                                    bo.buffer_store(ld_f32(r_scst, sb + (CR + i) * CW + o), r_scst, sb + i * CW + o)
                 stamp("cmp", tt, 4)
 
         def had_pair(v0, v1, ln):
@@ -2002,7 +2027,9 @@ def build_dsv4_kernel(
                 # one WAVE covers the row: lane ln holds channels ln and ln + 64
                 ln = lane
                 ilive = wave == 0
-                p = pos0 + tt
+                p = pos0  # tt is the sample -- its own sequence, shared position
+                isb = tt * C_ROWS * IW  # this sequence's slice of the rolling state
+                icb = tt * N_COMP * IHD  # ... and of the indexer's key cache
                 slot = p % CR
                 chs = [ln, ln + 64]
                 ap0 = [[ld_f32(_rsrc(i_ape), slot * IW + j * IHD + c) for j in range(C_COFF)] for c in chs]
@@ -2014,7 +2041,7 @@ def build_dsv4_kernel(
                 if ilive:
                     for e in range_constexpr(2):
                         for j in range_constexpr(C_COFF):
-                            w = (CBASE + slot) * IW + j * IHD + chs[e]
+                            w = isb + (CBASE + slot) * IW + j * IHD + chs[e]
                             bo.buffer_store(kvv[e][j], r_ikvst, w)
                             bo.buffer_store(gtv[e][j] + ap0[e][j], r_iscst, w)
                 if (p + 1) % CR == 0:  # uniform across the CTA
@@ -2031,7 +2058,7 @@ def build_dsv4_kernel(
                             num = fx.Float32(acc[2])
                             i = fx.Int32(_i)
                             coff = (i >= CR).select(fx.Int32(IHD), fx.Int32(0)) if OVERLAP else 0
-                            wi = i * IW + coff + chs[e]
+                            wi = isb + i * IW + coff + chs[e]
                             sv = ld_f32(r_iscst, wi)
                             kv_i = ld_f32(r_ikvst, wi)
                             m_new = fx.max(m, sv)
@@ -2057,7 +2084,7 @@ def build_dsv4_kernel(
                     o0, o1 = fp4_block(q0), fp4_block(q1)
                     if ilive:
                         r_ic = _rsrc(i_cache)
-                        row = (p // CR) * IHD
+                        row = icb + (p // CR) * IHD
                         bo.buffer_store(bf16_round(o0).to(fx.BFloat16), r_ic, row + ln)
                         bo.buffer_store(bf16_round(o1).to(fx.BFloat16), r_ic, row + ln + 64)
                         put(mb("i_cnew"), tt * IHD + ln, bf16_round(o0))
@@ -2069,8 +2096,12 @@ def build_dsv4_kernel(
                                 for j in range_constexpr(C_COFF):
                                     o = j * IHD + chs[e]
                                     if ilive:
-                                        bo.buffer_store(ld_f32(r_ikvst, (CR + i) * IW + o), r_ikvst, i * IW + o)
-                                        bo.buffer_store(ld_f32(r_iscst, (CR + i) * IW + o), r_iscst, i * IW + o)
+                                        bo.buffer_store(
+                                            ld_f32(r_ikvst, isb + (CR + i) * IW + o), r_ikvst, isb + i * IW + o
+                                        )
+                                        bo.buffer_store(
+                                            ld_f32(r_iscst, isb + (CR + i) * IW + o), r_iscst, isb + i * IW + o
+                                        )
                 stamp("i_cmp", tt, 4)
 
         # ==================================== 3. q_a RMSNorm -> q_b (raw f32 query)
@@ -2161,8 +2192,8 @@ def build_dsv4_kernel(
                 stamp("i_q", tt, 0)
                 ln = lane
                 chs = [ln, ln + 64]
-                rc = ld_f32(_rsrc(rope_cos), (pos0 + tt) * (ROPE_DIM // 2) + ln // 2)
-                rs2 = ld_f32(_rsrc(rope_sin), (pos0 + tt) * (ROPE_DIM // 2) + ln // 2)
+                rc = ld_f32(_rsrc(rope_cos), pos0 * (ROPE_DIM // 2) + ln // 2)
+                rs2 = ld_f32(_rsrc(rope_sin), pos0 * (ROPE_DIM // 2) + ln // 2)
                 for k in range_constexpr(IH // WAVES):
                     ihead = wave + k * WAVES
                     base_i = (tt * IH + ihead) * IHD
@@ -2189,8 +2220,13 @@ def build_dsv4_kernel(
                 r_iw = _rsrc(i_w)
 
                 def ld_hw(sks):
+                    # `tt` IS this task's sample, so the pair's own `s` (always 0,
+                    # since count=1 below asks for one sample's worth of offsets)
+                    # is discarded for it -- the same substitution `router`'s ld_a
+                    # makes. Taking `s` here gave every sample sample 0's score
+                    # weights, which is invisible at S == 1 and silent above it.
                     if const_expr(HC > 1):
-                        vals = poll([(mb("xin"), (s * HIDDEN + k) // 2, 2) for s, k in sks])
+                        vals = poll([(mb("xin"), (tt * HIDDEN + k) // 2, 2) for _s, k in sks])
                         res = []
                         for i in range_constexpr(len(sks)):
                             a0, a1 = bf2_f32(vals[i][0])
@@ -2198,8 +2234,8 @@ def build_dsv4_kernel(
                             res.append([a0, a1, b0, b1])
                         return res
                     res = []
-                    for s, k in sks:
-                        w = fx.Vector(bo.buffer_load(r_h, (s * HIDDEN + k) // 2, vec_width=2, dtype=T.i32))
+                    for _s, k in sks:
+                        w = fx.Vector(bo.buffer_load(r_h, (tt * HIDDEN + k) // 2, vec_width=2, dtype=T.i32))
                         v = w.bitcast(fx.BFloat16).to(fx.Float32)
                         res.append([v[j] for j in range(4)])
                     return res
@@ -2259,13 +2295,18 @@ def build_dsv4_kernel(
                 stamp("i_score", tt, 2)
                 c = blk * SCORE_TILE + tid
                 # entries the compressor has not written yet must never be picked
-                n_live = (pos0 + s + 1) // CR
+                n_live = (pos0 + 1) // CR
                 r_ic2 = _rsrc(i_cache)
+                # This sequence's slice of the key cache. Folded into the row base
+                # ONCE, outside the loop below -- `s` is loop-invariant, and adding
+                # it per iteration would put another live value in the body that
+                # was just trimmed to stop it spilling.
+                icb = s * N_COMP * (IHD // 2)
                 # the entry this launch just wrote is not reliably visible in the
                 # cache yet, so take it from the mailbox instead. The outer test is
                 # CTA-uniform, so every thread reaches the poll; only the thread
                 # holding that candidate uses the value.
-                is_new = c == (pos0 + s) // CR
+                is_new = c == pos0 // CR
                 # A RUNTIME loop, not range_constexpr. Unrolled, the compiler hoists
                 # all IHD / 8 key loads and every query read to the top of the stage;
                 # that is ~130 values more than the budget, so it spilled them and
@@ -2284,7 +2325,7 @@ def build_dsv4_kernel(
                         for v in fx.Vector(
                             bo.buffer_load(
                                 r_ic2,
-                                fx.min(c, N_COMP - 1) * (IHD // 2) + d0 * 4,
+                                icb + fx.min(c, N_COMP - 1) * (IHD // 2) + d0 * 4,
                                 vec_width=4,
                                 dtype=T.i32,
                             )
@@ -2292,7 +2333,7 @@ def build_dsv4_kernel(
                         .bitcast(fx.BFloat16)
                         .to(fx.Float32)
                     ]
-                    if (pos0 + s + 1) % CR == 0:
+                    if (pos0 + 1) % CR == 0:
                         nv = [getf(mb("i_cnew"), s * IHD + d0 * 8 + e) for e in range(8)]
                         kw = [is_new.select(nv[e], kw[e]) for e in range(8)]
                     accs = [fx.Float32(acc[hh]) for hh in range(IH)]
@@ -2352,7 +2393,7 @@ def build_dsv4_kernel(
                 tt = fx.Int32(tt)
                 stamp("i_topk", tt, 0)
                 s = tt
-                n_live = fx.min((pos0 + s + 1) // CR, fx.Int32(N_COMP))
+                n_live = fx.min((pos0 + 1) // CR, fx.Int32(N_COMP))
                 k_want = fx.min(n_live, fx.Int32(N_INDEX))
                 mine = [fx.Int32(tid) * TOPK_PER + j for j in range(TOPK_PER)]
                 ok_c = [(c < n_live) for c in mine]
@@ -2430,8 +2471,8 @@ def build_dsv4_kernel(
             s = tt // H
             head = tt % H
             ri = fx.max(tid - NOPE_DIM, fx.Int32(0)) // 2
-            c = ld_f32(_rsrc(rope_cos), (pos0 + s) * (ROPE_DIM // 2) + ri)
-            sn = ld_f32(_rsrc(rope_sin), (pos0 + s) * (ROPE_DIM // 2) + ri)
+            c = ld_f32(_rsrc(rope_cos), pos0 * (ROPE_DIM // 2) + ri)
+            sn = ld_f32(_rsrc(rope_sin), pos0 * (ROPE_DIM // 2) + ri)
             hint_wait(
                 QB_PER_HEAD,
                 lambda k: (mb("q_raw"), (s * H + head) * HEAD_DIM + k * Q_B_TILE + Q_B_TILE - 1),
@@ -2484,36 +2525,42 @@ def build_dsv4_kernel(
                         fx.Int32(bo.buffer_load(r_idx, s * N_KEYS + k_pos, vec_width=1, dtype=T.i32)),
                     )
 
-        def gather_old_kv():
+        def gather_old_kv(s):
             """Each wave copies its KPW keys' shared KV row (HEAD_DIM bf16) into the tile.
-            Unwritten slots (-1) are clamped to 0 here and masked in the softmax."""
+            Unwritten slots (-1) are clamped to 0 here and masked in the softmax.
+            The rows are slots within sample ``s``'s own cache slice."""
+            cb = s * CACHE_ROWS * (HEAD_DIM // 2)
             krows = [fx.max(lds_ld(keys, wave * KPW + jj), fx.Int32(0)) for jj in range(KPW)]
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
                 kv8 = fx.Vector(
-                    bo.buffer_load(r_kv, krows[jj] * (HEAD_DIM // 2) + lane * WPL, vec_width=WPL, dtype=T.i32)
+                    bo.buffer_load(r_kv, cb + krows[jj] * (HEAD_DIM // 2) + lane * WPL, vec_width=WPL, dtype=T.i32)
                 )
                 fx.ptr_store(kv8.bitcast(fx.Float32), ktile + (j * KS + lane * WPL))
 
-        def patch_new_kv():
+        def patch_new_kv(s):
             """Rows this launch wrote come from mailboxes, not the cache: the split
             cannot rely on seeing our own global store. That covers the window row
-            (kvnew) and, on a compression boundary, the compressed row (cnew)."""
+            (kvnew) and, on a compression boundary, the compressed row (cnew).
+
+            Only sample ``s``'s own rows: the samples are separate sequences, so
+            another sample's new row is not in this one's cache and must not be
+            patched into its tile. ``kr`` is wave-uniform, so the polls below are
+            reached by a whole wave or none of it."""
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
                 kr = lds_ld(keys, j)
-                for sn in range_constexpr(S):
-                    if kr == fx.Int32((pos0 + sn) % window):
-                        kvp = get2_many([(mb("kvnew"), sn * HEAD_DIM + lane * EPL + m * 2) for m in range(WPL)])
-                        w = [bf16_pair(a0, a1) for a0, a1 in kvp]
+                if kr == fx.Int32(pos0 % window):
+                    kvp = get2_many([(mb("kvnew"), s * HEAD_DIM + lane * EPL + m * 2) for m in range(WPL)])
+                    w = [bf16_pair(a0, a1) for a0, a1 in kvp]
+                    fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * WPL))
+                if const_expr(CR):
+                    # only a boundary step writes one, and then it is the newest
+                    # compressed slot
+                    if ((pos0 + 1) % CR == 0) & (kr == fx.Int32(window + pos0 // CR)):
+                        cvp = get2_many([(mb("cnew"), s * HEAD_DIM + lane * EPL + m * 2) for m in range(WPL)])
+                        w = [bf16_pair(a0, a1) for a0, a1 in cvp]
                         fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * WPL))
-                    if const_expr(CR):
-                        # only a boundary step writes one, and then it is the newest
-                        # compressed slot
-                        if ((pos0 + sn + 1) % CR == 0) & (kr == fx.Int32(window + (pos0 + sn) // CR)):
-                            cvp = get2_many([(mb("cnew"), sn * HEAD_DIM + lane * EPL + m * 2) for m in range(WPL)])
-                            w = [bf16_pair(a0, a1) for a0, a1 in cvp]
-                            fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * WPL))
 
         for tt in range(start("split"), S * N_SPLIT, G):
             tt = fx.Int32(tt)
@@ -2522,7 +2569,7 @@ def build_dsv4_kernel(
             t = tt % N_SPLIT  # 64-key chunk
             split_keys(t, s)
             gpu.barrier()
-            gather_old_kv()  # before waiting for q: these rows are from earlier launches
+            gather_old_kv(s)  # before waiting for q: these rows are from earlier launches
             hint_wait(
                 H,
                 lambda k: (mb("q"), ((s * H + k) * HEAD_DIM + HEAD_DIM - 2) // 2),
@@ -2545,7 +2592,7 @@ def build_dsv4_kernel(
                 w4 = tid + NQ * THREADS
                 if w4 < NQ_TOT:
                     stage_q(w4, poll([(mb("q"), (s * H * HEAD_DIM + w4 * 4) // 2, 2)])[0])
-            patch_new_kv()
+            patch_new_kv(s)
             stamp("split", tt, 2)
             gpu.barrier()
             stamp("split", tt, 5)
@@ -2661,8 +2708,8 @@ def build_dsv4_kernel(
             # de-rotate the RoPE lanes (inverse rotation: sin negated)
             d0 = doff + dp * 2
             ri = fx.max(d0 - NOPE_DIM, fx.Int32(0)) // 2
-            c = ld_f32(_rsrc(rope_cos), (pos0 + s) * (ROPE_DIM // 2) + ri)
-            sn = ld_f32(_rsrc(rope_sin), (pos0 + s) * (ROPE_DIM // 2) + ri)
+            c = ld_f32(_rsrc(rope_cos), pos0 * (ROPE_DIM // 2) + ri)
+            sn = ld_f32(_rsrc(rope_sin), pos0 * (ROPE_DIM // 2) + ri)
             rot = d0 >= NOPE_DIM
             v0 = rot.select(o0 * c + o1 * sn, o0)
             v1 = rot.select(o1 * c - o0 * sn, o1)
@@ -3049,17 +3096,27 @@ def build_dsv4_kernel(
         elif const_expr(S > 1):
             # One eight-intermediate tile per CTA and sample. Shared weights use
             # the sample columns of one MFMA; routed tiles pipeline over samples.
+            #
+            # REP tiles per CTA, unrolled at BUILD time rather than walked with a
+            # runtime `range(start("ug"), N_UG_TASKS, G)` the way S == 1 does: the
+            # unit lists below are Python lists of traced operands that mma_units
+            # consumes while tracing, so they cannot be carried by an scf.for.
+            # N_UG_TASKS need not divide BLOCKS -- V4-Pro's top-6 over INTER 384
+            # gives 288 tiles for 256 CTAs -- so a rep past the end is MASKED by
+            # `live` rather than skipped, which keeps every barrier below reached
+            # by the whole workgroup. `live` zeroes that rep's buffer descriptors'
+            # num_records so its weight loads are killed in the texture unit, and
+            # suppresses its publishes. The mask is redundant-work suppression, not
+            # a correctness guard: `uu` clamps a dead rep onto a real tile, so
+            # removing the publish mask alone changes no output (measured). What IS
+            # load-bearing is the loop itself -- capping REP at 1 leaves tiles
+            # 256..287 uncomputed and `down` then polls their `mid` slots forever.
             UG8_UNITS = (HIDDEN // UG_UNIT_K) // WAVES
             XW = HIDDEN // (4 if use_fp8_block128 else 2)
-            u = fx.Int32(start("ug"))
-            c = u % (INTER // UG8)
-            has_sh = u < INTER // UG8
-            slot = has_sh.select(fx.Int32(MOE_SLOTS - 1), u // (INTER // UG8))
-            w_rg = ((lane % 16) // 8) * (INTER // 16) + c // 2
-            w_ln = (lane & -16) | ((c % 2) * 8 + lane % 8)
-            s_rg = (lane // 32) * (INTER // 16) + c // 2
+            REP = (N_UG_TASKS + G - 1) // G
+            u0 = fx.Int32(start("ug"))
 
-            def ug8_units(e, sample, live=None):
+            def ug8_units(c, w_rg, w_ln, s_rg, e, sample, live=None):
                 nw = None if live is None else live.select(fx.Int32(UG_W_BYTES), fx.Int32(0))
                 ns = None if live is None else live.select(fx.Int32(UG_S_BYTES), fx.Int32(0))
                 rw = bo.create_buffer_resource_from_addr(
@@ -3116,7 +3173,7 @@ def build_dsv4_kernel(
                         units.append(("fp8", wv, sc, sn * XW + kc * 32 + (lane // 16) * 4))
                 return units
 
-            def ug8_emit(sample, shared):
+            def ug8_emit(c, slot, sample, shared, live):
                 if tid < (S if shared else 1) * UG8 // 2:
                     n = tid // (UG8 // 2)
                     r = (tid % (UG8 // 2)) * 2
@@ -3124,41 +3181,82 @@ def build_dsv4_kernel(
                     v0, v1 = lds_ld(outs, n * 16 + UG8 + r), lds_ld(outs, n * 16 + UG8 + r + 1)
                     sn = n if shared else fx.Int32(sample)
                     sl = fx.Int32(0) if shared else slot
-                    put2(
-                        mb("mid"),
-                        (sn * MOE_SLOTS + sl) * INTER + c * UG8 + r,
-                        _swiglu(g0, v0, swiglu_limit),
-                        _swiglu(g1, v1, swiglu_limit),
-                    )
+                    if live:
+                        put2(
+                            mb("mid"),
+                            (sn * MOE_SLOTS + sl) * INTER + c * UG8 + r,
+                            _swiglu(g0, v0, swiglu_limit),
+                            _swiglu(g1, v1, swiglu_limit),
+                        )
                 if (c == 0) & (tid < S if shared else tid == 0):
                     sn = tid if shared else fx.Int32(sample)
                     sl = fx.Int32(0) if shared else slot
-                    put(mb("sel"), sn * MOE_SLOTS + sl, lds_ld(keys, sn * MOE_SLOTS + sl))
-                    put(mb("prob"), sn * MOE_SLOTS + sl, lds_ld(dnw, sn * MOE_SLOTS + sl))
+                    if live:
+                        put(mb("sel"), sn * MOE_SLOTS + sl, lds_ld(keys, sn * MOE_SLOTS + sl))
+                        put(mb("prob"), sn * MOE_SLOTS + sl, lds_ld(dnw, sn * MOE_SLOTS + sl))
 
-            shared_pre = ug8_units(fx.Int32(SHARED_EXPERT), None, has_sh)
+            def ug8_tile(u):
+                """This CTA's tile for one rep: (live, c, slot, has_sh, w_rg, w_ln, s_rg).
+
+                ``u`` is clamped so a dead rep's LDS and descriptor indices stay in
+                range; `live` is what actually suppresses its effects."""
+                live = u < N_UG_TASKS
+                uu = fx.min(u, fx.Int32(N_UG_TASKS - 1))
+                c = uu % UG_PER_SLOT
+                has_sh = uu < UG_PER_SLOT
+                slot = has_sh.select(fx.Int32(MOE_SLOTS - 1), uu // UG_PER_SLOT)
+                w_rg = ((lane % 16) // 8) * (INTER // 16) + c // 2
+                w_ln = (lane & -16) | ((c % 2) * 8 + lane % 8)
+                s_rg = (lane // 32) * (INTER // 16) + c // 2
+                return live, uu, c, slot, has_sh, w_rg, w_ln, s_rg
+
+            # Rep 0's weights are prefetched ahead of the routing wait and the input
+            # staging, as the single-tile version did; dn_route and stage_moe_input
+            # are CTA-global, so they stay out of the rep loop and every rep reads
+            # the one staged input.
+            live0, uu0, c0, slot0, has_sh0, wr0, wl0, sr0 = ug8_tile(u0)
+            shared_pre = ug8_units(c0, wr0, wl0, sr0, fx.Int32(SHARED_EXPERT), None, has_sh0 & live0)
             dn_route(load_bias())
             gpu.barrier()
-            cur = ug8_units(_uniform(lds_ld(keys, slot)), 0)
+            cur = ug8_units(c0, wr0, wl0, sr0, _uniform(lds_ld(keys, slot0)), 0, live0)
             stage_moe_input(list(range(S)))
             gpu.barrier()
-            if has_sh:
-                reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre), emit_out(16))
-                gpu.barrier()
-                ug8_emit(0, True)
-            for sample in range_constexpr(S):
-                stamp("ug", sample * G + u, 0)
-                pre = cur
-                if const_expr(sample + 1 < S):
-                    cur = ug8_units(_uniform(lds_ld(keys, (sample + 1) * MOE_SLOTS + slot)), sample + 1)
-                reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16))
-                gpu.barrier()
-                ug8_emit(sample, False)
-                stamp("ug", sample * G + u, 4)
+            for rep in range_constexpr(REP):
+                if const_expr(rep == 0):
+                    live, uu, c, slot, has_sh = live0, uu0, c0, slot0, has_sh0
+                    w_rg, w_ln, s_rg = wr0, wl0, sr0
+                else:
+                    live, uu, c, slot, has_sh, w_rg, w_ln, s_rg = ug8_tile(u0 + rep * G)
+                    shared_pre = ug8_units(c, w_rg, w_ln, s_rg, fx.Int32(SHARED_EXPERT), None, has_sh & live)
+                    cur = ug8_units(c, w_rg, w_ln, s_rg, _uniform(lds_ld(keys, slot)), 0, live)
+                if has_sh:
+                    reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre), emit_out(16))
+                    gpu.barrier()
+                    ug8_emit(c, slot, 0, True, live)
+                for sample in range_constexpr(S):
+                    stamp("ug", sample * N_UG_TASKS + uu, 0, pred=live)
+                    pre = cur
+                    if const_expr(sample + 1 < S):
+                        cur = ug8_units(
+                            c,
+                            w_rg,
+                            w_ln,
+                            s_rg,
+                            _uniform(lds_ld(keys, (sample + 1) * MOE_SLOTS + slot)),
+                            sample + 1,
+                            live,
+                        )
+                    reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16))
+                    gpu.barrier()
+                    ug8_emit(c, slot, sample, False, live)
+                    stamp("ug", sample * N_UG_TASKS + uu, 4, pred=live)
 
         # =============== 10. expert down + route weighting + MoE TP reduce
         DN_NKC = INTER // 64
-        DN_R = (DN_TILE + 15) // 16  # 16-row groups touched by a tile (24-row tiles start at row 0 or 8 of one)
+        # dn_tile keeps this a multiple of 16, so every tile starts at row 0 of a
+        # group (dn_off == 0) and reduce_rows produces exactly the tile's rows.
+        assert DN_TILE % 16 == 0 and HIDDEN % DN_TILE == 0, f"down tile {DN_TILE} must divide {HIDDEN} by 16s"
+        DN_R = DN_TILE // 16  # 16-row groups touched by a tile
         DN_WPR = WAVES // DN_R
         DN_UNIT_K = 128 if (use_fp8_block128 or use_mxfp4_weight) else 64
         DN_UNITS_PER_SLOT = INTER // DN_UNIT_K

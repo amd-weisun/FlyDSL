@@ -121,17 +121,20 @@ class Dsv4MoeLayer:
         )
         self.stages = stage_tasks(samples, cfg.heads, window=cfg.window, top_k=cfg.top_k, inter=cfg.inter, **dims)
         # the compressor carries a rolling window across decode steps, so its state
-        # lives here rather than being rebuilt per call
+        # lives here rather than being rebuilt per call. The leading `samples` is
+        # the batch axis: each sample is its own sequence, so it carries its own
+        # rolling state -- which is also what keeps the S compressor tasks, one per
+        # CTA with nothing ordering them, from racing on a shared one.
         if cfg.indexed:
-            ishape = (cfg.c_rows, cfg.c_coff * cfg.index_head_dim)
+            ishape = (samples, cfg.c_rows, cfg.c_coff * cfg.index_head_dim)
             self.i_kv_state = torch.zeros(*ishape, dtype=torch.float32, device=dev)
             self.i_score_state = torch.full(ishape, float("-inf"), dtype=torch.float32, device=dev)
             # the indexer's cache holds compressed entries only, no window half
-            self.i_cache = torch.zeros(cfg.n_compressed, cfg.index_head_dim, dtype=torch.bfloat16, device=dev)
+            self.i_cache = torch.zeros(samples, cfg.n_compressed, cfg.index_head_dim, dtype=torch.bfloat16, device=dev)
         else:
             self.i_kv_state = self.i_score_state = self.i_cache = torch.zeros(1, device=dev)
         if cfg.compress_ratio:
-            shape = (cfg.c_rows, cfg.c_coff * cfg.head_dim)
+            shape = (samples, cfg.c_rows, cfg.c_coff * cfg.head_dim)
             self.kv_state = torch.zeros(*shape, dtype=torch.float32, device=dev)
             # -inf, not zero: with overlapping windows (CSA) the previous window's
             # rows are unwritten before the first emit and must drop out of the
@@ -165,12 +168,24 @@ class Dsv4MoeLayer:
         stream-ordered device ops, so the sequence can be captured in a HIP graph."""
         if not 0 <= layer < MAX_LAYERS_PER_STEP:
             raise ValueError(f"layer must be in [0, {MAX_LAYERS_PER_STEP}), got {layer}")
+        cfg = self.W.cfg
+        # The kernel derives every per-sample offset from self.S, so a leading
+        # dimension that disagrees is not a wrong answer, it is a read past the end
+        # of somebody's buffer. Cheap to check once per layer against a launch that
+        # would otherwise corrupt memory.
+        hshape = (self.S, cfg.hidden) if cfg.hc_mult == 1 else (self.S, cfg.hc_mult, cfg.hidden)
+        if tuple(h.shape) != hshape:
+            raise ValueError(f"h must be {hshape}, got {tuple(h.shape)}")
+        if tuple(kv_cache.shape) != (self.S, cfg.cache_rows, cfg.head_dim):
+            raise ValueError(
+                f"kv_cache must be {(self.S, cfg.cache_rows, cfg.head_dim)} -- one slice per "
+                f"sequence in the batch -- got {tuple(kv_cache.shape)}"
+            )
+        if tuple(indices.shape) != (self.S, cfg.n_keys):
+            raise ValueError(f"indices must be {(self.S, cfg.n_keys)}, got {tuple(indices.shape)}")
         t = dict(self.W.t, **self.packed)
         if x_out is None:
-            shape = (self.S, self.W.cfg.hidden)
-            if self.W.cfg.hc_mult > 1:  # the layer preserves the whole residual stream
-                shape = (self.S, self.W.cfg.hc_mult, self.W.cfg.hidden)
-            x_out = torch.empty(*shape, dtype=torch.bfloat16, device=h.device)
+            x_out = torch.empty(*hshape, dtype=torch.bfloat16, device=h.device)
         p = lambda x: x.data_ptr()  # noqa: E731
         self.launch(
             p(h),
