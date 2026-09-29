@@ -60,6 +60,7 @@ class SharedReuseMlaMoeLayer:
         free_unpacked: bool = False,
         reuse: "SharedReuseMlaMoeLayer | None" = None,
         packed: dict | None = None,
+        kv_fp8: bool = False,
     ):
         """``paged``: serving mode (S independent sequences over a paged 576-wide cache, see
         ``build_shared_reuse_kernel``).  ``reuse``: another layer built with identical
@@ -71,6 +72,7 @@ class SharedReuseMlaMoeLayer:
         self.moe_mode = as_moe_mode(moe_mode)
         self.W, self.S, self.rank, self.npes, self.topk = W, samples, rank, npes, topk
         self.paged = paged
+        self.kv_fp8 = kv_fp8
         if packed is not None:  # weights already packed by a sibling layer object (another S)
             self.packed = packed
         else:
@@ -81,12 +83,13 @@ class SharedReuseMlaMoeLayer:
         dims = dict(hidden=W.hidden, q_lora=W.q_lora, nope_dim=W.nope_dim, v_dim=W.v_dim)
         dev = torch.device("cuda", torch.cuda.current_device())
         if reuse is not None:
-            assert (reuse.S, reuse.W.heads, reuse.npes, reuse.topk, reuse.paged) == (
+            assert (reuse.S, reuse.W.heads, reuse.npes, reuse.topk, reuse.paged, reuse.kv_fp8) == (
                 samples,
                 W.heads,
                 npes,
                 topk,
                 paged,
+                kv_fp8,
             ), "reuse= needs identical static arguments"
             self.scr_layout, self.sym_layout = reuse.scr_layout, reuse.sym_layout
             self.scratch, self.peer_buffer = reuse.scratch, reuse.peer_buffer
@@ -107,6 +110,7 @@ class SharedReuseMlaMoeLayer:
                 topk_groups=topk_groups,
                 paged=paged,
                 eps=eps,
+                kv_fp8=kv_fp8,
                 **dims,
             )
             self.stages = stage_tasks(samples, W.heads, topk, **dims)
@@ -138,7 +142,7 @@ class SharedReuseMlaMoeLayer:
         """Serving decode step of one layer: ``h`` [S, hidden] bf16 (S independent sequences, one
         new token each), ``positions``/``slot_map`` int32 [S], ``kv_indptr`` int32 [S+1] and
         ``kv_indices`` int32 CSR rows of each sample's whole context (new token included) into
-        ``kv_pool`` (a [rows, 576] bf16 pool: 512 latent | 64 k_pe), ``cos``/``sin`` f32 [max_pos, 32]."""
+        ``kv_pool`` (a [rows, 576] bf16 pool, or float8_e4m3fn with ``kv_fp8``: 512 latent | 64 k_pe), ``cos``/``sin`` f32 [max_pos, 32]."""
         assert self.paged, "layer was not built with paged=True"
         return self.forward(
             h,

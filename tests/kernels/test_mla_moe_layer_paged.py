@@ -34,7 +34,7 @@ MAX_SEQ = 131072 + 8
 POOL_ROWS = 300000
 
 
-def run(S, lens, seed=1234, dev="cuda:0", pad=0, pad_value=None):
+def run(S, lens, seed=1234, dev="cuda:0", pad=0, pad_value=None, kv_fp8=False):
     from kernels.mla_moe_layer.layer import SharedReuseMlaMoeLayer
 
     torch.cuda.set_device(dev)
@@ -44,6 +44,8 @@ def run(S, lens, seed=1234, dev="cuda:0", pad=0, pad_value=None):
     cos, sin = rope_table(MAX_SEQ, device=dev)
     gen = torch.Generator(device=dev).manual_seed(seed + 7)
     pool = torch.randn(POOL_ROWS, KV_LORA + PE_DIM, generator=gen, device=dev).to(torch.bfloat16)
+    if kv_fp8:  # the pool holds E4M3FN bytes; the golden sees their exact bf16 values
+        pool = pool.to(torch.float8_e4m3fn)
     perm = torch.randperm(POOL_ROWS, generator=gen, device=dev)
     slots, o = [], 0
     for L in lens:  # each sample owns L scattered rows; the last one is its new token
@@ -59,9 +61,10 @@ def run(S, lens, seed=1234, dev="cuda:0", pad=0, pad_value=None):
             if L == 0:
                 h[b] = pad_value
     pool0 = pool.clone()
+    pool0_bf = pool0.to(torch.bfloat16) if kv_fp8 else pool0
 
     op = SharedReuseMlaMoeLayer(
-        W, S, npes=1, topk=TOPK, paged=True, eps=EPS, softmax_scale=SCALE, n_groups=N_GROUPS, topk_groups=TOPK_GROUPS
+        W, S, npes=1, topk=TOPK, paged=True, kv_fp8=kv_fp8, eps=EPS, softmax_scale=SCALE, n_groups=N_GROUPS, topk_groups=TOPK_GROUPS
     )
     out = op.forward_paged(h, positions, pool, slot_map, indptr, indices, cos, sin)
     torch.cuda.synchronize()
@@ -82,15 +85,15 @@ def run(S, lens, seed=1234, dev="cuda:0", pad=0, pad_value=None):
             continue
         kv = torch.zeros(MAX_SEQ, KV_LORA, dtype=torch.bfloat16, device=dev)
         pe = torch.zeros(MAX_SEQ, PE_DIM, dtype=torch.bfloat16, device=dev)
-        kv[: L - 1] = pool0[slots[b][:-1].long(), :KV_LORA]
-        pe[: L - 1] = pool0[slots[b][:-1].long(), KV_LORA:]
+        kv[: L - 1] = pool0_bf[slots[b][:-1].long(), :KV_LORA]
+        pe[: L - 1] = pool0_bf[slots[b][:-1].long(), KV_LORA:]
         ref = golden_layer(W, h[b : b + 1], L - 1, kv, pe, None, cos, sin, ident, topk=10**9)
         moe = golden_moe(W, ref["a"], ident, n_groups=N_GROUPS, topk_groups=TOPK_GROUPS)
         for name in ("q_a", "kv_a", "q_nope", "q_pe", "q_lat", "o", "a"):
             g, r = stages[name][b].float(), ref[name][0].float()
             rel = ((g - r).norm() / r.norm()).item()
             print(f"  {name:7s} rel_l2={rel:.2e}")
-            assert rel < 2e-2, f"{name} of sample {b} diverges (rel_l2={rel:.2e})"
+            assert rel < (4e-2 if kv_fp8 else 2e-2), f"{name} of sample {b} diverges (rel_l2={rel:.2e})"
         same_sel = sorted(stages["sel"][b].tolist()) == sorted(moe["sel"][0].tolist())
         own = golden_moe(
             W,
@@ -111,13 +114,14 @@ def run(S, lens, seed=1234, dev="cuda:0", pad=0, pad_value=None):
         else:
             print("  x_out vs independent golden: skipped (routing flipped on a 1-ulp difference in a)")
         # cache write of the new token
-        new = pool[slot_map[b].long()]
-        torch.testing.assert_close(new[:KV_LORA].float(), kv[L - 1].float(), atol=2e-2, rtol=1e-2)
-        torch.testing.assert_close(new[KV_LORA:].float(), pe[L - 1].float(), atol=2e-2, rtol=1e-2)
+        new = pool[slot_map[b].long()].to(torch.bfloat16)
+        tol = dict(atol=0.03, rtol=0.13) if kv_fp8 else dict(atol=2e-2, rtol=1e-2)  # fp8: one E4M3 ulp
+        torch.testing.assert_close(new[:KV_LORA].float(), kv[L - 1].float(), **tol)
+        torch.testing.assert_close(new[KV_LORA:].float(), pe[L - 1].float(), **tol)
     # only the new rows may change
     mask = torch.ones(POOL_ROWS, dtype=torch.bool, device=dev)
     mask[slot_map[slot_map >= 0].long()] = False
-    assert torch.equal(pool[mask], pool0[mask]), "paged kernel wrote outside the new-token rows"
+    assert torch.equal(pool[mask].view(torch.uint8), pool0[mask].view(torch.uint8)), "paged kernel wrote outside the new-token rows"
     op.close()
     return worst
 
@@ -145,6 +149,12 @@ def test_paged_padded_rows_with_garbage_hidden(pad_value):
     """The hidden rows of padded samples come out of ATOM's attention over an EMPTY context: NaN/Inf/huge is
     possible.  Real samples must be unaffected."""
     assert run(4, [120, 300, 0, 0], pad=2, pad_value=pad_value) < 5e-2
+
+
+@pytest.mark.parametrize("lens", [[37, 300], [1500, 64, 200, 9000], [70000, 129, 8192, 45]])
+def test_paged_fp8_kv(lens):
+    """fp8 (E4M3FN, unit scale) pool: rows are dequantized on gather, the new token is stored saturated."""
+    assert run(len(lens), lens, kv_fp8=True) < 5e-2
 
 
 def test_paged_padded_samples():

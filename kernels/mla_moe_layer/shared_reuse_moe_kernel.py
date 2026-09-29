@@ -42,7 +42,7 @@ order, so all ranks produce bit-identical hidden states (and routing).
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 from kernels.common import buffer_ops as bo
@@ -343,6 +343,7 @@ def build_shared_reuse_kernel(
     v_dim: int = V_DIM,
     paged: bool = False,
     eps: float = EPS,
+    kv_fp8: bool = False,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer.
 
@@ -353,6 +354,11 @@ def build_shared_reuse_kernel(
     included); the cache is a paged pool of 576-wide bf16 rows (512 latent | 64 k_pe,
     ``pe_cache`` = ``kv_cache`` + 512 elements).  ``paged=False`` keeps the one-sequence,
     S-consecutive-tokens contract with separate contiguous kv/pe caches.
+
+    ``kv_fp8=True`` (paged only) makes the pool rows 576 bytes of E4M3FN (unit scale, ATOM's
+    ``--kv_cache_dtype fp8``): key rows are converted to bf16 when gathered, the new token's
+    row is stored as saturated fp8, and the values patched in for this launch's new rows are the
+    fp8-rounded ones so they equal what later launches will read.
 
     ``n_groups``/``topk_groups`` add DeepSeek-V3-style group-limited routing (see
     ``reference.route``'s docstring for the exact selection semantics this mirrors);
@@ -426,7 +432,8 @@ def build_shared_reuse_kernel(
     SC, SY = layout(S, H, W, topk, moe_mode, hidden=HIDDEN, q_lora=Q_LORA, nope_dim=NOPE_DIM, v_dim=V_DIM)
     N_SPLIT = topk // SPLIT_KEYS
     assert N_SPLIT <= 64, "the split merge holds one split per lane: topk // 64 <= 64 (in paged mode topk only sets the split count)"
-    KV_ROW = KV_LORA + PE_DIM if paged else KV_LORA  # cache row stride in bf16 elements
+    assert not kv_fp8 or paged, "kv_fp8 is a paged-mode option"
+    KV_ROW = KV_LORA + PE_DIM if paged else KV_LORA  # cache row stride in bf16 (fp8: byte) elements
     PE_ROW = KV_LORA + PE_DIM if paged else PE_DIM
     QB_ROWS = H * (NOPE_DIM + PE_DIM)
     N_QB = QB_ROWS // Q_B_TILE
@@ -1295,17 +1302,36 @@ def build_shared_reuse_kernel(
                 kvn = bf16_round(vs[s] * _rsq(ssq[s] * (1.0 / KV_LORA) + EPS) * g)
                 # paged: a padded sample (CUDA-graph batch padding) has slot -1 and stores nothing;
                 # its mailbox rows below are still produced so consumers never wait forever
-                if pos >= 0:
-                    bo.buffer_store(kvn.to(fx.BFloat16), r_kv, pos * KV_ROW + tid)
-                put(mb("kvnew"), s * KV_LORA + tid, kvn)
+                if const_expr(kv_fp8):
+                    # saturated E4M3FN (unit scale); the mailbox then carries the fp8-rounded value, which is
+                    # exactly what later launches read back from the cache
+                    kq = fx.min(fx.max(kvn, fx.Float32(-FP8_MAX)), fx.Float32(FP8_MAX))
+                    kword = rocdl.cvt_pk_fp8_f32(T.i32, kq, fx.Float32(0.0), fx.Int32(0), False)
+                    if pos >= 0:
+                        bo.buffer_store(arith.trunci(T.i8, kword), r_kv, pos * KV_ROW + tid)
+                    kv_out = _fp8_roundtrip(kq, fx.Float32(0.0))[0]
+                else:
+                    if pos >= 0:
+                        bo.buffer_store(kvn.to(fx.BFloat16), r_kv, pos * KV_ROW + tid)
+                    kv_out = kvn
+                put(mb("kvnew"), s * KV_LORA + tid, kv_out)
                 if tid < PE_DIM // 2:
                     x0, x1 = pes[s]
                     c, sn = cs[s], sns[s]
                     p0 = bf16_round(x0 * c - x1 * sn)
                     p1 = bf16_round(x0 * sn + x1 * c)
-                    if pos >= 0:
-                        bo.buffer_store(p0.to(fx.BFloat16), r_pe, pos * PE_ROW + tid * 2)
-                        bo.buffer_store(p1.to(fx.BFloat16), r_pe, pos * PE_ROW + tid * 2 + 1)
+                    if const_expr(kv_fp8):
+                        q0 = fx.min(fx.max(p0, fx.Float32(-FP8_MAX)), fx.Float32(FP8_MAX))
+                        q1 = fx.min(fx.max(p1, fx.Float32(-FP8_MAX)), fx.Float32(FP8_MAX))
+                        pword = rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)
+                        if pos >= 0:
+                            bo.buffer_store(arith.trunci(T.i8, pword), r_pe, pos * PE_ROW + tid * 2)
+                            bo.buffer_store(arith.trunci(T.i8, pword >> 8), r_pe, pos * PE_ROW + tid * 2 + 1)
+                        p0, p1 = _fp8_roundtrip(q0, q1)
+                    else:
+                        if pos >= 0:
+                            bo.buffer_store(p0.to(fx.BFloat16), r_pe, pos * PE_ROW + tid * 2)
+                            bo.buffer_store(p1.to(fx.BFloat16), r_pe, pos * PE_ROW + tid * 2 + 1)
                     put2(mb("penew"), s * PE_DIM + tid * 2, p0, p1)
             stamp("cache", t, 4)
 
@@ -1440,10 +1466,22 @@ def build_shared_reuse_kernel(
             krows = [lds_ld(keys, wave * KPW + jj) for jj in range(KPW)]
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
-                kv8 = fx.Vector(bo.buffer_load(r_kv, krows[jj] * (KV_ROW // 2) + lane * 4, vec_width=4, dtype=T.i32))
-                fx.ptr_store(kv8.bitcast(fx.Float32), ktile + (j * KS + lane * 4))
-                if lane < PE_DIM // 2:
-                    lds_st(petile, j * PS + lane, ld_f32(r_pe, krows[jj] * (PE_ROW // 2) + lane))
+                if const_expr(kv_fp8):
+                    # 8 fp8 latent bytes per lane -> 8 bf16 (16 B of the tile row); 4 pe bytes per lane < 16
+                    f8 = fx.Vector(bo.buffer_load(r_kv, krows[jj] * (KV_ROW // 4) + lane * 2, vec_width=2, dtype=T.i32))
+                    fx.ptr_store(_fp8_to_bf16x8(f8[0], f8[1]).bitcast(fx.Float32), ktile + (j * KS + lane * 4))
+                    if lane < PE_DIM // 4:
+                        pw = fx.Int32(bo.buffer_load(r_pe, krows[jj] * (PE_ROW // 4) + lane, vec_width=1, dtype=T.i32))
+                        pb = _fp8_to_bf16x8(pw, pw).bitcast(fx.Float32)  # first 4 bf16 = the 4 pe values
+                        lds_st(petile, j * PS + lane * 2, pb[0])
+                        lds_st(petile, j * PS + lane * 2 + 1, pb[1])
+                else:
+                    kv8 = fx.Vector(
+                        bo.buffer_load(r_kv, krows[jj] * (KV_ROW // 2) + lane * 4, vec_width=4, dtype=T.i32)
+                    )
+                    fx.ptr_store(kv8.bitcast(fx.Float32), ktile + (j * KS + lane * 4))
+                    if lane < PE_DIM // 2:
+                        lds_st(petile, j * PS + lane, ld_f32(r_pe, krows[jj] * (PE_ROW // 2) + lane))
 
         def patch_new_kv(s):
             """Rows appended by this launch come from the cache task's kvnew / penew pairs."""
