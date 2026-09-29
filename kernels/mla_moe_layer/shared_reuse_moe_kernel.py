@@ -425,6 +425,7 @@ def build_shared_reuse_kernel(
     TG = topk_groups
     SC, SY = layout(S, H, W, topk, moe_mode, hidden=HIDDEN, q_lora=Q_LORA, nope_dim=NOPE_DIM, v_dim=V_DIM)
     N_SPLIT = topk // SPLIT_KEYS
+    assert N_SPLIT <= 64, "the split merge holds one split per lane: topk // 64 <= 64 (in paged mode topk only sets the split count)"
     KV_ROW = KV_LORA + PE_DIM if paged else KV_LORA  # cache row stride in bf16 elements
     PE_ROW = KV_LORA + PE_DIM if paged else PE_DIM
     QB_ROWS = H * (NOPE_DIM + PE_DIM)
@@ -1403,32 +1404,35 @@ def build_shared_reuse_kernel(
         r_idx = _rsrc(indices)
         KPW = SPLIT_KEYS // WAVES
 
-        def split_keys(t, s):
-            """(nkeys, sparse) of sample s; wave 0 writes this split's 64 cache rows to LDS keys."""
+        def nkeys_of(s):
+            """Keys sample ``s`` attends over.  Paged mode: its whole CSR row list (any length, each
+            of the N_SPLIT split tasks walks its share of the 64-key chunks); otherwise at most ``topk``."""
             if const_expr(paged):
-                # every key row comes from the sample's CSR list (its own new row last)
                 base = _uniform(bo.buffer_load(_rsrc(kv_indptr), s, vec_width=1, dtype=T.i32))
                 kv_len = _uniform(bo.buffer_load(_rsrc(kv_indptr), s + 1, vec_width=1, dtype=T.i32)) - base
-                kv_len = (kv_len > 0).select(kv_len, fx.Int32(1))  # padded sample: one dummy key, no NaN softmax
-                sparse = kv_len > topk
-                nkeys = sparse.select(fx.Int32(topk), kv_len)
-                if wave == 0:
-                    k_pos = t * SPLIT_KEYS + lane
-                    k_cl = (k_pos < nkeys).select(k_pos, 0)
-                    lds_st(keys, lane, fx.Int32(bo.buffer_load(r_idx, base + k_cl, vec_width=1, dtype=T.i32)))
-                return nkeys, sparse
+                return (kv_len > 0).select(kv_len, fx.Int32(1))  # padded sample: one dummy key, no NaN softmax
             kv_len = pos0 + s + 1
-            sparse = kv_len > topk
-            nkeys = sparse.select(fx.Int32(topk), kv_len)
+            return (kv_len > topk).select(fx.Int32(topk), kv_len)
+
+        def split_keys(c, s, nkeys):
+            """Wave 0 writes the cache rows of sample s's 64-key chunk ``c`` to LDS ``keys``."""
             if wave == 0:
-                k_pos = t * SPLIT_KEYS + lane
+                k_pos = c * SPLIT_KEYS + lane
                 k_cl = (k_pos < nkeys).select(k_pos, 0)
-                lds_st(
-                    keys,
-                    lane,
-                    sparse.select(fx.Int32(bo.buffer_load(r_idx, s * topk + k_cl, vec_width=1, dtype=T.i32)), k_cl),
-                )
-            return nkeys, sparse
+                if const_expr(paged):
+                    base = _uniform(bo.buffer_load(_rsrc(kv_indptr), s, vec_width=1, dtype=T.i32))
+                    end = _uniform(bo.buffer_load(_rsrc(kv_indptr), s + 1, vec_width=1, dtype=T.i32))
+                    # a padded sample's CSR range is empty: read entry 0 (valid memory) for its dummy key
+                    at = (end > base).select(base + k_cl, fx.Int32(0))
+                    lds_st(keys, lane, fx.Int32(bo.buffer_load(r_idx, at, vec_width=1, dtype=T.i32)))
+                else:
+                    lds_st(
+                        keys,
+                        lane,
+                        ((pos0 + s + 1) > topk).select(
+                            fx.Int32(bo.buffer_load(r_idx, s * topk + k_cl, vec_width=1, dtype=T.i32)), k_cl
+                        ),
+                    )
 
         def gather_old_kv():
             """Each wave copies its 8 keys' KV latent (1 KB) + k_pe (128 B) cache rows
@@ -1461,12 +1465,94 @@ def build_shared_reuse_kernel(
                         a0, a1 = get2(mb("penew"), sn * PE_DIM + lane * 2)
                         lds_st(petile, j * PS + lane, bf16_pair(a0, a1))
 
+        NH = H // WAVES  # heads per wave in the softmax step
+        NACC = 2 * (KV_LORA // 32 // WAVES)  # (c0, c1) accumulators per wave
+
+        def attend(c, nkeys, m_run, l_run, acc, tt):
+            """One 64-key chunk ``c`` (rows already in the LDS tiles, q in ``xs``): scores, online
+            softmax against the running max, O += P V.  Returns the updated (m, l, acc) state."""
+            # scores = K Q^T on MFMA: keys are M (4 row groups), the 576 dims K
+            # (18 steps of 32, split in two halves), heads N.  wave = (row group, half)
+            hn = fx.min(lane % 16, H - 1)
+            rgk = wave % 4
+            sc_acc = fx.Vector.filled(4, 0.0, fx.Float32)
+            for st in range_constexpr(QK_DIM // 32 // 2):
+                kst = (wave // 4) * (QK_DIM // 32 // 2) + st
+                key = rgk * 16 + lane % 16
+                kw = (kst < KV_LORA // 32).select(
+                    KT_OFF + key * KS + kst * 16,
+                    PT_OFF + key * PS + (kst - KV_LORA // 32) * 16,
+                )
+                a = fx.ptr_load(xs + (kw + (lane // 16) * 4), result_type=v4f).bitcast(fx.BFloat16)
+                b = fx.ptr_load(xs + (hn * QS + kst * 16 + (lane // 16) * 4), result_type=v4f).bitcast(fx.BFloat16)
+                sc_acc = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, sc_acc]))
+            fx.ptr_store(sc_acc, red + (wave * 64 + lane) * 4)
+            gpu.barrier()
+            stamp("split", tt, 6)
+            # chunk softmax against the running max: wave h, lane = key j (score = sum of the two K
+            # halves).  H may exceed WAVES (16 heads on 8 waves): the score MFMA already computed every
+            # head, so recovering each just re-reads `red` per wave-group.  P is formed relative to the
+            # NEW running max; alpha = exp(m_old - m_new) rescales the accumulators after the barrier.
+            new_m, new_l = [], []
+            for hg in range_constexpr(NH):
+                h = wave + hg * WAVES
+                kidx = c * SPLIT_KEYS + lane
+                valid = kidx < nkeys
+                r16 = lane % 16
+                cl = h + 16 * (r16 // 4)
+                raw = lds_ld(red, ((lane // 16) * 64 + cl) * 4 + r16 % 4) + lds_ld(
+                    red, ((lane // 16 + 4) * 64 + cl) * 4 + r16 % 4
+                )
+                sc_v = valid.select(raw * scale, fx.Float32(NEG))
+                mc = wave_max(sc_v)
+                m_new = (mc > m_run[hg]).select(mc, m_run[hg])
+                alpha = _exp(m_run[hg] - m_new)
+                p = valid.select(_exp(sc_v - m_new), fx.Float32(0.0))
+                lsum = wave_sum(p)
+                p_n = _xshfl(p, 1)
+                if lane % 2 == 0:  # P^T bf16 [h][64 keys] (words h * 32 + j / 2)
+                    lds_st(pl, h * (SPLIT_KEYS // 2) + lane // 2, bf16_pair(p, p_n))
+                if lane == 0:
+                    lds_st(misc, h, alpha)
+                new_m.append(m_new)
+                new_l.append(l_run[hg] * alpha + lsum)
+            gpu.barrier()
+            stamp("split", tt, 3)
+            # O = alpha * O + P V on MFMA: heads M, keys K (2 steps), latent dims N.  Each V word holds
+            # a dim pair (even dim low), so one read feeds two MFMAs (even / odd dims):
+            # each wave owns 2 groups of 32 dims.  V is read key-strided from the tile.
+            al = [lds_ld(misc, (lane // 16) * 4 + e) for e in range_constexpr(4)]  # rows (heads) of this lane
+            new_acc = []
+            for g in range_constexpr(KV_LORA // 32 // WAVES):
+                dw = (wave * (KV_LORA // 32 // WAVES) + g) * 16 + lane % 16  # dim pair word
+                c0 = fx.Vector.from_elements([acc[2 * g][e] * al[e] for e in range_constexpr(4)], fx.Float32)
+                c1 = fx.Vector.from_elements([acc[2 * g + 1][e] * al[e] for e in range_constexpr(4)], fx.Float32)
+                for js in range_constexpr(SPLIT_KEYS // 32):
+                    a = fx.ptr_load(
+                        pl + (hn * (SPLIT_KEYS // 2) + js * 16 + (lane // 16) * 4), result_type=v4f
+                    ).bitcast(fx.BFloat16)
+                    ws = [
+                        fx.ptr_load(ktile + ((js * 32 + (lane // 16) * 8 + i) * KS + dw)).bitcast(fx.Int32)
+                        for i in range(8)
+                    ]
+                    w_lo = [(ws[2 * i] & 0xFFFF) | (ws[2 * i + 1] << 16) for i in range(4)]
+                    w_hi = [fx.Int32(fx.Uint32(ws[2 * i]) >> 16) | (ws[2 * i + 1] & -65536) for i in range(4)]
+                    b0 = fx.Vector.from_elements(w_lo, fx.Int32).bitcast(fx.BFloat16)
+                    b1 = fx.Vector.from_elements(w_hi, fx.Int32).bitcast(fx.BFloat16)
+                    c0 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b0, c0]))
+                    c1 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b1, c1]))
+                new_acc += [c0, c1]
+            return new_m, new_l, new_acc
+
         for tt in range(start("split"), S * N_SPLIT, G):
             tt = fx.Int32(tt)
             stamp("split", tt, 0)
             s = tt // N_SPLIT  # sample
-            t = tt % N_SPLIT  # 64-key chunk
-            nkeys, sparse = split_keys(t, s)
+            t = tt % N_SPLIT  # this task walks chunks t, t + N_SPLIT, ... of the sample's keys
+            nkeys = nkeys_of(s)
+            n_it = ((nkeys + (SPLIT_KEYS - 1)) // SPLIT_KEYS - t + (N_SPLIT - 1)) // N_SPLIT
+            n_it = (n_it > 1).select(n_it, fx.Int32(1))  # an empty split still publishes (m = NEG, l = 0, acc = 0)
+            split_keys(t, s, nkeys)
             gpu.barrier()
             gather_old_kv()  # before waiting for q: these rows are from earlier launches
             if const_expr(True):
@@ -1514,76 +1600,42 @@ def build_shared_reuse_kernel(
                 stamp("split", tt, 2)
             gpu.barrier()
             stamp("split", tt, 5)
-            # scores = K Q^T on MFMA: keys are M (4 row groups), the 576 dims K
-            # (18 steps of 32, split in two halves), heads N.  wave = (row group, half)
-            hn = fx.min(lane % 16, H - 1)
-            rgk = wave % 4
-            c = fx.Vector.filled(4, 0.0, fx.Float32)
-            for st in range_constexpr(QK_DIM // 32 // 2):
-                kst = (wave // 4) * (QK_DIM // 32 // 2) + st
-                key = rgk * 16 + lane % 16
-                kw = (kst < KV_LORA // 32).select(
-                    KT_OFF + key * KS + kst * 16,
-                    PT_OFF + key * PS + (kst - KV_LORA // 32) * 16,
+            m_run = [fx.Float32(NEG) for _ in range_constexpr(NH)]
+            l_run = [fx.Float32(0.0) for _ in range_constexpr(NH)]
+            acc = [fx.Vector.filled(4, 0.0, fx.Float32) for _ in range_constexpr(NACC)]
+            m_run, l_run, acc = attend(t, nkeys, m_run, l_run, acc, tt)
+            init_state = m_run + l_run + acc
+            loop_state = init_state
+            for i, st_in in range(1, n_it, 1, init=init_state):
+                c = t + fx.Int32(i) * N_SPLIT
+                split_keys(c, s, nkeys)
+                gpu.barrier()
+                gather_old_kv()
+                patch_new_kv(s)
+                gpu.barrier()
+                nm, nl, na = attend(
+                    c,
+                    nkeys,
+                    [st_in[j] for j in range_constexpr(NH)],
+                    [st_in[NH + j] for j in range_constexpr(NH)],
+                    [st_in[2 * NH + j] for j in range_constexpr(NACC)],
+                    tt,
                 )
-                a = fx.ptr_load(xs + (kw + (lane // 16) * 4), result_type=v4f).bitcast(fx.BFloat16)
-                b = fx.ptr_load(xs + (hn * QS + kst * 16 + (lane // 16) * 4), result_type=v4f).bitcast(fx.BFloat16)
-                c = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
-            fx.ptr_store(c, red + (wave * 64 + lane) * 4)
-            gpu.barrier()
-            stamp("split", tt, 6)
-            # split-local softmax: wave h, lane = key j (score = sum of the two K halves).
-            # H may exceed WAVES (e.g. 16 heads on 8 waves): the score MFMA above already
-            # computed every head's score in one shot (its N width is the hardware 16, only
-            # clamped to H - 1 when H < 16), so recovering every head just means re-reading
-            # `red` once per wave-group instead of widening the MFMA or the wave count.
-            for hg in range_constexpr(H // WAVES):
-                h = wave + hg * WAVES
-                kidx = t * SPLIT_KEYS + lane
-                valid = kidx < nkeys
-                r16 = lane % 16
-                cl = h + 16 * (r16 // 4)
-                raw = lds_ld(red, ((lane // 16) * 64 + cl) * 4 + r16 % 4) + lds_ld(
-                    red, ((lane // 16 + 4) * 64 + cl) * 4 + r16 % 4
-                )
-                sc_v = valid.select(raw * scale, fx.Float32(NEG))
-                m = wave_max(sc_v)
-                p = valid.select(_exp(sc_v - m), fx.Float32(0.0))
-                lsum = wave_sum(p)
-                p_n = _xshfl(p, 1)
-                if lane % 2 == 0:  # P^T bf16 [h][64 keys] (words h * 32 + j / 2)
-                    lds_st(pl, h * (SPLIT_KEYS // 2) + lane // 2, bf16_pair(p, p_n))
-                if lane == 0:  # written last: the merge's readiness hint
-                    put(mb("sp_m"), (s * N_SPLIT + t) * H + h, m)
-                    put(mb("sp_l"), (s * N_SPLIT + t) * H + h, lsum)
-            gpu.barrier()
-            stamp("split", tt, 3)
-            # O = P V on MFMA: heads M, keys K (2 steps), latent dims N.  Each V word holds
-            # a dim pair (even dim low), so one read feeds two MFMAs (even / odd dims):
-            # each wave owns 2 groups of 32 dims.  V is read key-strided from the tile.
+                loop_state = yield nm + nl + na
+            m_run = [loop_state[j] for j in range_constexpr(NH)]
+            l_run = [loop_state[NH + j] for j in range_constexpr(NH)]
+            acc = [loop_state[2 * NH + j] for j in range_constexpr(NACC)]
             for g in range_constexpr(KV_LORA // 32 // WAVES):
                 dw = (wave * (KV_LORA // 32 // WAVES) + g) * 16 + lane % 16  # dim pair word
-                c0 = fx.Vector.filled(4, 0.0, fx.Float32)
-                c1 = fx.Vector.filled(4, 0.0, fx.Float32)
-                for js in range_constexpr(SPLIT_KEYS // 32):
-                    a = fx.ptr_load(
-                        pl + (hn * (SPLIT_KEYS // 2) + js * 16 + (lane // 16) * 4), result_type=v4f
-                    ).bitcast(fx.BFloat16)
-                    ws = [
-                        fx.ptr_load(ktile + ((js * 32 + (lane // 16) * 8 + i) * KS + dw)).bitcast(fx.Int32)
-                        for i in range(8)
-                    ]
-                    w_lo = [(ws[2 * i] & 0xFFFF) | (ws[2 * i + 1] << 16) for i in range(4)]
-                    w_hi = [fx.Int32(fx.Uint32(ws[2 * i]) >> 16) | (ws[2 * i + 1] & -65536) for i in range(4)]
-                    b0 = fx.Vector.from_elements(w_lo, fx.Int32).bitcast(fx.BFloat16)
-                    b1 = fx.Vector.from_elements(w_hi, fx.Int32).bitcast(fx.BFloat16)
-                    c0 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b0, c0]))
-                    c1 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b1, c1]))
                 if lane < 16 * (H // 4):  # rows (heads) 4 * (lane // 16) + e < H
                     for e in range_constexpr(4):
                         hh = (lane // 16) * 4 + e
-                        put_bf(mb("sp_acc"), ((s * N_SPLIT + t) * H + hh) * KV_LORA + dw * 2, [c0[e], c1[e]])
-            # sp_m / sp_l were already published per head-group above, alongside pl.
+                        put_bf(mb("sp_acc"), ((s * N_SPLIT + t) * H + hh) * KV_LORA + dw * 2, [acc[2 * g][e], acc[2 * g + 1][e]])
+            for hg in range_constexpr(NH):  # written last: the merge's readiness hint
+                if lane == 0:
+                    h = wave + hg * WAVES
+                    put(mb("sp_m"), (s * N_SPLIT + t) * H + h, fx.Float32(m_run[hg]))
+                    put(mb("sp_l"), (s * N_SPLIT + t) * H + h, fx.Float32(l_run[hg]))
             stamp("split", tt, 4)
 
         # ========================== 6. split merge + W_UV: o = W_UV (softmax . KV)

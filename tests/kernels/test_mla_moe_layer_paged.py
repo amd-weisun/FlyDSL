@@ -28,9 +28,10 @@ from kernels.mla_moe_layer.reference import golden_layer, golden_moe, make_weigh
 DS = dict(heads=16, hidden=7168, q_lora=1536, nope_dim=128, v_dim=128)
 N_GROUPS, TOPK_GROUPS = 8, 4
 EPS = 1e-6
+TOPK = 2048  # paged mode: 32 parallel splits; the context length itself is unbounded
 SCALE = (128 + 64) ** -0.5 * 1.8742  # DeepSeek-V3's yarn mscale^2
-MAX_SEQ = 4096
-POOL_ROWS = 16384
+MAX_SEQ = 131072 + 8
+POOL_ROWS = 300000
 
 
 def run(S, lens, seed=1234, dev="cuda:0", pad=0):
@@ -56,13 +57,18 @@ def run(S, lens, seed=1234, dev="cuda:0", pad=0):
     pool0 = pool.clone()
 
     op = SharedReuseMlaMoeLayer(
-        W, S, npes=1, topk=2048, paged=True, eps=EPS, softmax_scale=SCALE, n_groups=N_GROUPS, topk_groups=TOPK_GROUPS
+        W, S, npes=1, topk=TOPK, paged=True, eps=EPS, softmax_scale=SCALE, n_groups=N_GROUPS, topk_groups=TOPK_GROUPS
     )
     out = op.forward_paged(h, positions, pool, slot_map, indptr, indices, cos, sin)
     torch.cuda.synchronize()
 
     ident = lambda x, bf16_partials=False: x  # noqa: E731
     stages = op.intermediates()
+    if os.environ.get("DBG"):
+        n_split = TOPK // 64
+        for nm, shp in (("sp_m", (S, n_split, DS["heads"])), ("sp_l", (S, n_split, DS["heads"])), ("sp_acc", (S, n_split, DS["heads"], KV_LORA))):
+            x = op.debug(nm, shp, bf2=(nm == "sp_acc"))
+            print(nm, "nan", int(torch.isnan(x).sum()), "of", x.numel(), "absmax", x.nan_to_num().abs().max().item())
     worst = 0.0
     for b in range(S):
         L = lens[b]
@@ -73,7 +79,7 @@ def run(S, lens, seed=1234, dev="cuda:0", pad=0):
         pe = torch.zeros(MAX_SEQ, PE_DIM, dtype=torch.bfloat16, device=dev)
         kv[: L - 1] = pool0[slots[b][:-1].long(), :KV_LORA]
         pe[: L - 1] = pool0[slots[b][:-1].long(), KV_LORA:]
-        ref = golden_layer(W, h[b : b + 1], L - 1, kv, pe, None, cos, sin, ident, topk=2048)
+        ref = golden_layer(W, h[b : b + 1], L - 1, kv, pe, None, cos, sin, ident, topk=10**9)
         moe = golden_moe(W, ref["a"], ident, n_groups=N_GROUPS, topk_groups=TOPK_GROUPS)
         for name in ("q_a", "kv_a", "q_nope", "q_pe", "q_lat", "o", "a"):
             g, r = stages[name][b].float(), ref[name][0].float()
@@ -112,6 +118,12 @@ def run(S, lens, seed=1234, dev="cuda:0", pad=0):
 
 @pytest.mark.parametrize("lens", [[37], [1500], [200, 2000], [1, 64, 65, 700], [3, 10, 999, 2048, 5, 640, 1, 2000]])
 def test_paged_layer(lens):
+    assert run(len(lens), lens) < 5e-2
+
+
+@pytest.mark.parametrize("lens", [[2049], [9000], [4100, 30000], [131072], [70000, 129, 8192, 1]])
+def test_paged_long_context(lens):
+    """Contexts beyond one pass of the parallel splits: each split walks several 64-key chunks."""
     assert run(len(lens), lens) < 5e-2
 
 
