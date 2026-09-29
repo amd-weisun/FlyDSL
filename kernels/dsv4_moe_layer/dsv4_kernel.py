@@ -176,6 +176,9 @@ def layout(
     c_coff: int = 1,
     index_head_dim: int = 0,
     index_heads: int = 0,
+    # this and index_topk are unused here, and stay in the signature on purpose:
+    # layout(), stage_tasks() and build_dsv4_kernel() are all fed from ONE dims
+    # dict, and letting them drift apart is what caused three separate bugs
     index_heads_total: int = 0,
     index_topk: int = 0,
     max_seq: int = 0,
@@ -238,7 +241,6 @@ def layout(
         ("sel", S * MOE_SLOTS * pr),
         ("prob", S * MOE_SLOTS * pr),
         ("mid", S * MOE_SLOTS * INTER * pr),
-        ("ugp", BLOCKS * S * 2 * UG_TILE * pr),  # up/gate K-segment partial sums
         ("xqd", S * hidden * 4),  # debug: dequantized MoE activation (plain f32)
     ]
     off, scratch = 0, {}
@@ -349,24 +351,7 @@ def _xred(v, off, op):
     return op(type(v)(a), type(v)(b))
 
 
-def _ballot(pred):
-    return fx.Int64(rocdl.ballot(T.i64, fx.Boolean(pred).ir_value()))
-
-
-def _popc(mask):
-    return fx.Int32(fx.Int64(fmath.ctpop(mask)))
-
-
-def _mbcnt(mask):
-    """Number of set bits of the 64-bit lane mask below this lane."""
-    lo = llvm.call_intrinsic(
-        T.i32, "llvm.amdgcn.mbcnt.lo", [fx.Int32(mask & 0xFFFFFFFF).ir_value(), fx.Int32(0).ir_value()], [], []
-    )
-    return fx.Int32(llvm.call_intrinsic(T.i32, "llvm.amdgcn.mbcnt.hi", [fx.Int32(mask >> 32).ir_value(), lo], [], []))
-
-
 FP4_MAX = 6.0
-FP4_BLOCK = 32
 
 
 def _fp4_roundtrip(a, b):

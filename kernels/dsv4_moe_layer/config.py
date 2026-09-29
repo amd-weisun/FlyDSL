@@ -11,10 +11,8 @@ the dimensions and the routing differ.
 from __future__ import annotations
 
 from kernels.mla_moe_layer.config import (  # noqa: F401  (re-exported)
-    MOE_FORMATS,
     ExpertActivation,
     ExpertWeight,
-    MoeFormat,
     MoeMode,
     as_moe_mode,
     moe_format,
@@ -68,9 +66,6 @@ MAX_LAYERS_PER_STEP = 128
 COMPRESS_SWA = 0  # sliding window only (the MTP block's shape)
 COMPRESS_CSA = 4  # compressed sparse attention, needs the lightning indexer
 COMPRESS_HCA = 128  # heavily compressed attention, dense over compressed
-# HCA needs only the KV compressor; CSA additionally needs the lightning indexer
-# (and the compressor in its overlapping form), which is not implemented.
-SUPPORTED_COMPRESS = (COMPRESS_SWA, COMPRESS_CSA, COMPRESS_HCA)  # see validate_shard
 COMPRESS_ROPE_THETA = 1.6e5  # compressed layers use their own rope base
 # Lightning indexer (CSA only). 64 global index heads / 8 ranks; each scores the
 # compressed entries with its own 128-dim query, and the weighted head-sum picks
