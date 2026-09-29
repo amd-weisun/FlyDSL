@@ -34,7 +34,7 @@ MAX_SEQ = 131072 + 8
 POOL_ROWS = 300000
 
 
-def run(S, lens, seed=1234, dev="cuda:0", pad=0):
+def run(S, lens, seed=1234, dev="cuda:0", pad=0, pad_value=None):
     from kernels.mla_moe_layer.layer import SharedReuseMlaMoeLayer
 
     torch.cuda.set_device(dev)
@@ -54,6 +54,10 @@ def run(S, lens, seed=1234, dev="cuda:0", pad=0):
     positions = torch.tensor([max(L - 1, 0) for L in lens], dtype=torch.int32, device=dev)
     slot_map = torch.stack([sl[-1] if len(sl) else torch.tensor(-1, device=dev) for sl in slots]).to(torch.int32)
     h = torch.randn(S, DS["hidden"], generator=gen, device=dev).to(torch.bfloat16)
+    if pad_value is not None:  # ATOM runs padded rows through its own (empty-context) attention: garbage/NaN rows
+        for b, L in enumerate(lens):
+            if L == 0:
+                h[b] = pad_value
     pool0 = pool.clone()
 
     op = SharedReuseMlaMoeLayer(
@@ -73,7 +77,8 @@ def run(S, lens, seed=1234, dev="cuda:0", pad=0):
     for b in range(S):
         L = lens[b]
         if L == 0:  # padded sample: finite output, and (checked below) it stored nothing
-            assert torch.isfinite(out[b].float()).all(), "padded sample produced non-finite output"
+            if pad_value is None:  # a NaN/Inf input row may legitimately produce a NaN output row
+                assert torch.isfinite(out[b].float()).all(), "padded sample produced non-finite output"
             continue
         kv = torch.zeros(MAX_SEQ, KV_LORA, dtype=torch.bfloat16, device=dev)
         pe = torch.zeros(MAX_SEQ, PE_DIM, dtype=torch.bfloat16, device=dev)
@@ -97,6 +102,7 @@ def run(S, lens, seed=1234, dev="cuda:0", pad=0):
         )
         e_own = ((out[b].float() - own["x_out"][0].float()).norm() / own["x_out"][0].float().norm()).item()
         print(f"  x_out vs golden fed the kernel's own a/mid/sel/prob: rel_l2={e_own:.2e}")
+        assert e_own == e_own, f"sample {b}: NaN output"
         worst = max(worst, e_own)
         if same_sel:  # a near-tied routing decision may legitimately flip on a 1-ulp difference in ``a``
             e2e = ((out[b].float() - moe["x_out"][0].float()).norm() / moe["x_out"][0].float().norm()).item()
@@ -125,6 +131,20 @@ def test_paged_layer(lens):
 def test_paged_long_context(lens):
     """Contexts beyond one pass of the parallel splits: each split walks several 64-key chunks."""
     assert run(len(lens), lens) < 5e-2
+
+
+@pytest.mark.parametrize(
+    "pad_value",
+    [
+        pytest.param(float("nan"), marks=pytest.mark.xfail(strict=True, reason="known: a NaN row poisons every sample; callers must sanitize")),
+        pytest.param(float("inf"), marks=pytest.mark.xfail(strict=True, reason="known: an Inf row poisons every sample; callers must sanitize")),
+        3e4,
+    ],
+)
+def test_paged_padded_rows_with_garbage_hidden(pad_value):
+    """The hidden rows of padded samples come out of ATOM's attention over an EMPTY context: NaN/Inf/huge is
+    possible.  Real samples must be unaffected."""
+    assert run(4, [120, 300, 0, 0], pad=2, pad_value=pad_value) < 5e-2
 
 
 def test_paged_padded_samples():
