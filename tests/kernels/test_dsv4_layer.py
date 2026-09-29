@@ -26,6 +26,8 @@ from kernels.dsv4_moe_layer.reference import (
     golden_moe,
     layer_idxs,
     make_weights,
+    dequant,
+    qkv_a_split,
     rmsnorm,
     window_idxs,
 )
@@ -1147,3 +1149,72 @@ def test_dsv4_indexer_score_allreduce_tp8():
     results = mp.Manager().dict()
     mp.spawn(_indexer_score_rank, args=(8, _free_port(), results), nprocs=8)
     assert all(results[r] for r in range(8))
+
+
+def test_dsv4_indexer_topk_in_kernel():
+    """Which compressed entries the kernel's indexer selects, against the golden.
+
+    The SET is what matters: attention sums over the gathered keys, so their order
+    in the index list changes nothing. The selection has to be exact rather than
+    approximate, because every rank runs it on bit-identical scores and they must
+    land on the same set without a further exchange.
+
+    index_topk is reduced so the top-k actually discards -- at V4-Pro's 1024 it
+    would keep every entry these runs produce and the selection would be untested.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+    from kernels.dsv4_moe_layer.reference import indexer_step
+
+    torch.manual_seed(0)
+    ratio = COMPRESS_CSA
+    cfg = _cfg(hc_mult=1)
+    cfg.compress_ratio, cfg.max_seq, cfg.index_topk = ratio, 256, 4
+    ihd, dev, mode = cfg.index_head_dim, "cuda", MoeMode.W8A8
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    t = W.t
+    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
+
+    cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    i_ks = torch.zeros(cfg.c_rows, cfg.c_coff * ihd, device=dev)
+    i_ss = torch.full((cfg.c_rows, cfg.c_coff * ihd), float("-inf"), device=dev)
+    i_ref = torch.zeros(cfg.n_compressed, ihd, dtype=torch.bfloat16, device=dev)
+    dq_qkv = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+    cut = qkv_a_split(cfg)
+
+    chose, discarded = 0, 0
+    for pos in range(8 * ratio):
+        h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
+        cur = torch.tensor([pos], dtype=torch.int32, device=dev)
+        layer.forward(h, cur, kv_k, layer_idxs(pos, 1, cfg, dev), cos, sin)
+        torch.cuda.synchronize()
+
+        x = bf(rmsnorm(h.float(), t["g_in"], cfg.eps))
+        proj = x @ dq_qkv.float().T
+        q_an = bf(rmsnorm(proj[:, : cfg.q_lora], t["g_q"], cfg.eps))
+        ref = indexer_step(
+            x[0], q_an[0], proj[0, slice(*cut["i_kv"])], proj[0, slice(*cut["i_gate"])],
+            pos, cfg, t, i_ks, i_ss, i_ref, cos, sin, lambda z: z,
+        )
+        got = layer.debug("i_sel", (1, cfg.n_keys - cfg.window), torch.int32)[0]
+
+        n = (pos + 1) // ratio
+        k = min(cfg.index_topk, n)
+        assert int((got >= 0).sum()) == k, f"pos={pos}: picked {int((got >= 0).sum())}, want {k}"
+        if not k:
+            continue
+        chose += 1
+        discarded += n > cfg.index_topk
+        # The golden scores through its own compressor, whose FP4 ties can move a
+        # borderline entry, so judge the SELECTION against the kernel's own scores:
+        # that is what the top-k is, and the score has its own test.
+        sc = layer.debug("i_score", (1, cfg.n_compressed))[0][:n]
+        want = set((cfg.window + sc.topk(k).indices).tolist())
+        a = set(got[got >= 0].tolist())
+        margin = (sc.sort(descending=True).values[k - 1] - sc.sort(descending=True).values[k]).item() if n > k else 1.0
+        if a != want and margin > 1e-6:
+            raise AssertionError(f"pos={pos} picked {sorted(a)} vs {sorted(want)} (margin {margin:.3e})")
+        # and the golden's own pick should agree except where its scores tie-break
+        assert len(set(ref[ref >= 0].tolist())) == k
+
+    assert chose >= 6 and discarded >= 3, f"chose {chose}, discarded on {discarded}"

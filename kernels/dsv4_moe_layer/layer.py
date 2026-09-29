@@ -94,6 +94,7 @@ class Dsv4MoeLayer:
         dims["index_heads"] = cfg.index_heads if cfg.indexed else 0
         dims["max_seq"] = cfg.max_seq
         dims["index_heads_total"] = cfg.index_heads_total if cfg.indexed else 0
+        dims["index_topk"] = cfg.index_topk if cfg.indexed else 0
         self.scr_layout, self.sym_layout = layout(samples, cfg.heads, npes, cfg.window, self.moe_mode, **dims)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)

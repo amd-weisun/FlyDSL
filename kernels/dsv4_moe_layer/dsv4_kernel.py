@@ -111,6 +111,7 @@ UG8 = 8  # intermediates one up/gate task actually owns
 SPLIT_KEYS = 64
 HC_CPW = 2  # hc_pre 64-K chunks per wave; sets the K split across tasks
 NEG = -1.0e30
+MIN_I32 = -(1 << 31)  # flips the sign bit: signed-ordered <-> unsigned-ordered
 
 # task counts per stage
 QKV_A_ROWS = Q_LORA + HEAD_DIM
@@ -176,6 +177,7 @@ def layout(
     index_head_dim: int = 0,
     index_heads: int = 0,
     index_heads_total: int = 0,
+    index_topk: int = 0,
     max_seq: int = 0,
 ):
     """Byte offsets of the per-rank scratch and of the symmetric buffer.
@@ -220,6 +222,9 @@ def layout(
         ("i_cnew", S * index_head_dim * pr if index_head_dim else pr),
         # one score per compressed entry; entries not yet written score NEG
         ("i_score", S * max(n_compressed(max_seq, compress_ratio), 1) * pr),
+        # the slots the indexer picked, which the attention gather reads instead of
+        # the caller's index list for the compressed half
+        ("i_sel", S * max((n_keys or window) - window, 1) * pr),
         ("q", S * heads * head_dim * pr),  # full per-head query: rope is inside it
         ("sp_acc", S * n_split * heads * head_dim * pr),
         ("sp_m", S * n_split * heads * pr),
@@ -440,6 +445,13 @@ def n_compressed(max_seq: int, compress_ratio: int) -> int:
     return max_seq // compress_ratio if compress_ratio else 0
 
 
+def n_index(max_seq: int, compress_ratio: int, index_head_dim: int, index_topk: int) -> int:
+    """Compressed slots the attention can gather: the indexer's pick, capped."""
+    if not index_head_dim:
+        return 0
+    return min(index_topk, n_compressed(max_seq, compress_ratio))
+
+
 def n_score_tiles(max_seq: int, compress_ratio: int, index_head_dim: int) -> int:
     """Tiles of compressed entries the indexer scores, sized for the WHOLE cache.
 
@@ -485,6 +497,7 @@ def stage_tasks(
     index_head_dim: int = 0,
     index_heads: int = 0,
     index_heads_total: int = 0,
+    index_topk: int = 0,
     max_seq: int = 0,
 ):
     """[(stage name, task count)] in execution order.
@@ -512,6 +525,8 @@ def stage_tasks(
         # the per-head score weights, then the score of every compressed entry
         ("i_wp", S if index_head_dim else 0),
         ("i_score", S * n_score_tiles(max_seq, compress_ratio, index_head_dim)),
+        # ... and the top-k over them, which the split stage waits on
+        ("i_topk", S if index_head_dim else 0),
         ("split", S * ((window if n_keys is None else n_keys) // SPLIT_KEYS)),
         ("uv", S * (heads * head_dim // UV_TILE)),
         ("o_a", S * o_groups * o_lora // ROW_TILE),
@@ -555,6 +570,7 @@ def build_dsv4_kernel(
     index_head_dim: int = 0,
     index_heads: int = 0,
     index_heads_total: int = 0,
+    index_topk: int = 0,
     max_seq: int = 0,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole V4 layer.
@@ -702,6 +718,7 @@ def build_dsv4_kernel(
         c_coff=C_COFF,
         index_head_dim=IHD,
         index_heads=index_heads,
+        index_topk=index_topk,
         max_seq=max_seq,
     )
     assert N_KEYS % SPLIT_KEYS == 0, "the index list must be a whole number of key tiles"
@@ -714,8 +731,18 @@ def build_dsv4_kernel(
     IQB_PER_HEAD = IHD // Q_B_TILE if IHD else 0
     IH_TOTAL = index_heads_total or index_heads
     N_COMP = (max_seq // CR) if (IHD and CR) else 0
+    N_INDEX = n_index(max_seq, compress_ratio, index_head_dim, index_topk)
+    # the top-k holds every candidate in registers across the radix passes, so one
+    # thread's share is bounded rather than the sequence length
+    TOPK_PER = max(1, (N_COMP + THREADS - 1) // THREADS) if N_COMP else 1
+    TOPK_ACTIVE = ((N_COMP + TOPK_PER - 1) // TOPK_PER) if N_COMP else 0
+    # the index list pads to a whole key tile, so its compressed half has room for
+    # more than the indexer will ever pick; the surplus is filled with -1
+    N_ISEL = N_KEYS - window
     N_ISCORE = n_score_tiles(max_seq, compress_ratio, index_head_dim)
     if IHD:
+        assert window % SPLIT_KEYS == 0, "a key tile must fall wholly inside or outside the window"
+        assert N_KEYS >= window + N_INDEX, "the index list must hold the window and the pick"
         assert IHD % 8 == 0 and N_COMP > 0
         assert IHD == 128, "the indexer's Hadamard is written for a 128-wide head"
         assert IH % WAVES == 0, "one wave takes a whole index head"
@@ -769,6 +796,7 @@ def build_dsv4_kernel(
         c_coff=C_COFF,
         index_head_dim=IHD,
         index_heads=index_heads,
+        index_topk=index_topk,
         max_seq=max_seq,
     )
     base, first, acc = {}, {}, 0
@@ -793,6 +821,7 @@ def build_dsv4_kernel(
         "i_q",
         "i_wp",
         "i_score",
+        "i_topk",
         "uv",
         "o_a",
         "o_b",
@@ -1042,6 +1071,33 @@ def build_dsv4_kernel(
             for off in (8, 4, 2, 1):
                 v = _xred(v, off, fx.max)
             return v
+
+        def block_isum(v):
+            """Block-wide sum of a per-thread int32."""
+            w = wave_sum(fx.Float32(v))
+            if lane == 0:
+                lds_st(red, wave, w)
+            gpu.barrier()
+            t = lds_ld(red, 0)
+            for i in range_constexpr(1, WAVES):
+                t = t + lds_ld(red, i)
+            gpu.barrier()
+            return fx.Int32(t)
+
+        def block_excl_scan(v):
+            """Exclusive prefix sum of a per-thread int32 over the whole block.
+
+            The obvious O(THREADS) form: one LDS write, then each thread adds the
+            counts before it. Runs once per sample on a few hundred values, so the
+            two-level version is not worth the complexity yet.
+            """
+            lds_st(xs, tid, fx.Float32(v))
+            gpu.barrier()
+            acc = fx.Float32(0.0)
+            for i in range_constexpr(TOPK_ACTIVE):
+                acc = acc + (fx.Int32(i) < tid).select(lds_ld(xs, i), fx.Float32(0.0))
+            gpu.barrier()
+            return fx.Int32(acc)
 
         def block_sums(vs):
             """Block-wide sums of several per-thread values with one LDS exchange."""
@@ -2255,6 +2311,89 @@ def build_dsv4_kernel(
                     put(mb("i_score"), s * N_COMP + c, live.select(sc_t, fx.Float32(NEG)))
                 stamp("i_score", tt, 4)
 
+        # ============ 3e. top-k: which compressed entries the attention gathers
+        # Exact and deterministic, which is the point: every rank all-reduced to
+        # bit-identical scores above, so an exact selection gives every rank the
+        # same set without a second exchange. An approximate or order-dependent
+        # pick would let the ranks attend to different skey.
+        #
+        # Radix select, MSB first, on the score's order-preserving bits. Each pass
+        # counts the candidates whose remaining prefix matches a trial, so it needs
+        # only equality tests -- no unsigned compare.
+        if const_expr(IHD):
+            for tt in range(start("i_topk"), S, G):
+                tt = fx.Int32(tt)
+                stamp("i_topk", tt, 0)
+                s = tt
+                n_live = fx.min((pos0 + s + 1) // CR, fx.Int32(N_COMP))
+                k_want = fx.min(n_live, fx.Int32(N_INDEX))
+                mine = [fx.Int32(tid) * TOPK_PER + j for j in range(TOPK_PER)]
+                ok_c = [(c < n_live) for c in mine]
+                # f32 bits -> signed int32 whose ORDER matches the float's: flip the
+                # low 31 bits of negatives, which puts -2 below -1 and both below 0
+                skey = []
+                for j in range_constexpr(TOPK_PER):
+                    b = getf(mb("i_score"), s * N_COMP + fx.min(mine[j], fx.Int32(N_COMP - 1)))
+                    bi = b.bitcast(fx.Int32)
+                    skey.append(bi ^ ((bi >> 31) & 0x7FFFFFFF))
+                # ... and to the unsigned domain, where MSB-first prefixes work
+                us = [ok_c[j].select(skey[j] ^ MIN_I32, fx.Int32(0)) for j in range(TOPK_PER)]
+                stamp("i_topk", tt, 2)
+
+                pfx = fx.Int32(0)
+                gt = fx.Int32(0)
+                for bit in range_constexpr(32):
+                    b = 31 - bit
+                    trial = pfx | fx.Int32(1 << b)
+                    cnt = fx.Int32(0)
+                    for j in range_constexpr(TOPK_PER):
+                        hit = ok_c[j] & (((us[j] ^ trial) >> b) == 0)
+                        cnt = cnt + hit.select(fx.Int32(1), fx.Int32(0))
+                    tot = block_isum(cnt)
+                    take = (gt + tot) >= k_want
+                    pfx = take.select(trial, pfx)
+                    gt = take.select(gt, gt + tot)
+                thr = pfx ^ MIN_I32  # back to the signed-comparable domain
+                need = k_want - gt  # how many of the ties at thr to keep
+
+                # Two compactions in index order: everything strictly above the
+                # threshold, then as many of the ties as the count still needs. One
+                # pass over `>=` would not do -- ties early in index order would
+                # crowd out strict-greaters that must all be kept.
+                # Each phase appends from wherever the last one ended, and the -1
+                # fill starts from what was ACTUALLY written, not from k_want. That
+                # matters beyond tidiness: the gather polls every slot of this
+                # mailbox, so a slot the compaction skips is not a wrong answer, it
+                # is a kernel that never finishes. Deriving the fill from the real
+                # count makes any error in the threshold above show up as a bad
+                # selection, which a test can see.
+                stamp("i_topk", tt, 3)
+                w_base = fx.Int32(0)
+                for phase in range_constexpr(2):
+                    sel = []
+                    for j in range_constexpr(TOPK_PER):
+                        hit = skey[j] > thr if phase == 0 else skey[j] == thr
+                        sel.append(ok_c[j] & hit)
+                    mycnt = fx.Int32(0)
+                    for j in range_constexpr(TOPK_PER):
+                        mycnt = mycnt + sel[j].select(fx.Int32(1), fx.Int32(0))
+                    off = block_excl_scan(mycnt)
+                    tot = block_isum(mycnt)
+                    room = k_want - w_base
+                    w = w_base + off
+                    for j in range_constexpr(TOPK_PER):
+                        if sel[j] & ((w - w_base) < room):
+                            put(mb("i_sel"), s * N_ISEL + w, window + mine[j])
+                        w = w + sel[j].select(fx.Int32(1), fx.Int32(0))
+                    w_base = w_base + fx.min(tot, room)
+                    gpu.barrier()
+                for j in range_constexpr((N_ISEL + THREADS - 1) // THREADS):
+                    o = fx.Int32(tid) + j * THREADS
+                    if o < N_ISEL:
+                        if o >= w_base:
+                            put(mb("i_sel"), s * N_ISEL + o, fx.Int32(-1))
+                stamp("i_topk", tt, 4)
+
         # ============== 4. per-head query RMS (no weight) + RoPE -> bf16 query
         # V4 scales each head's whole HEAD_DIM query by rsqrt(mean(q^2) + eps) before
         # rotating its tail; that spans all of a head's dims, so it cannot ride in a
@@ -2295,10 +2434,29 @@ def build_dsv4_kernel(
         WPL = EPL // 2  # ... as packed bf16 words
 
         def split_keys(t, s):
-            """Wave 0 writes this split's 64 ring slots to LDS keys; -1 = not yet written."""
+            """Wave 0 writes this split's 64 ring slots to LDS keys; -1 = not yet written.
+
+            With an indexer the compressed half is not the caller's to give: it is
+            whatever the top-k just chose. The window is a whole number of tiles, so
+            which side a tile falls on is uniform across the CTA.
+            """
             if wave == 0:
                 k_pos = t * SPLIT_KEYS + lane
-                lds_st(keys, lane, fx.Int32(bo.buffer_load(r_idx, s * N_KEYS + k_pos, vec_width=1, dtype=T.i32)))
+                if const_expr(IHD):
+                    if t * SPLIT_KEYS >= window:  # uniform across the CTA
+                        lds_st(keys, lane, get(mb("i_sel"), s * N_ISEL + k_pos - window))
+                    else:
+                        lds_st(
+                            keys,
+                            lane,
+                            fx.Int32(bo.buffer_load(r_idx, s * N_KEYS + k_pos, vec_width=1, dtype=T.i32)),
+                        )
+                else:
+                    lds_st(
+                        keys,
+                        lane,
+                        fx.Int32(bo.buffer_load(r_idx, s * N_KEYS + k_pos, vec_width=1, dtype=T.i32)),
+                    )
 
         def gather_old_kv():
             """Each wave copies its KPW keys' shared KV row (HEAD_DIM bf16) into the tile.
