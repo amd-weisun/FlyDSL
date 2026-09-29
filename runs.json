@@ -1,6 +1,6 @@
 {
  "schema": 1,
- "updated": "2026-09-29T09:54:00Z",
+ "updated": "2026-09-29T12:27:43Z",
  "repo": "amd-weisun/FlyDSL",
  "runs": [
   {
@@ -10,11 +10,11 @@
    "branch": "main",
    "event": "push",
    "title": "Issue causal flash q-blocks longest-first. (#1186)",
-   "status": "queued",
-   "conclusion": null,
+   "status": "completed",
+   "conclusion": "cancelled",
    "url": "https://github.com/amd-weisun/FlyDSL/actions/runs/36421786108",
    "created_at": "2026-09-28T12:25:54Z",
-   "updated_at": "2026-09-28T12:26:37Z",
+   "updated_at": "2026-09-29T12:26:39Z",
    "actor": "amd-weisun",
    "jobs": []
   },
