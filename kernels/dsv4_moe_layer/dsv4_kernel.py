@@ -720,7 +720,6 @@ def build_dsv4_kernel(
     # the top-k holds every candidate in registers across the radix passes, so one
     # thread's share is bounded rather than the sequence length
     TOPK_PER = max(1, (N_COMP + THREADS - 1) // THREADS) if N_COMP else 1
-    TOPK_ACTIVE = ((N_COMP + TOPK_PER - 1) // TOPK_PER) if N_COMP else 0
     # the index list pads to a whole key tile, so its compressed half has room for
     # more than the indexer will ever pick; the surplus is filled with -1
     N_ISEL = N_KEYS - window
@@ -1070,19 +1069,35 @@ def build_dsv4_kernel(
             return fx.Int32(t)
 
         def block_excl_scan(v):
-            """Exclusive prefix sum of a per-thread int32 over the whole block.
+            """Exclusive prefix sum of a per-thread int32 over the block, and the
+            block total.
 
-            The obvious O(THREADS) form: one LDS write, then each thread adds the
-            counts before it. Runs once per sample on a few hundred values, so the
-            two-level version is not worth the complexity yet.
+            Butterfly scan: before step ``off`` every lane holds the sum of its
+            aligned ``off``-wide block, so a lane in the upper half of the next
+            block adds the lower half's sum to its prefix, and both halves add each
+            other to stay a block sum. Six xor shuffles cover the wave; the WAVES
+            wave totals then combine through LDS. This replaces the O(THREADS) form
+            -- one LDS write, then every thread walking all the counts before it --
+            which at THREADS = 512 was a 512-deep unrolled LDS walk per thread and
+            cost 139 us of the layer.
             """
-            lds_st(xs, tid, fx.Float32(v))
+            x = fx.Float32(v)
+            pre = fx.Float32(0.0)
+            for sh in range_constexpr(6):
+                off = 1 << sh
+                p = _xshfl(x, off)
+                pre = ((lane & off) != 0).select(pre + p, pre)
+                x = x + p  # every lane now holds the sum of its 2 * off block
+            if lane == 0:  # x is the wave total in every lane
+                lds_st(red, wave, x)
             gpu.barrier()
-            acc = fx.Float32(0.0)
-            for i in range_constexpr(TOPK_ACTIVE):
-                acc = acc + (fx.Int32(i) < tid).select(lds_ld(xs, i), fx.Float32(0.0))
+            tot = fx.Float32(0.0)
+            for i in range_constexpr(WAVES):
+                t = lds_ld(red, i)
+                pre = (fx.Int32(i) < wave).select(pre + t, pre)
+                tot = tot + t
             gpu.barrier()
-            return fx.Int32(acc)
+            return fx.Int32(pre), fx.Int32(tot)
 
         def block_sums(vs):
             """Block-wide sums of several per-thread values with one LDS exchange."""
@@ -1551,6 +1566,15 @@ def build_dsv4_kernel(
 
         def stamp(name, t, which, lead=0):
             if const_expr(timeline):
+                # Nothing may cross the clock read. Without this the scheduler
+                # sinks plain VALU work past the stamp -- it only has to respect
+                # memory side effects -- and the phase that follows is charged for
+                # it. That reported i_score's exchange at 233 us when the exchange
+                # was 8 and the 233 was the scoring loop's own tail. Compiler-only,
+                # and the whole body is compiled out when timeline is off -- but it
+                # does constrain the scheduler in the timeline build, so read the
+                # phase SPLIT from here and the layer total from a timeline-off run.
+                rocdl.sched_barrier(0)
                 if tid == lead:
                     now = fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
                     fx.generic_store(
@@ -2237,13 +2261,24 @@ def build_dsv4_kernel(
                 # entries the compressor has not written yet must never be picked
                 n_live = (pos0 + s + 1) // CR
                 r_ic2 = _rsrc(i_cache)
-                accs = [fx.Float32(0.0) for _ in range(IH)]
                 # the entry this launch just wrote is not reliably visible in the
                 # cache yet, so take it from the mailbox instead. The outer test is
                 # CTA-uniform, so every thread reaches the poll; only the thread
                 # holding that candidate uses the value.
                 is_new = c == (pos0 + s) // CR
-                for d0 in range_constexpr(IHD // 8):
+                # A RUNTIME loop, not range_constexpr. Unrolled, the compiler hoists
+                # all IHD / 8 key loads and every query read to the top of the stage;
+                # that is ~130 values more than the budget, so it spilled them and
+                # then fed the FMAs back one scratch load and one full vmcnt wait at
+                # a time -- 274 us of stall to do 1024 FMAs. Carrying the
+                # accumulators keeps a single iteration live and the spills go away.
+                for _d0, acc in range(
+                    0,
+                    IHD // 8,
+                    fx.Int32(1),
+                    init=[fx.Float32(0.0) for _ in range(IH)],
+                ):
+                    d0 = fx.Int32(_d0)
                     kw = [
                         v
                         for v in fx.Vector(
@@ -2260,13 +2295,15 @@ def build_dsv4_kernel(
                     if (pos0 + s + 1) % CR == 0:
                         nv = [getf(mb("i_cnew"), s * IHD + d0 * 8 + e) for e in range(8)]
                         kw = [is_new.select(nv[e], kw[e]) for e in range(8)]
+                    accs = [fx.Float32(acc[hh]) for hh in range(IH)]
                     for e in range_constexpr(8):
                         kv = kw[e]
                         for hh in range_constexpr(IH):
                             accs[hh] = accs[hh] + kv * lds_ld(xs, hh * IHD + d0 * 8 + e)
+                    res = yield accs
                 sc_t = fx.Float32(0.0)
                 for hh in range_constexpr(IH):
-                    sc_t = sc_t + fx.max(accs[hh], fx.Float32(0.0)) * wv[hh]
+                    sc_t = sc_t + fx.max(fx.Float32(res[hh]), fx.Float32(0.0)) * wv[hh]
                 live = (c < n_live) & (c < N_COMP)
                 if const_expr(W > 1):
                     # This rank holds only IH of the 64 index heads, so its score is
@@ -2278,6 +2315,7 @@ def build_dsv4_kernel(
                     # mark 3, not 5: the report reads marks 0..4, so this is what
                     # splits `compute` (the scoring loop) from `epi` (the exchange).
                     # Stamping outside that range lumped them together.
+                    gpu.barrier()  # TEMP probe fence
                     stamp("i_score", tt, 3)
                     for p in range_constexpr(W):
                         pv2 = fx.Vector(bo.buffer_load(r_peers, p * 2, vec_width=2, dtype=T.i32))
@@ -2289,6 +2327,7 @@ def build_dsv4_kernel(
                                 sc_t,
                                 CM_SYS,
                             )
+                    stamp("i_score", tt, 5)  # TEMP probe: push issued
                     own = sym + fx.Int64(SY["iscore"])
                     ci = fx.min(c, N_COMP - 1)
                     got = poll([(own, (src * S + s) * N_COMP + ci, 1) for src in range(W)], "one-as")
@@ -2365,8 +2404,7 @@ def build_dsv4_kernel(
                     mycnt = fx.Int32(0)
                     for j in range_constexpr(TOPK_PER):
                         mycnt = mycnt + sel[j].select(fx.Int32(1), fx.Int32(0))
-                    off = block_excl_scan(mycnt)
-                    tot = block_isum(mycnt)
+                    off, tot = block_excl_scan(mycnt)
                     room = k_want - w_base
                     w = w_base + off
                     for j in range_constexpr(TOPK_PER):

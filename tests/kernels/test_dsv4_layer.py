@@ -1286,3 +1286,59 @@ def test_dsv4_indexer_topk_in_kernel():
         assert len(set(ref[ref >= 0].tolist())) == k
 
     assert chose >= 6 and discarded >= 3, f"chose {chose}, discarded on {discarded}"
+
+
+def test_dsv4_indexer_topk_compaction_spans_waves():
+    """The compaction writes one slot per pick when the picks span every wave.
+
+    test_dsv4_indexer_topk_in_kernel judges the selection, but at its shape
+    (index_topk 4, 64 candidates) every pick lands in wave 0 and at most four
+    slots are written, so the block scan that assigns those slots is barely
+    used: a scan that drops its cross-wave term, or runs the wrong way round,
+    still produces four distinct slots and the same set. Here 512 candidates
+    fill all eight waves and ~200 are kept, so a scan that miscounts collides --
+    two picks on one slot, which shows up as a short count or a duplicate.
+
+    The picks are judged against the kernel's OWN scores: what is under test is
+    the compaction, and the scoring has its own test. No golden is stepped, so
+    this can afford the many positions it takes to fill the candidate space.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    torch.manual_seed(0)
+    ratio = COMPRESS_CSA
+    cfg = _cfg(hc_mult=1)
+    cfg.compress_ratio, cfg.max_seq, cfg.index_topk = ratio, 2048, 200
+    dev, mode = "cuda", MoeMode.W8A8
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
+    cos, sin = rope_table(4096, theta=cfg.rope_base, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+
+    # positions to judge at: deep enough that the live candidates cover several
+    # waves, and that the last two are past index_topk so the pick also discards
+    checks = [400, 700, 1100]
+    waves_hit = 0
+    for pos in range(checks[-1] + 1):
+        h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
+        cur = torch.tensor([pos], dtype=torch.int32, device=dev)
+        layer.forward(h, cur, kv_k, layer_idxs(pos, 1, cfg, dev), cos, sin)
+        if pos not in checks:
+            continue
+        torch.cuda.synchronize()
+        n = (pos + 1) // ratio
+        k = min(cfg.index_topk, n)
+        got = layer.debug("i_sel", (1, cfg.n_keys - cfg.window), torch.int32)[0]
+        sel = got[got >= 0].tolist()
+        assert len(sel) == k, f"pos={pos}: wrote {len(sel)} slots, want {k}"
+        assert len(set(sel)) == k, f"pos={pos}: {k - len(set(sel))} picks collided on a slot"
+        sc = layer.debug("i_score", (1, cfg.n_compressed))[0][:n]
+        srt = sc.sort(descending=True).values
+        margin = (srt[k - 1] - srt[k]).item() if n > k else 1.0
+        want = set((cfg.window + sc.topk(k).indices).tolist())
+        if set(sel) != want and margin > 1e-6:
+            raise AssertionError(f"pos={pos}: picked {len(set(sel) - want)} entries the scores do not rank")
+        waves_hit = max(waves_hit, (max(s - cfg.window for s in sel) // 64) + 1)
+    # the point of the shape: without this the cross-wave term is never read
+    assert waves_hit >= 5, f"picks only reached wave {waves_hit}, so the scan is still untested"
+    layer.close()
