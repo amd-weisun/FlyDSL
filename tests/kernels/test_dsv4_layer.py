@@ -1482,3 +1482,65 @@ def test_dsv4_batching_is_independent_sequences(ratio):
             a, b = batched[pos][0][s].float(), alone[pos][0][0].float()
             rel = ((a - b).norm() / b.norm().clamp(min=1e-6)).item()
             assert rel < 1e-3, f"pos={pos} sample {s}: x_out rel {rel:.3e} when batched"
+
+
+def test_dsv4_state_slots_place_the_rolling_state():
+    """The compressor's state lives where `state_slots` says, not at sample s.
+
+    Every other test hands the kernel the identity assignment, so a kernel that
+    ignored the slot vector entirely would pass all of them. Here the same two
+    sequences run twice: once in a pool of exactly S slots taking 0 and 1, and
+    once in a larger pool taking 3 and 1 -- non-identity, non-contiguous, and
+    not even in order. The answers must be identical, because which slot a
+    sequence's window lives in is bookkeeping, not arithmetic.
+
+    That is the property a serving pool needs: it hands slots out per request,
+    they are not contiguous, and it relocates them.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    torch.manual_seed(0)
+    dev, mode, S, ratio = "cuda", MoeMode.W8A8, 2, COMPRESS_CSA
+    cfg = _cfg(hc_mult=4)
+    cfg.compress_ratio, cfg.max_seq, cfg.index_topk = ratio, 256, 4
+    cfg.validate()
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
+    steps, coff, ihd = 6 * ratio, cfg.c_coff, cfg.index_head_dim
+    hs = [(0.5 * torch.randn(S, cfg.hc_mult, cfg.hidden, device=dev)).bfloat16() for _ in range(steps)]
+
+    def run(slots, pool):
+        layer = Dsv4MoeLayer(W, samples=S, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
+        if pool != S:  # repoint at a wider pool, as a runtime's allocator would
+            layer.state_slots = torch.tensor(slots, dtype=torch.int32, device=dev)
+            # POISON every slot, then initialise only the two that were handed out.
+            # Without this the test cannot tell "uses the slot vector" from "uses
+            # the sample index": any injective map onto private, zeroed slots gives
+            # the same answer. Reading the wrong slot has to read somebody's data.
+            layer.kv_state = torch.randn(pool, cfg.c_rows, coff * cfg.head_dim, device=dev)
+            layer.score_state = torch.randn(pool, cfg.c_rows, coff * cfg.head_dim, device=dev)
+            layer.i_kv_state = torch.randn(pool, cfg.c_rows, coff * ihd, device=dev)
+            layer.i_score_state = torch.randn(pool, cfg.c_rows, coff * ihd, device=dev)
+            layer.i_cache = torch.randn(pool, cfg.n_compressed, ihd, device=dev).bfloat16()
+            for sl in slots:
+                layer.kv_state[sl] = 0
+                layer.score_state[sl] = float("-inf")
+                layer.i_kv_state[sl] = 0
+                layer.i_score_state[sl] = float("-inf")
+                layer.i_cache[sl] = 0
+        kv = torch.zeros(S * cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+        outs = []
+        for pos in range(steps):
+            cur = torch.tensor([pos] * S, dtype=torch.int32, device=dev)
+            idx, dest = contiguous_pool([pos] * S, cfg, dev)
+            outs.append(layer.forward(hs[pos], cur, kv, dest, idx, cos, sin).clone())
+        torch.cuda.synchronize()
+        layer.close()
+        return outs
+
+    # the scattered run takes slots that are neither the sample indices nor in
+    # order, in a pool whose other slots hold noise
+    packed, scattered = run([0, 1], S), run([3, 1], S + 3)
+    for pos in range(steps):
+        d = (packed[pos].float() - scattered[pos].float()).abs().max().item()
+        assert d == 0.0, f"pos={pos}: moving the state to other slots changed the answer by {d:.3e}"

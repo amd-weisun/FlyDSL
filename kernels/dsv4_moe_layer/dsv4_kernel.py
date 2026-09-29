@@ -891,8 +891,12 @@ def build_dsv4_kernel(
         peers: Int64,
         timeline_buf: Int64,
         step: Int64,
+        state_slots: Int64,
         rank: Int32,
         layer: Int32,
+        st_kv: Int32,
+        st_i: Int32,
+        st_ic: Int32,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -936,6 +940,19 @@ def build_dsv4_kernel(
             write and the split's 'did we just write this row' test read the same
             value, so they cannot drift apart."""
             return _uniform(bo.buffer_load(r_dest, j * S + s, vec_width=1, dtype=T.i32))
+
+        r_slot = _rsrc(state_slots)
+
+        def ld_slot(s, stride):
+            """Element offset of sample ``s``'s slice of a rolling-state pool.
+
+            The slot is supplied, not the sample index: a pool hands slots out per
+            sequence, they are not contiguous, and they move -- a request can be
+            relocated, or fork its state. The stride is supplied too and is the
+            whole ENTRY, not this field: a pool interleaves several fields inside
+            one slot, so a kernel that assumed contiguity walks into its neighbour.
+            """
+            return _uniform(bo.buffer_load(r_slot, s, vec_width=1, dtype=T.i32)) * stride
 
         r_peers = _rsrc(peers)
         # Each wave sends to one peer, so retain only that wave's destination.
@@ -1927,7 +1944,7 @@ def build_dsv4_kernel(
                 # its own rolling state. That per-sample state is also what keeps
                 # these S tasks -- one per CTA, nothing ordering them -- from racing.
                 p = ld_pos(tt)
-                sb = tt * C_ROWS * CW  # this sequence's slice of the rolling state
+                sb = ld_slot(tt, st_kv)  # this sequence's slice of the rolling state
                 slot = p % CR
                 ap0 = [ld_f32(_rsrc(ape), slot * CW + j * HEAD_DIM + ch) for j in range(C_COFF)]
                 g = ld_bf16(_rsrc(g_ckv), ch)
@@ -2049,8 +2066,8 @@ def build_dsv4_kernel(
                 ln = lane
                 ilive = wave == 0
                 p = ld_pos(tt)  # tt is the sample: its own sequence, its own position
-                isb = tt * C_ROWS * IW  # this sequence's slice of the rolling state
-                icb = tt * N_COMP * IHD  # ... and of the indexer's key cache
+                isb = ld_slot(tt, st_i)  # this sequence's slice of the rolling state
+                icb = ld_slot(tt, st_ic)  # ... and of the indexer's key cache
                 slot = p % CR
                 chs = [ln, ln + 64]
                 ap0 = [[ld_f32(_rsrc(i_ape), slot * IW + j * IHD + c) for j in range(C_COFF)] for c in chs]
@@ -2324,7 +2341,7 @@ def build_dsv4_kernel(
                 # ONCE, outside the loop below -- `s` is loop-invariant, and adding
                 # it per iteration would put another live value in the body that
                 # was just trimmed to stop it spilling.
-                icb = s * N_COMP * (IHD // 2)
+                icb = ld_slot(s, st_ic) // 2
                 # the entry this launch just wrote is not reliably visible in the
                 # cache yet, so take it from the mailbox instead. The outer test is
                 # CTA-uniform, so every thread reaches the poll; only the thread
@@ -3500,8 +3517,12 @@ def build_dsv4_kernel(
         peers: Int64,
         timeline_buf: Int64,
         step: Int64,
+        state_slots: Int64,
         rank: Int32,
         layer: Int32,
+        st_kv: Int32,
+        st_i: Int32,
+        st_ic: Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         dsv4_kernel(
@@ -3553,8 +3574,12 @@ def build_dsv4_kernel(
             peers,
             timeline_buf,
             step,
+            state_slots,
             rank,
             layer,
+            st_kv,
+            st_i,
+            st_ic,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
     return launch_dsv4

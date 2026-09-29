@@ -142,6 +142,15 @@ class Dsv4MoeLayer:
             self.score_state = torch.full(shape, float("-inf"), dtype=torch.float32, device=dev)
         else:
             self.kv_state = self.score_state = torch.zeros(1, device=dev)
+        # The trivial state pool: slot s is sample s and each field is contiguous,
+        # so the strides are just the per-sample sizes. A serving pool hands out
+        # slots per sequence and interleaves these fields inside one entry, which
+        # is why both the slot and the stride cross the boundary rather than being
+        # derived from the sample index here.
+        self.state_slots = torch.arange(samples, dtype=torch.int32, device=dev)
+        self.st_kv = self.kv_state[0].numel() if cfg.compress_ratio else 0
+        self.st_i = self.i_kv_state[0].numel() if cfg.indexed else 0
+        self.st_ic = self.i_cache[0].numel() if cfg.indexed else 0
         n_tasks = sum(n for _, n in self.stages)
         self.timeline = torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev) if timeline else None
         self.step = torch.zeros(1, dtype=torch.int32, device=dev)  # decode-step counter
@@ -243,8 +252,12 @@ class Dsv4MoeLayer:
             p(self.peers),
             0 if self.timeline is None else p(self.timeline),
             p(self.step),
+            p(self.state_slots),
             self.rank,
             layer,
+            self.st_kv,
+            self.st_i,
+            self.st_ic,
             stream=torch.cuda.current_stream(),
         )
         if advance:
