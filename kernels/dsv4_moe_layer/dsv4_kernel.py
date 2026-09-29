@@ -242,7 +242,10 @@ def layout(
         off += _align(size)
     scratch["_bytes"] = off
     part = npes * S * hidden * pr
-    sym = {"attn": 0, "ffn": part, "_bytes": 2 * part}
+    # the indexer's score partials get their own region: every rank scores every
+    # compressed entry with its OWN index heads, so the sum spans ranks
+    iscore = npes * S * max(n_compressed(max_seq, compress_ratio), 1) * pr
+    sym = {"attn": 0, "ffn": part, "iscore": 2 * part, "_bytes": 2 * part + _align(iscore)}
     return scratch, sym
 
 
@@ -2224,6 +2227,30 @@ def build_dsv4_kernel(
                 for hh in range_constexpr(IH):
                     sc_t = sc_t + fx.max(accs[hh], fx.Float32(0.0)) * wv[hh]
                 live = (c < n_live) & (c < N_COMP)
+                if const_expr(W > 1):
+                    # This rank holds only IH of the 64 index heads, so its score is
+                    # a PARTIAL sum -- without this exchange the ranks would rank the
+                    # entries differently and silently attend to different keys.
+                    # Push to every peer, then sum all ranks' partials in rank order
+                    # from our own buffer: same order everywhere, so the totals are
+                    # bit-identical and the top-k below cannot disagree.
+                    stamp("i_score", tt, 5)
+                    for p in range_constexpr(W):
+                        pv2 = fx.Vector(bo.buffer_load(r_peers, p * 2, vec_width=2, dtype=T.i32))
+                        dst = (fx.Int64(_uniform(pv2[1])) << 32) | fx.Int64(fx.Uint32(_uniform(pv2[0])))
+                        if c < N_COMP:
+                            put(
+                                dst + fx.Int64(SY["iscore"]),
+                                (rank * S + s) * N_COMP + c,
+                                sc_t,
+                                CM_SYS,
+                            )
+                    own = sym + fx.Int64(SY["iscore"])
+                    ci = fx.min(c, N_COMP - 1)
+                    got = poll([(own, (src * S + s) * N_COMP + ci, 1) for src in range(W)], "one-as")
+                    sc_t = fx.Float32(0.0)
+                    for src in range_constexpr(W):
+                        sc_t = sc_t + got[src][0].bitcast(fx.Float32)
                 if c < N_COMP:
                     put(mb("i_score"), s * N_COMP + c, live.select(sc_t, fx.Float32(NEG)))
                 stamp("i_score", tt, 4)
