@@ -59,20 +59,25 @@ class SharedReuseMlaMoeLayer:
         softmax_scale: float = SOFTMAX_SCALE,
         free_unpacked: bool = False,
         reuse: "SharedReuseMlaMoeLayer | None" = None,
+        packed: dict | None = None,
     ):
         """``paged``: serving mode (S independent sequences over a paged 576-wide cache, see
         ``build_shared_reuse_kernel``).  ``reuse``: another layer built with identical
         static arguments whose compiled launcher, scratch, symmetric buffer and step
         counter are shared (they are safe to share: every launch uses a fresh tag).
-        ``free_unpacked`` drops the row-major weight copies once packed."""
+        ``free_unpacked`` drops the row-major weight copies once packed; ``packed`` reuses
+        another layer object's packed weights (its ``W`` must be passed too)."""
         validate_shard(samples, W.heads, rank, npes, topk)
         self.moe_mode = as_moe_mode(moe_mode)
         self.W, self.S, self.rank, self.npes, self.topk = W, samples, rank, npes, topk
         self.paged = paged
-        self.packed = pack_layer_weights(W.t, self.moe_mode)
-        if free_unpacked:
-            for name in self.packed:
-                W.t.pop(name, None)
+        if packed is not None:  # weights already packed by a sibling layer object (another S)
+            self.packed = packed
+        else:
+            self.packed = pack_layer_weights(W.t, self.moe_mode)
+            if free_unpacked:
+                for name in self.packed:
+                    W.t.pop(name, None)
         dims = dict(hidden=W.hidden, q_lora=W.q_lora, nope_dim=W.nope_dim, v_dim=W.v_dim)
         dev = torch.device("cuda", torch.cuda.current_device())
         if reuse is not None:
