@@ -25,6 +25,7 @@ from kernels.dsv4_moe_layer.reference import (
     golden_layer,
     golden_moe,
     layer_idxs,
+    contiguous_pool,
     make_weights,
     dequant,
     qkv_a_split,
@@ -147,18 +148,18 @@ def test_dsv4_layer_matches_golden(S, moe_mode, hc_mult):
     hshape = (S, cfg.hidden) if cfg.hc_mult == 1 else (S, cfg.hc_mult, cfg.hidden)
     h = (0.5 * torch.randn(*hshape, device=dev)).bfloat16()
     pos = cfg.window  # ring already wrapped once
-    cur = torch.tensor([pos], dtype=torch.int32, device=dev)
-    kv0 = (0.3 * torch.randn(S, cfg.window, cfg.head_dim, device=dev)).bfloat16()
-    idx = window_idxs(pos, S, cfg.window, dev)
+    cur = torch.tensor([pos] * S, dtype=torch.int32, device=dev)
+    kv0 = (0.3 * torch.randn(S * cfg.window, cfg.head_dim, device=dev)).bfloat16()
+    idx, dest = contiguous_pool([pos] * S, cfg, dev)
     cos, sin = rope_table(4096, theta=cfg.rope_theta, device=dev)
 
     kv_kernel = kv0.clone()
-    out = layer.forward(h, cur, kv_kernel, idx, cos, sin)
+    out = layer.forward(h, cur, kv_kernel, dest, idx, cos, sin)
     torch.cuda.synchronize()
     got = layer.intermediates()
 
     kv_ref = kv0.clone()
-    ref = golden_layer(W, h, pos, kv_ref, idx, cos, sin, lambda z: z, moe_mode=moe_mode)
+    ref = golden_layer(W, h, [pos] * S, kv_ref, dest, idx, cos, sin, lambda z: z, moe_mode=moe_mode)
 
     if _routing_flipped(got, ref, W, cfg, S):
         ref = _rebase_on_own_routing(got, ref, W, moe_mode)
@@ -196,16 +197,16 @@ def test_dsv4_layer_matches_golden_at_real_dims(S):
 
     h = (0.5 * torch.randn(S, cfg.hidden, device=dev)).bfloat16()
     pos = cfg.window
-    cur = torch.tensor([pos], dtype=torch.int32, device=dev)
-    kv0 = (0.3 * torch.randn(S, cfg.window, cfg.head_dim, device=dev)).bfloat16()
-    idx = window_idxs(pos, S, cfg.window, dev)
+    cur = torch.tensor([pos] * S, dtype=torch.int32, device=dev)
+    kv0 = (0.3 * torch.randn(S * cfg.window, cfg.head_dim, device=dev)).bfloat16()
+    idx, dest = contiguous_pool([pos] * S, cfg, dev)
     cos, sin = rope_table(4096, theta=cfg.rope_theta, device=dev)
 
     kv_kernel = kv0.clone()
-    out = layer.forward(h, cur, kv_kernel, idx, cos, sin)
+    out = layer.forward(h, cur, kv_kernel, dest, idx, cos, sin)
     torch.cuda.synchronize()
     got = layer.intermediates()
-    ref = golden_layer(W, h, pos, kv0.clone(), idx, cos, sin, lambda z: z, moe_mode=mode)
+    ref = golden_layer(W, h, [pos] * S, kv0.clone(), dest, idx, cos, sin, lambda z: z, moe_mode=mode)
 
     if _routing_flipped(got, ref, W, cfg, S):
         ref = _rebase_on_own_routing(got, ref, W, mode)
@@ -299,13 +300,13 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4,
     # Without compression each step is independent, so the cache is re-seeded from
     # kv0 every iteration. The compressor carries state across steps, so its run has
     # to be a real sequential decode: one cache, one rolling state, advancing pos.
-    kv0 = torch.randn(1, cfg.window, cfg.head_dim, generator=gen, device=dev).to(torch.bfloat16)
+    kv0 = torch.randn(cfg.window, cfg.head_dim, generator=gen, device=dev).to(torch.bfloat16)
     pos = cfg.window
-    idx = window_idxs(pos, 1, cfg.window, dev)
+    idx, dest = contiguous_pool([pos], cfg, dev)
     if compress_ratio:
         pos = 0
-        kv_k = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
-        kv_r = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+        kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+        kv_r = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
         ks = torch.zeros(1, cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev)
         ss = torch.full((1, cfg.c_rows, cfg.c_coff * cfg.head_dim), float("-inf"), device=dev)
 
@@ -329,11 +330,11 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4,
         h = torch.randn(*hshape, generator=gen, device=dev).to(torch.bfloat16)
         if compress_ratio:
             pos = it
-            idx = layer_idxs(pos, 1, cfg, dev)
+            idx, dest = contiguous_pool([pos], cfg, dev)
             boundaries += (pos + 1) % compress_ratio == 0
         cur = torch.tensor([pos], dtype=torch.int32, device=dev)
         kv_in = kv_k if compress_ratio else kv0.clone()
-        out = layer.forward(h, cur, kv_in, idx, cos, sin)
+        out = layer.forward(h, cur, kv_in, dest, idx, cos, sin)
         torch.cuda.synchronize()
         got = layer.intermediates()
 
@@ -352,8 +353,9 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4,
         ref = golden_layer(
             W,
             h,
-            pos,
+            [pos],
             kv_r if compress_ratio else kv0.clone(),
+            dest,
             idx,
             cos,
             sin,
@@ -363,7 +365,7 @@ def run_rank(rank, npes, real=False, iters=2, group=None, moe_mode=MoeMode.A8W4,
         )
         if compress_ratio and (pos + 1) % compress_ratio == 0:
             slot = cfg.window + pos // compress_ratio
-            a_c, b_c = kv_k[0, slot].float(), kv_r[0, slot].float()
+            a_c, b_c = kv_k[slot].float(), kv_r[slot].float()
             c_rel = (a_c - b_c).abs().max().item() / max(b_c.abs().max().item(), 1e-6)
             if c_rel >= 2e-2:
                 print(f"rank {rank}: compressed row at {slot} rel {c_rel:.5f}", flush=True)
@@ -520,18 +522,18 @@ def bench_rank(
     cfg.validate()
     W = make_weights(rank, cfg=cfg, device=dev, seed=TP_SEED, moe_mode=moe_mode)
     cos, sin = rope_table(max(4096, cfg.max_seq), theta=cfg.rope_base, device=dev)
-    kv = torch.randn(samples, cfg.cache_rows, cfg.head_dim, device=dev).to(torch.bfloat16)
+    kv = torch.randn(samples * cfg.cache_rows, cfg.head_dim, device=dev).to(torch.bfloat16)
     # deep enough that the compressed half of the cache is full, which is the
     # steady state a decode spends nearly all of its time in
     pos = (cfg.max_seq - 1) if compress_ratio else cfg.window
-    idx = layer_idxs(pos, samples, cfg, dev) if compress_ratio else window_idxs(pos, samples, cfg.window, dev)
-    cur = torch.tensor([pos], dtype=torch.int32, device=dev)
+    idx, dest = contiguous_pool([pos] * samples, cfg, dev)
+    cur = torch.tensor([pos] * samples, dtype=torch.int32, device=dev)
     op = Dsv4MoeLayer(W, samples, rank=rank, npes=npes, group=group, moe_mode=moe_mode, allow_unindexed_csa=True)
     hshape = (samples, cfg.hidden) if cfg.hc_mult == 1 else (samples, cfg.hc_mult, cfg.hidden)
     h = torch.randn(*hshape, device=dev).to(torch.bfloat16)
     x = torch.empty_like(h)
     for _ in range(10):
-        op.forward(h, cur, kv, idx, cos, sin, x_out=x)
+        op.forward(h, cur, kv, dest, idx, cos, sin, x_out=x)
     torch.cuda.synchronize()
     if npes > 1:
         dist.barrier()
@@ -548,7 +550,7 @@ def bench_rank(
             allow_unindexed_csa=True,
         )
         for _ in range(3):
-            top.forward(h, cur, kv, idx, cos, sin, x_out=x)
+            top.forward(h, cur, kv, dest, idx, cos, sin, x_out=x)
         torch.cuda.synchronize()
         if rank == 0:
             print(top.timeline_report(), flush=True)
@@ -557,7 +559,7 @@ def bench_rank(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         for layer in range(BENCH_LAYERS):
-            op.forward(h, cur, kv, idx, cos, sin, x_out=x, layer=layer, advance=False)
+            op.forward(h, cur, kv, dest, idx, cos, sin, x_out=x, layer=layer, advance=False)
         op.advance_step()
     for _ in range(3):
         graph.replay()
@@ -672,8 +674,8 @@ def test_dsv4_hca_layer_matches_golden(moe_mode):
     # consumer, so a compressing layer rotates its window q/kv on the same table
     # as its compressed rows. cfg.rope_base holds that rule.
     cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
-    kv_k = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
-    kv_r = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    kv_r = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     ks = torch.zeros(1, cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev)
     # -inf like the layer's own state: unwritten rows must drop out of the softmax
     ss = torch.full((1, cfg.c_rows, cfg.c_coff * cfg.head_dim), float("-inf"), device=dev)
@@ -682,14 +684,15 @@ def test_dsv4_hca_layer_matches_golden(moe_mode):
     for pos in range(3 * ratio + 2):
         h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
         cur = torch.tensor([pos], dtype=torch.int32, device=dev)
-        idx = layer_idxs(pos, 1, cfg, dev)
-        out = layer.forward(h, cur, kv_k, idx, cos, sin)
+        idx, dest = contiguous_pool([pos], cfg, dev)
+        out = layer.forward(h, cur, kv_k, dest, idx, cos, sin)
         torch.cuda.synchronize()
         ref = golden_layer(
             W,
             h,
-            pos,
+            [pos],
             kv_r,
+            dest,
             idx,
             cos,
             sin,
@@ -707,7 +710,7 @@ def test_dsv4_hca_layer_matches_golden(moe_mode):
             # pools with an online softmax on the hardware exp2 while the golden uses
             # a batch softmax, and the result is rounded to bf16, so they can land a
             # few ulp apart. A few percent means the pooling itself is right.
-            a_c, b_c = kv_k[0, slot].float(), kv_r[0, slot].float()
+            a_c, b_c = kv_k[slot].float(), kv_r[slot].float()
             rel = (a_c - b_c).abs().max().item() / max(b_c.abs().max().item(), 1e-6)
             assert rel < 2e-2, f"compressed row at slot {slot} differs by rel {rel:.5f}"
 
@@ -769,8 +772,8 @@ def test_dsv4_hca_layer_at_real_dims():
 
     # one table for the whole layer, at this layer's base
     cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
-    kv_k = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
-    kv_r = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    kv_r = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     ks = torch.zeros(1, cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev)
     ss = torch.full((1, cfg.c_rows, cfg.c_coff * cfg.head_dim), float("-inf"), device=dev)
 
@@ -781,14 +784,15 @@ def test_dsv4_hca_layer_at_real_dims():
     for pos in range(2 * ratio + 4):
         h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
         cur = torch.tensor([pos], dtype=torch.int32, device=dev)
-        idx = layer_idxs(pos, 1, cfg, dev)
-        out = layer.forward(h, cur, kv_k, idx, cos, sin)
+        idx, dest = contiguous_pool([pos], cfg, dev)
+        out = layer.forward(h, cur, kv_k, dest, idx, cos, sin)
         torch.cuda.synchronize()
         ref = golden_layer(
             W,
             h,
-            pos,
+            [pos],
             kv_r,
+            dest,
             idx,
             cos,
             sin,
@@ -802,7 +806,7 @@ def test_dsv4_hca_layer_at_real_dims():
         if (pos + 1) % ratio == 0:
             boundaries += 1
             slot = cfg.window + pos // ratio
-            a_c, b_c = kv_k[0, slot].float(), kv_r[0, slot].float()
+            a_c, b_c = kv_k[slot].float(), kv_r[slot].float()
             rel = (a_c - b_c).abs().max().item() / max(b_c.abs().max().item(), 1e-6)
             assert rel < 2e-2, f"compressed row at slot {slot} differs by rel {rel:.5f}"
 
@@ -874,7 +878,7 @@ def test_dsv4_csa_compressor_in_kernel():
     layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
 
     cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
-    kv_k = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     ks = torch.zeros(cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev)
     ss = torch.full((cfg.c_rows, cfg.c_coff * cfg.head_dim), float("-inf"), device=dev)
     cache_r = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
@@ -885,8 +889,8 @@ def test_dsv4_csa_compressor_in_kernel():
     for pos in range(5 * ratio):
         h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
         cur = torch.tensor([pos], dtype=torch.int32, device=dev)
-        idx = layer_idxs(pos, 1, cfg, dev)
-        layer.forward(h, cur, kv_k, idx, cos, sin)
+        idx, dest = contiguous_pool([pos], cfg, dev)
+        layer.forward(h, cur, kv_k, dest, idx, cos, sin)
         torch.cuda.synchronize()
 
         x = bf(rmsnorm(h.float(), t["g_in"], cfg.eps))
@@ -902,13 +906,14 @@ def test_dsv4_csa_compressor_in_kernel():
             cache_r,
             cos,
             sin,
+            dest_row=cfg.window + pos // ratio,
         )
         if (pos + 1) % ratio:
             assert ref is None, f"pos={pos} should emit nothing"
             continue
         emitted += 1
         slot = cfg.window + pos // ratio
-        a, b = kv_k[0, slot].float(), cache_r[slot].float()
+        a, b = kv_k[slot].float(), cache_r[slot].float()
         # Most boundaries come out bit-exact. The kernel pools with an online
         # softmax on the hardware exp2 and the golden with a batch softmax, so the
         # pre-quantization value can differ in the last fp32 bits, and once in a
@@ -948,7 +953,7 @@ def test_dsv4_indexer_compressor_in_kernel():
     layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
 
     cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
-    kv_k = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     i_ks = torch.zeros(cfg.c_rows, cfg.c_coff * ihd, device=dev)
     i_ss = torch.full((cfg.c_rows, cfg.c_coff * ihd), float("-inf"), device=dev)
     i_ref = torch.zeros(cfg.n_compressed, ihd, dtype=torch.bfloat16, device=dev)
@@ -959,7 +964,8 @@ def test_dsv4_indexer_compressor_in_kernel():
     for pos in range(5 * ratio):
         h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
         cur = torch.tensor([pos], dtype=torch.int32, device=dev)
-        layer.forward(h, cur, kv_k, layer_idxs(pos, 1, cfg, dev), cos, sin)
+        idx, dest = contiguous_pool([pos], cfg, dev)
+        layer.forward(h, cur, kv_k, dest, idx, cos, sin)
         torch.cuda.synchronize()
 
         x = bf(rmsnorm(h.float(), t["g_in"], cfg.eps))
@@ -978,7 +984,6 @@ def test_dsv4_indexer_compressor_in_kernel():
             head_dim=ihd,
             ape=t["i_ape"],
             gamma=t["g_ickv"],
-            base=0,
             rotate=True,
         )
         if (pos + 1) % ratio:
@@ -1024,14 +1029,15 @@ def test_dsv4_indexer_query_in_kernel():
     layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
 
     cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
-    kv_k = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     dq_qkv = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
     dq_iqb = dequant(t["w_i_q_b"], t["s_i_q_b"], 128)
 
     for pos in range(3):
         h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
         cur = torch.tensor([pos], dtype=torch.int32, device=dev)
-        layer.forward(h, cur, kv_k, layer_idxs(pos, 1, cfg, dev), cos, sin)
+        idx, dest = contiguous_pool([pos], cfg, dev)
+        layer.forward(h, cur, kv_k, dest, idx, cos, sin)
         torch.cuda.synchronize()
 
         x = bf(rmsnorm(h.float(), t["g_in"], cfg.eps))
@@ -1084,7 +1090,7 @@ def test_dsv4_indexer_scoring_in_kernel():
     layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
 
     cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
-    kv_k = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     i_ks = torch.zeros(cfg.c_rows, cfg.c_coff * ihd, device=dev)
     i_ss = torch.full((cfg.c_rows, cfg.c_coff * ihd), float("-inf"), device=dev)
     i_ref = torch.zeros(cfg.n_compressed, ihd, dtype=torch.bfloat16, device=dev)
@@ -1097,7 +1103,8 @@ def test_dsv4_indexer_scoring_in_kernel():
     for pos in range(4 * ratio):
         h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
         cur = torch.tensor([pos], dtype=torch.int32, device=dev)
-        layer.forward(h, cur, kv_k, layer_idxs(pos, 1, cfg, dev), cos, sin)
+        idx, dest = contiguous_pool([pos], cfg, dev)
+        layer.forward(h, cur, kv_k, dest, idx, cos, sin)
         torch.cuda.synchronize()
 
         x = bf(rmsnorm(h.float(), t["g_in"], cfg.eps))
@@ -1116,7 +1123,6 @@ def test_dsv4_indexer_scoring_in_kernel():
             head_dim=ihd,
             ape=t["i_ape"],
             gamma=t["g_ickv"],
-            base=0,
             rotate=True,
         )
         q_an = bf(rmsnorm(proj[:, : cfg.q_lora], t["g_q"], cfg.eps))
@@ -1166,7 +1172,7 @@ def _indexer_score_rank(rank, npes, port, results):
         t = W.t
         layer = Dsv4MoeLayer(W, samples=1, rank=rank, npes=npes, moe_mode=mode, allow_unindexed_csa=True)
         cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
-        kv_k = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+        kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
         dq_qkv = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
         dq_iqb = dequant(t["w_i_q_b"], t["s_i_q_b"], 128)
         scale = ihd**-0.5 * cfg.index_heads_total**-0.5
@@ -1176,7 +1182,8 @@ def _indexer_score_rank(rank, npes, port, results):
         for pos in range(3 * ratio):
             h = torch.randn(1, cfg.hidden, generator=gen, device=dev).to(torch.bfloat16)
             cur = torch.tensor([pos], dtype=torch.int32, device=dev)
-            layer.forward(h, cur, kv_k, layer_idxs(pos, 1, cfg, dev), cos, sin)
+            idx, dest = contiguous_pool([pos], cfg, dev)
+            layer.forward(h, cur, kv_k, dest, idx, cos, sin)
             torch.cuda.synchronize()
             got = layer.debug("i_score", (1, cfg.n_compressed))[0]
 
@@ -1282,7 +1289,7 @@ def test_dsv4_indexer_topk_in_kernel():
     layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
 
     cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
-    kv_k = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     i_ks = torch.zeros(cfg.c_rows, cfg.c_coff * ihd, device=dev)
     i_ss = torch.full((cfg.c_rows, cfg.c_coff * ihd), float("-inf"), device=dev)
     i_ref = torch.zeros(cfg.n_compressed, ihd, dtype=torch.bfloat16, device=dev)
@@ -1293,7 +1300,8 @@ def test_dsv4_indexer_topk_in_kernel():
     for pos in range(8 * ratio):
         h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
         cur = torch.tensor([pos], dtype=torch.int32, device=dev)
-        layer.forward(h, cur, kv_k, layer_idxs(pos, 1, cfg, dev), cos, sin)
+        idx, dest = contiguous_pool([pos], cfg, dev)
+        layer.forward(h, cur, kv_k, dest, idx, cos, sin)
         torch.cuda.synchronize()
 
         x = bf(rmsnorm(h.float(), t["g_in"], cfg.eps))
@@ -1363,7 +1371,7 @@ def test_dsv4_indexer_topk_compaction_spans_waves():
     W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
     layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
     cos, sin = rope_table(4096, theta=cfg.rope_base, device=dev)
-    kv_k = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
 
     # positions to judge at: deep enough that the live candidates cover several
     # waves, and that the last two are past index_topk so the pick also discards
@@ -1372,7 +1380,8 @@ def test_dsv4_indexer_topk_compaction_spans_waves():
     for pos in range(checks[-1] + 1):
         h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
         cur = torch.tensor([pos], dtype=torch.int32, device=dev)
-        layer.forward(h, cur, kv_k, layer_idxs(pos, 1, cfg, dev), cos, sin)
+        idx, dest = contiguous_pool([pos], cfg, dev)
+        layer.forward(h, cur, kv_k, dest, idx, cos, sin)
         if pos not in checks:
             continue
         torch.cuda.synchronize()
@@ -1399,10 +1408,11 @@ def test_dsv4_batching_is_independent_sequences(ratio):
     """The kernel at S=2 must equal the kernel run twice at S=1.
 
     This is what the batch axis means, and it is the test that catches a stage
-    reading sample 0's state for every sample -- which `i_wp` really did, by
-    building its address from the Python-level sample index (always 0) instead of
-    its task's. Comparing per-stage against the golden does not catch that class
-    on its own: at S=1 the two are the same thing.
+    reading sample 0's state -- or sample 0's POSITION -- for every sample. `i_wp`
+    really did the former, by building its address from the Python-level sample
+    index (always 0) instead of its task's. Comparing per-stage against the golden
+    does not catch that class on its own: at S=1 the two are the same thing, and
+    with every sample at the same position a wrong position is invisible too.
 
     Exact equality, not a tolerance: the samples are independent by construction,
     so batching changes which lanes do the work but not the arithmetic any one
@@ -1429,18 +1439,27 @@ def test_dsv4_batching_is_independent_sequences(ratio):
         assert (steps - 1) // ratio > cfg.index_topk, "the top-k must discard, or the scores are untested"
 
     hs = [(0.5 * torch.randn(S, cfg.hc_mult, cfg.hidden, device=dev)).bfloat16() for _ in range(steps)]
+    # STAGGERED starts: sample s begins at OFFSETS[s], as sequences admitted at
+    # different times are. Equal positions would let a stage read sample 0's
+    # position for every sample and still agree -- the same shape of defect the
+    # indexer's score weights actually had. The offsets are not multiples of the
+    # ratio, so the samples also cross their compression boundaries on different
+    # steps, which is what makes the per-sample boundary test meaningful.
+    OFFSETS = (0, 3)
+    assert len(OFFSETS) == S and (not ratio or OFFSETS[1] % ratio), "offsets must stagger the boundary"
 
     def run(rows):
-        """Decode `steps` positions for the given sample rows; per-stage results."""
+        """Decode `steps` steps for the given sample rows; per-stage results."""
         n = len(rows)
         layer = Dsv4MoeLayer(W, samples=n, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
-        kv = torch.zeros(n, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+        kv = torch.zeros(n * cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
         seq = []
-        for pos in range(steps):
-            cur = torch.tensor([pos], dtype=torch.int32, device=dev)
-            idx = layer_idxs(pos, n, cfg, dev) if ratio else window_idxs(pos, n, cfg.window, dev)
-            h = torch.cat([hs[pos][r : r + 1] for r in rows])
-            out = layer.forward(h, cur, kv, idx, cos, sin).clone()
+        for step in range(steps):
+            ps = [OFFSETS[r] + step for r in rows]
+            cur = torch.tensor(ps, dtype=torch.int32, device=dev)
+            idx, dest = contiguous_pool(ps, cfg, dev)
+            h = torch.cat([hs[step][r : r + 1] for r in rows])
+            out = layer.forward(h, cur, kv, dest, idx, cos, sin).clone()
             torch.cuda.synchronize()
             seq.append((out, {k: v.clone() for k, v in layer.intermediates().items()}))
         layer.close()

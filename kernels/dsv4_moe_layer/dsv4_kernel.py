@@ -847,6 +847,7 @@ def build_dsv4_kernel(
         x_out: Int64,
         cur_pos: Int64,
         kv_cache: Int64,
+        dest_rows: Int64,
         indices: Int64,
         rope_cos: Int64,
         rope_sin: Int64,
@@ -913,7 +914,29 @@ def build_dsv4_kernel(
         # device counter bumped once per decode step (graph friendly); ``layer``
         # makes it unique per layer within the step.
         tag = _uniform(bo.buffer_load(_rsrc(step), 0, vec_width=1, dtype=T.i32)) * LAYER_SLOTS + layer + 1
-        pos0 = _uniform(bo.buffer_load(_rsrc(cur_pos), 0, vec_width=1, dtype=T.i32))
+        r_pos = _rsrc(cur_pos)
+
+        def ld_pos(s):
+            """Sample ``s``'s position. One entry per sample, not one scalar: the
+            samples are independent sequences and a real batch has each at its own
+            offset. Every caller derives ``s`` from its task index (or a constexpr
+            loop), so the value is wave-uniform and the readfirstlane is honest."""
+            return _uniform(bo.buffer_load(r_pos, s, vec_width=1, dtype=T.i32))
+
+        r_dest = _rsrc(dest_rows)
+
+        def ld_dest(j, s):
+            """Plane rows for sample ``s``: j=0 the row this token's KV goes to,
+            j=1 the row its compressed entry ZERO lives at (entry c is row1 + c).
+
+            Supplied rather than derived, because the cache is ONE plane and which
+            rows a sequence owns is the pool's arithmetic, not the kernel's -- a
+            serving pool interleaves layers and relocates slots, so
+            ``base + pos % window`` is not a formula this side can know. Both the
+            write and the split's 'did we just write this row' test read the same
+            value, so they cannot drift apart."""
+            return _uniform(bo.buffer_load(r_dest, j * S + s, vec_width=1, dtype=T.i32))
+
         r_peers = _rsrc(peers)
         # Each wave sends to one peer, so retain only that wave's destination.
         pv = fx.Vector(bo.buffer_load(r_peers, fx.min(wave, W - 1) * 2, vec_width=2, dtype=T.i32))
@@ -1855,12 +1878,10 @@ def build_dsv4_kernel(
             # gamma and the RoPE factors are issued ahead of the wait
             g = ld_bf16(_rsrc(g_kv), fx.min(tid, HEAD_DIM - 1))
             ri = fx.max(tid - NOPE_DIM, fx.Int32(0)) // 2
-            # every sample is a separate sequence at the SAME position, so one
-            # rotation and one ring slot serve them all; they differ only in which
-            # cache slice they land in
-            cs = ld_f32(_rsrc(rope_cos), pos0 * (ROPE_DIM // 2) + ri)
-            sns = ld_f32(_rsrc(rope_sin), pos0 * (ROPE_DIM // 2) + ri)
-            slot = pos0 % window
+            # one task covers every sample, so each loads its own position
+            ps = [ld_pos(sx) for sx in range(S)]
+            cs = [ld_f32(_rsrc(rope_cos), ps[sx] * (ROPE_DIM // 2) + ri) for sx in range(S)]
+            sns = [ld_f32(_rsrc(rope_sin), ps[sx] * (ROPE_DIM // 2) + ri) for sx in range(S)]
             hint_wait(
                 HEAD_DIM // QKV_A_TILE,
                 lambda k: (mb("kv_a"), (S - 1) * HEAD_DIM + k * QKV_A_TILE + QKV_A_TILE - 1),
@@ -1875,7 +1896,7 @@ def build_dsv4_kernel(
                 # rope tail: lane ^ 1 is the other half of this interleaved (2i, 2i+1) pair
                 partner = _xshfl(nv, 1)
                 even = tid % 2 == 0
-                rot = even.select(nv * cs - partner * sns, partner * sns + nv * cs)
+                rot = even.select(nv * cs[s] - partner * sns[s], partner * sns[s] + nv * cs[s])
                 # nope head: one 64-wide FP8 block per wave
                 amax = wave_max(fmath.absf(nv))
                 nz = amax > 0.0
@@ -1884,7 +1905,7 @@ def build_dsv4_kernel(
                 d0, _ = _fp8_roundtrip(fx.min(fx.max(nv * inv, -FP8_MAX), FP8_MAX), fx.Float32(0.0))
                 kvn = bf16_round((tid < NOPE_DIM).select(d0 * qs, rot))
                 if live:
-                    bo.buffer_store(kvn.to(fx.BFloat16), r_kv, (s * CACHE_ROWS + slot) * HEAD_DIM + tid)
+                    bo.buffer_store(kvn.to(fx.BFloat16), r_kv, ld_dest(0, s) * HEAD_DIM + tid)
                     put(mb("kvnew"), s * HEAD_DIM + tid, kvn)
             stamp("cache", t, 4)
 
@@ -1905,9 +1926,8 @@ def build_dsv4_kernel(
                 # tt is the sample: its own sequence, at the shared position, with
                 # its own rolling state. That per-sample state is also what keeps
                 # these S tasks -- one per CTA, nothing ordering them -- from racing.
-                p = pos0
+                p = ld_pos(tt)
                 sb = tt * C_ROWS * CW  # this sequence's slice of the rolling state
-                cb = tt * CACHE_ROWS * HEAD_DIM  # ... and of the KV cache
                 slot = p % CR
                 ap0 = [ld_f32(_rsrc(ape), slot * CW + j * HEAD_DIM + ch) for j in range(C_COFF)]
                 g = ld_bf16(_rsrc(g_ckv), ch)
@@ -1967,7 +1987,8 @@ def build_dsv4_kernel(
                     d0, _ = _fp8_roundtrip(fx.min(fx.max(nv * inv, -FP8_MAX), FP8_MAX), fx.Float32(0.0))
                     cv = bf16_round((tid < NOPE_DIM).select(d0 * qs, rot))
                     if live:
-                        bo.buffer_store(cv.to(fx.BFloat16), _rsrc(kv_cache), cb + (window + p // CR) * HEAD_DIM + tid)
+                        crow = ld_dest(1, tt) + p // CR  # this sequence's entry p // CR
+                        bo.buffer_store(cv.to(fx.BFloat16), _rsrc(kv_cache), crow * HEAD_DIM + tid)
                         put(mb("cnew"), tt * HEAD_DIM + tid, cv)
                     if const_expr(OVERLAP):
                         # the current window becomes the previous one. Each thread
@@ -2027,7 +2048,7 @@ def build_dsv4_kernel(
                 # one WAVE covers the row: lane ln holds channels ln and ln + 64
                 ln = lane
                 ilive = wave == 0
-                p = pos0  # tt is the sample -- its own sequence, shared position
+                p = ld_pos(tt)  # tt is the sample: its own sequence, its own position
                 isb = tt * C_ROWS * IW  # this sequence's slice of the rolling state
                 icb = tt * N_COMP * IHD  # ... and of the indexer's key cache
                 slot = p % CR
@@ -2192,8 +2213,9 @@ def build_dsv4_kernel(
                 stamp("i_q", tt, 0)
                 ln = lane
                 chs = [ln, ln + 64]
-                rc = ld_f32(_rsrc(rope_cos), pos0 * (ROPE_DIM // 2) + ln // 2)
-                rs2 = ld_f32(_rsrc(rope_sin), pos0 * (ROPE_DIM // 2) + ln // 2)
+                ip = ld_pos(tt)
+                rc = ld_f32(_rsrc(rope_cos), ip * (ROPE_DIM // 2) + ln // 2)
+                rs2 = ld_f32(_rsrc(rope_sin), ip * (ROPE_DIM // 2) + ln // 2)
                 for k in range_constexpr(IH // WAVES):
                     ihead = wave + k * WAVES
                     base_i = (tt * IH + ihead) * IHD
@@ -2295,7 +2317,8 @@ def build_dsv4_kernel(
                 stamp("i_score", tt, 2)
                 c = blk * SCORE_TILE + tid
                 # entries the compressor has not written yet must never be picked
-                n_live = (pos0 + 1) // CR
+                sp = ld_pos(s)
+                n_live = (sp + 1) // CR
                 r_ic2 = _rsrc(i_cache)
                 # This sequence's slice of the key cache. Folded into the row base
                 # ONCE, outside the loop below -- `s` is loop-invariant, and adding
@@ -2306,7 +2329,7 @@ def build_dsv4_kernel(
                 # cache yet, so take it from the mailbox instead. The outer test is
                 # CTA-uniform, so every thread reaches the poll; only the thread
                 # holding that candidate uses the value.
-                is_new = c == pos0 // CR
+                is_new = c == sp // CR
                 # A RUNTIME loop, not range_constexpr. Unrolled, the compiler hoists
                 # all IHD / 8 key loads and every query read to the top of the stage;
                 # that is ~130 values more than the budget, so it spilled them and
@@ -2333,7 +2356,7 @@ def build_dsv4_kernel(
                         .bitcast(fx.BFloat16)
                         .to(fx.Float32)
                     ]
-                    if (pos0 + 1) % CR == 0:
+                    if (sp + 1) % CR == 0:
                         nv = [getf(mb("i_cnew"), s * IHD + d0 * 8 + e) for e in range(8)]
                         kw = [is_new.select(nv[e], kw[e]) for e in range(8)]
                     accs = [fx.Float32(acc[hh]) for hh in range(IH)]
@@ -2393,7 +2416,8 @@ def build_dsv4_kernel(
                 tt = fx.Int32(tt)
                 stamp("i_topk", tt, 0)
                 s = tt
-                n_live = fx.min((pos0 + 1) // CR, fx.Int32(N_COMP))
+                c0 = ld_dest(1, s)  # plane row of this sequence's compressed entry 0
+                n_live = fx.min((ld_pos(s) + 1) // CR, fx.Int32(N_COMP))
                 k_want = fx.min(n_live, fx.Int32(N_INDEX))
                 mine = [fx.Int32(tid) * TOPK_PER + j for j in range(TOPK_PER)]
                 ok_c = [(c < n_live) for c in mine]
@@ -2450,7 +2474,7 @@ def build_dsv4_kernel(
                     w = w_base + off
                     for j in range_constexpr(TOPK_PER):
                         if sel[j] & ((w - w_base) < room):
-                            put(mb("i_sel"), s * N_ISEL + w, window + mine[j])
+                            put(mb("i_sel"), s * N_ISEL + w, c0 + mine[j])
                         w = w + sel[j].select(fx.Int32(1), fx.Int32(0))
                     w_base = w_base + fx.min(tot, room)
                     gpu.barrier()
@@ -2471,8 +2495,9 @@ def build_dsv4_kernel(
             s = tt // H
             head = tt % H
             ri = fx.max(tid - NOPE_DIM, fx.Int32(0)) // 2
-            c = ld_f32(_rsrc(rope_cos), pos0 * (ROPE_DIM // 2) + ri)
-            sn = ld_f32(_rsrc(rope_sin), pos0 * (ROPE_DIM // 2) + ri)
+            sp = ld_pos(s)
+            c = ld_f32(_rsrc(rope_cos), sp * (ROPE_DIM // 2) + ri)
+            sn = ld_f32(_rsrc(rope_sin), sp * (ROPE_DIM // 2) + ri)
             hint_wait(
                 QB_PER_HEAD,
                 lambda k: (mb("q_raw"), (s * H + head) * HEAD_DIM + k * Q_B_TILE + Q_B_TILE - 1),
@@ -2525,16 +2550,19 @@ def build_dsv4_kernel(
                         fx.Int32(bo.buffer_load(r_idx, s * N_KEYS + k_pos, vec_width=1, dtype=T.i32)),
                     )
 
-        def gather_old_kv(s):
+        def gather_old_kv():
             """Each wave copies its KPW keys' shared KV row (HEAD_DIM bf16) into the tile.
             Unwritten slots (-1) are clamped to 0 here and masked in the softmax.
-            The rows are slots within sample ``s``'s own cache slice."""
-            cb = s * CACHE_ROWS * (HEAD_DIM // 2)
+
+            The index list holds ABSOLUTE rows of one cache plane, so there is no
+            per-sample or per-layer term here: whoever owns the pool folds its base
+            into the indices (or hands this layer a view), as a paged runtime must
+            anyway to express a row two sequences share."""
             krows = [fx.max(lds_ld(keys, wave * KPW + jj), fx.Int32(0)) for jj in range(KPW)]
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
                 kv8 = fx.Vector(
-                    bo.buffer_load(r_kv, cb + krows[jj] * (HEAD_DIM // 2) + lane * WPL, vec_width=WPL, dtype=T.i32)
+                    bo.buffer_load(r_kv, krows[jj] * (HEAD_DIM // 2) + lane * WPL, vec_width=WPL, dtype=T.i32)
                 )
                 fx.ptr_store(kv8.bitcast(fx.Float32), ktile + (j * KS + lane * WPL))
 
@@ -2547,17 +2575,20 @@ def build_dsv4_kernel(
             another sample's new row is not in this one's cache and must not be
             patched into its tile. ``kr`` is wave-uniform, so the polls below are
             reached by a whole wave or none of it."""
+            sp = ld_pos(s)
+            w_row = ld_dest(0, s)
+            c_row = (ld_dest(1, s) + sp // CR) if const_expr(CR) else fx.Int32(0)
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
                 kr = lds_ld(keys, j)
-                if kr == fx.Int32(pos0 % window):
+                if kr == w_row:
                     kvp = get2_many([(mb("kvnew"), s * HEAD_DIM + lane * EPL + m * 2) for m in range(WPL)])
                     w = [bf16_pair(a0, a1) for a0, a1 in kvp]
                     fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * WPL))
                 if const_expr(CR):
                     # only a boundary step writes one, and then it is the newest
                     # compressed slot
-                    if ((pos0 + 1) % CR == 0) & (kr == fx.Int32(window + pos0 // CR)):
+                    if ((sp + 1) % CR == 0) & (kr == c_row):
                         cvp = get2_many([(mb("cnew"), s * HEAD_DIM + lane * EPL + m * 2) for m in range(WPL)])
                         w = [bf16_pair(a0, a1) for a0, a1 in cvp]
                         fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * WPL))
@@ -2569,7 +2600,7 @@ def build_dsv4_kernel(
             t = tt % N_SPLIT  # 64-key chunk
             split_keys(t, s)
             gpu.barrier()
-            gather_old_kv(s)  # before waiting for q: these rows are from earlier launches
+            gather_old_kv()  # before waiting for q: these rows are from earlier launches
             hint_wait(
                 H,
                 lambda k: (mb("q"), ((s * H + k) * HEAD_DIM + HEAD_DIM - 2) // 2),
@@ -2708,8 +2739,9 @@ def build_dsv4_kernel(
             # de-rotate the RoPE lanes (inverse rotation: sin negated)
             d0 = doff + dp * 2
             ri = fx.max(d0 - NOPE_DIM, fx.Int32(0)) // 2
-            c = ld_f32(_rsrc(rope_cos), pos0 * (ROPE_DIM // 2) + ri)
-            sn = ld_f32(_rsrc(rope_sin), pos0 * (ROPE_DIM // 2) + ri)
+            sp = ld_pos(s)
+            c = ld_f32(_rsrc(rope_cos), sp * (ROPE_DIM // 2) + ri)
+            sn = ld_f32(_rsrc(rope_sin), sp * (ROPE_DIM // 2) + ri)
             rot = d0 >= NOPE_DIM
             v0 = rot.select(o0 * c + o1 * sn, o0)
             v1 = rot.select(o1 * c - o0 * sn, o1)
@@ -3424,6 +3456,7 @@ def build_dsv4_kernel(
         x_out: Int64,
         cur_pos: Int64,
         kv_cache: Int64,
+        dest_rows: Int64,
         indices: Int64,
         rope_cos: Int64,
         rope_sin: Int64,
@@ -3476,6 +3509,7 @@ def build_dsv4_kernel(
             x_out,
             cur_pos,
             kv_cache,
+            dest_rows,
             indices,
             rope_cos,
             rope_sin,

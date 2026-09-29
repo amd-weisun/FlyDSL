@@ -161,7 +161,7 @@ class Dsv4MoeLayer:
         words = self.scratch[off : off + n * 8].view(torch.int32).view(n, 2)[:, 0].contiguous()
         return words.view(dtype).view(shape)
 
-    def forward(self, h, cur_pos, kv_cache, indices, cos, sin, x_out=None, layer=0, advance=True):
+    def forward(self, h, cur_pos, kv_cache, dest_rows, indices, cos, sin, x_out=None, layer=0, advance=True):
         """One layer.  Mailbox epochs are ``step * 128 + layer + 1``: layers sharing
         this scratch within a decode step need distinct ``layer``; call
         ``advance_step`` (or pass ``advance=True``) once per step.  Both are
@@ -176,13 +176,20 @@ class Dsv4MoeLayer:
         hshape = (self.S, cfg.hidden) if cfg.hc_mult == 1 else (self.S, cfg.hc_mult, cfg.hidden)
         if tuple(h.shape) != hshape:
             raise ValueError(f"h must be {hshape}, got {tuple(h.shape)}")
-        if tuple(kv_cache.shape) != (self.S, cfg.cache_rows, cfg.head_dim):
+        if kv_cache.ndim != 2 or kv_cache.shape[1] != cfg.head_dim:
             raise ValueError(
-                f"kv_cache must be {(self.S, cfg.cache_rows, cfg.head_dim)} -- one slice per "
-                f"sequence in the batch -- got {tuple(kv_cache.shape)}"
+                f"kv_cache must be one plane [rows, {cfg.head_dim}], got {tuple(kv_cache.shape)} -- "
+                "which rows a sequence owns is the caller's, supplied through indices and dest_rows"
             )
+        if tuple(dest_rows.shape) != (2, self.S):
+            raise ValueError(f"dest_rows must be {(2, self.S)}, got {tuple(dest_rows.shape)}")
         if tuple(indices.shape) != (self.S, cfg.n_keys):
             raise ValueError(f"indices must be {(self.S, cfg.n_keys)}, got {tuple(indices.shape)}")
+        if cur_pos.numel() != self.S:
+            raise ValueError(
+                f"cur_pos must hold one position per sample ({self.S}), got {cur_pos.numel()} -- "
+                "the samples are independent sequences, each at its own offset"
+            )
         t = dict(self.W.t, **self.packed)
         if x_out is None:
             x_out = torch.empty(*hshape, dtype=torch.bfloat16, device=h.device)
@@ -192,6 +199,7 @@ class Dsv4MoeLayer:
             p(x_out),
             p(cur_pos),
             p(kv_cache),
+            p(dest_rows),
             p(indices),
             p(cos),
             p(sin),

@@ -25,6 +25,7 @@ from kernels.dsv4_moe_layer.config import MoeMode, moe_format
 from kernels.dsv4_moe_layer.reference import (
     V4Config,
     compress_step,
+    contiguous_pool,
     fp8_mats,
     golden_layer,
     indexer_step,
@@ -167,12 +168,12 @@ def test_v4_layer_matches_deepseek_reference(steps):
     _load_oracle_weights(attn, moe, W, cfg, moe_format(MoeMode.W8A16).weight)
 
     cos, sin = rope_table(256, theta=cfg.rope_theta, device=device)
-    kv_cache = torch.zeros(1, cfg.window, cfg.head_dim, dtype=torch.bfloat16, device=device)
+    kv_cache = torch.zeros(cfg.window, cfg.head_dim, dtype=torch.bfloat16, device=device)
 
     for pos in range(steps):
         h = (0.5 * torch.randn(1, cfg.hidden, device=device)).to(torch.bfloat16)
-        idx = window_idxs(pos, 1, cfg.window, device)
-        res = golden_layer(W, h, pos, kv_cache, idx, cos, sin, lambda z: z, moe_mode=MoeMode.W8A16)
+        idx, dest = contiguous_pool([pos], cfg, device)
+        res = golden_layer(W, h, [pos], kv_cache, dest, idx, cos, sin, lambda z: z, moe_mode=MoeMode.W8A16)
         a_ref, out_ref = _oracle_step(om, attn, moe, h, pos, W.t["g_in"], W.t["g_post"], cfg.eps)
 
         da = (res["a"].float() - a_ref.float()).abs().max().item()
@@ -275,12 +276,12 @@ def test_v4_block_with_hyper_connections_matches_deepseek(steps):
     _load_block_weights(block, W, cfg, moe_format(MoeMode.W8A16).weight)
 
     cos, sin = rope_table(256, theta=cfg.rope_theta, device=device)
-    kv_cache = torch.zeros(1, cfg.window, cfg.head_dim, dtype=torch.bfloat16, device=device)
+    kv_cache = torch.zeros(cfg.window, cfg.head_dim, dtype=torch.bfloat16, device=device)
 
     for pos in range(steps):
         h = (0.5 * torch.randn(1, cfg.hc_mult, cfg.hidden, device=device)).to(torch.bfloat16)
-        idx = window_idxs(pos, 1, cfg.window, device)
-        res = golden_layer(W, h, pos, kv_cache, idx, cos, sin, lambda z: z, moe_mode=MoeMode.W8A16)
+        idx, dest = contiguous_pool([pos], cfg, device)
+        res = golden_layer(W, h, [pos], kv_cache, dest, idx, cos, sin, lambda z: z, moe_mode=MoeMode.W8A16)
         with torch.device(device):
             ids = torch.zeros(1, 1, dtype=torch.long, device=device)
             ref = block(h.unsqueeze(0), pos, ids).squeeze(0)
@@ -313,7 +314,7 @@ def test_v4_hca_compressor_matches_deepseek(steps):
     _load_block_weights(block, W, cfg, moe_format(MoeMode.W8A16).weight)
 
     cos, sin = rope_table(512, theta=cfg.rope_base, device=device)
-    kv_cache = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device)
+    kv_cache = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device)
     kv_state = torch.zeros(1, ratio, cfg.head_dim, device=device)
     score_state = torch.zeros(1, ratio, cfg.head_dim, device=device)
 
@@ -321,12 +322,13 @@ def test_v4_hca_compressor_matches_deepseek(steps):
     near_ties = 0
     for pos in range(steps):
         h = (0.5 * torch.randn(1, cfg.hc_mult, cfg.hidden, device=device)).to(torch.bfloat16)
-        idx = layer_idxs(pos, 1, cfg, device)
+        idx, dest = contiguous_pool([pos], cfg, device)
         res = golden_layer(
             W,
             h,
-            pos,
+            [pos],
             kv_cache,
+            dest,
             idx,
             cos,
             sin,
@@ -419,6 +421,7 @@ def test_v4_compressor_matches_deepseek_directly(ratio):
             cache,
             cos,
             sin,
+            dest_row=cfg.window + pos // ratio,
         )
         with torch.device(device):
             theirs = comp(x.unsqueeze(0), pos)
@@ -492,7 +495,6 @@ def test_v4_indexer_compressor_matches_deepseek():
             head_dim=ihd,
             ape=ape,
             gamma=gamma,
-            base=0,  # the indexer's cache holds compressed entries only
             rotate=True,
         )
         with torch.device(device):
@@ -578,7 +580,9 @@ def test_v4_indexer_matches_deepseek():
             lambda z: z,
         )
         with torch.device(device):
-            theirs = idxr(x.unsqueeze(0), q_a_n.unsqueeze(0), pos, cfg.window)
+            # offset 0: indexer_step now returns compressed ENTRY indices, and
+            # the plane row of entry 0 is the caller's to add (contiguous_pool)
+            theirs = idxr(x.unsqueeze(0), q_a_n.unsqueeze(0), pos, 0)
         n = (pos + 1) // ratio
         if not n:
             assert int((ours >= 0).sum()) == 0, f"pos={pos}: nothing compressed yet"
@@ -628,7 +632,7 @@ def test_v4_csa_layer_matches_deepseek(steps):
 
     cos, sin = rope_table(512, theta=cfg.rope_base, device=device)
     ihd, coff = cfg.index_head_dim, cfg.c_coff
-    kv_cache = torch.zeros(1, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device)
+    kv_cache = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device)
     kv_state = torch.zeros(1, cfg.c_rows, coff * cfg.head_dim, device=device)
     score_state = torch.full((1, cfg.c_rows, coff * cfg.head_dim), float("-inf"), device=device)
     i_cache = torch.zeros(1, cfg.n_compressed, ihd, dtype=torch.bfloat16, device=device)
@@ -638,12 +642,13 @@ def test_v4_csa_layer_matches_deepseek(steps):
     selected, near_ties = 0, 0
     for pos in range(steps):
         h = (0.5 * torch.randn(1, cfg.hc_mult, cfg.hidden, device=device)).to(torch.bfloat16)
-        idx = layer_idxs(pos, 1, cfg, device)
+        idx, dest = contiguous_pool([pos], cfg, device)
         res = golden_layer(
             W,
             h,
-            pos,
+            [pos],
             kv_cache,
+            dest,
             idx,
             cos,
             sin,
@@ -701,7 +706,8 @@ def test_v4_golden_batches_independent_sequences(ratio):
 
     def state(n):
         """The per-sequence buffers golden_layer threads, for a batch of n."""
-        d = dict(kv_cache=torch.zeros(n, cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device))
+        # ONE plane; sample s owns rows [s * cache_rows, (s+1) * cache_rows)
+        d = dict(kv_cache=torch.zeros(n * cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device))
         if not ratio:
             return d
         d |= dict(
@@ -721,12 +727,14 @@ def test_v4_golden_batches_independent_sequences(ratio):
     def run(st, h, pos):
         n = h.shape[0]
         kw = dict(st)
+        idx, dest = contiguous_pool([pos] * n, cfg, device)
         return golden_layer(
             W,
             h,
-            pos,
+            [pos] * n,
             kw.pop("kv_cache"),
-            layer_idxs(pos, n, cfg, device),
+            dest,
+            idx,
             cos,
             sin,
             lambda z: z,
