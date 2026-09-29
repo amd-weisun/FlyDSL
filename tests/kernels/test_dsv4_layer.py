@@ -1583,6 +1583,69 @@ def test_dsv4_compress_schedule_is_the_checkpoints():
         assert list(r) == json.load(open(path))["compress_ratios"], "schedule differs from the config"
 
 
+def test_dsv4_split_merge_spans_the_block():
+    """More key splits than one wave holds, against the golden.
+
+    The flash merge in `uv` gives each split one thread. While they fit in a
+    wave that reduction is register-only; past 64 it has to run over the whole
+    block, and the two paths are selected at trace time, so nothing else in the
+    suite compiles the wide one -- every other shape here has at most 18 splits.
+
+    Overrunning the width is SILENT rather than a crash: the splits above it get
+    no weight, so the softmax simply normalises over a prefix of the keys and the
+    answer is a plausible number that attends to the wrong set. That is why this
+    checks the output against the golden instead of merely that it runs.
+
+    max_seq is the knob: n_keys = window + max_seq // ratio, and 64 splits is
+    4096 keys, so a HCA layer needs more than ~508K of context to get here.
+    """
+    from kernels.dsv4_moe_layer.dsv4_kernel import SPLIT_KEYS
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    torch.manual_seed(0)
+    dev, mode, S = "cuda", MoeMode.W8A8, 1
+    cfg = _cfg()
+    cfg.compress_ratio, cfg.max_seq = COMPRESS_HCA, 655360
+    cfg.validate()
+    splits = cfg.n_keys // SPLIT_KEYS
+    assert splits > 64, f"this shape must exercise the wide path, got {splits} splits"
+
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    layer = Dsv4MoeLayer(W, samples=S, rank=0, npes=1, moe_mode=mode)
+    h = (0.5 * torch.randn(S, cfg.hidden, device=dev)).bfloat16()
+    pos = cfg.max_seq - 1  # every compressed entry live
+    cur = torch.tensor([pos] * S, dtype=torch.int32, device=dev)
+    kv0 = (0.3 * torch.randn(S * cfg.cache_rows, cfg.head_dim, device=dev)).bfloat16()
+    idx, dest = contiguous_pool([pos] * S, cfg, dev)
+    cos, sin = rope_table(cfg.max_seq, theta=cfg.rope_theta, device=dev)
+
+    out = layer.forward(h, cur, kv0.clone(), dest, idx, cos, sin)
+    torch.cuda.synchronize()
+    ref = golden_layer(
+        W,
+        h,
+        [pos] * S,
+        kv0.clone(),
+        dest,
+        idx,
+        cos,
+        sin,
+        lambda z: z,
+        moe_mode=mode,
+        kv_state=torch.zeros(S, cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev),
+        score_state=torch.full(
+            (S, cfg.c_rows, cfg.c_coff * cfg.head_dim), float("-inf"), device=dev
+        ),
+        cos_c=cos,
+        sin_c=sin,
+    )
+
+    a_out, b_out = out.float(), ref["x_out"].float()
+    assert torch.isfinite(a_out).all(), "the wide merge produced non-finite output"
+    rel_l2 = ((a_out - b_out).norm() / b_out.norm()).item()
+    assert rel_l2 < _tol(OUT_REL_L2, cfg.hc_mult, 1), f"x_out diverged: rel_l2 {rel_l2:.5f}"
+
+
 @pytest.mark.parametrize("n_layers", [4])
 def test_dsv4_alternating_stack_matches_golden(n_layers):
     """A stack whose attention variant changes per layer, against the golden.

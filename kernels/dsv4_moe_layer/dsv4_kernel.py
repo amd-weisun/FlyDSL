@@ -722,19 +722,19 @@ def build_dsv4_kernel(
     )
     assert N_KEYS % SPLIT_KEYS == 0, "the index list must be a whole number of key tiles"
     N_SPLIT = N_KEYS // SPLIT_KEYS
-    # The flash merge in `uv` gives each split ONE LANE of one wave: wave 0
-    # computes every split's exp(m - M)/L into misc[split], and the merge then
-    # reads misc[0 .. N_SPLIT). Past 64 splits the lanes run out, so the splits
-    # above 64 get no weight, the softmax normalises over a prefix, and the read
-    # runs past misc -- NaN at every position, silently. Reject it here.
-    # This binds the context: n_keys <= 4096, so HCA (whose key list grows with
-    # the sequence) tops out near max_seq 508K, while CSA is unaffected at any
-    # length because index_topk pins its n_keys at 1152.
+    # The flash merge in `uv` gives each split ONE THREAD, which computes that
+    # split's exp(m - M)/L into misc[split]; the merge then reads
+    # misc[0 .. N_SPLIT). Run it over a single wave while the splits fit in one
+    # (the reduction is then register-only, no LDS and no barrier) and over the
+    # whole block past that. Overrunning it is silent -- the splits above the
+    # width get no weight, the softmax normalises over a prefix, and the read
+    # runs past misc -- so it is asserted rather than left to NaN.
+    UV_WIDE = N_SPLIT > THREADS // WAVES
     # Largest chunk up to 8 that divides the split count: bounds how many
     # per-split words the `uv` merge holds live at once (see the loop below).
     UV_CHUNK = max(c for c in range(1, 9) if N_SPLIT % c == 0)
-    assert N_SPLIT <= THREADS // WAVES, (
-        f"{N_SPLIT} key splits needs a block-wide merge in `uv`; one wave holds {THREADS // WAVES}. "
+    assert N_SPLIT <= THREADS, (
+        f"{N_SPLIT} key splits exceeds the {THREADS} threads the block-wide `uv` merge has. "
         f"n_keys {N_KEYS} = window {window} + the compressed list, so this is a max_seq limit"
     )
     N_QB = H * HEAD_DIM // Q_B_TILE
@@ -1183,6 +1183,17 @@ def build_dsv4_kernel(
                 tots.append(t)
             gpu.barrier()
             return tots
+
+        def block_max(v):
+            w = wave_max(v)
+            if lane == 0:
+                lds_st(red, wave, w)
+            gpu.barrier()
+            t = lds_ld(red, 0)
+            for i in range_constexpr(1, WAVES):
+                t = fx.max(t, lds_ld(red, i))
+            gpu.barrier()
+            return t
 
         def block_sum(v):
             w = wave_sum(v)
@@ -2741,18 +2752,29 @@ def build_dsv4_kernel(
             pre_poll(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head))
             stamp("uv", tt, 5)
             dp = fx.min(tid, UV_PAIRS - 1)  # dim pair within this tile
-            spi = fx.min(lane, N_SPLIT - 1)
+            # which thread owns a split: a lane of wave 0 while they fit in one
+            # wave, otherwise one thread of the whole block
+            sp_id = tid if UV_WIDE else lane
+            spi = fx.min(sp_id, N_SPLIT - 1)  # clamped so the spare threads read a real slot
             ml = (s * N_SPLIT + spi) * H + head
             got = poll([(mb("sp_m"), ml, 1), (mb("sp_l"), ml, 1)], batch=2)
-            if wave == 0:  # per-split weights exp(m - M) / L for this head -> misc[sp]
-                ok_sp = lane < N_SPLIT
-                m_sp = ok_sp.select(got[0][0].bitcast(fx.Float32), fx.Float32(NEG))
-                l_sp = ok_sp.select(got[1][0].bitcast(fx.Float32), fx.Float32(0.0))
-                mx = wave_max(m_sp)
+            # per-split weights exp(m - M) / L for this head -> misc[split]
+            ok_sp = sp_id < N_SPLIT
+            m_sp = ok_sp.select(got[0][0].bitcast(fx.Float32), fx.Float32(NEG))
+            l_sp = ok_sp.select(got[1][0].bitcast(fx.Float32), fx.Float32(0.0))
+            if UV_WIDE:  # trace-time: a plain Python bool, not a traced value
+                mx = block_max(m_sp)
                 w_sp = _exp(m_sp - mx)
-                den = wave_sum(l_sp * w_sp) + _exp(sink - mx)
+                den = block_sum(l_sp * w_sp) + _exp(sink - mx)
                 if ok_sp:
-                    lds_st(misc, lane, w_sp * _rcp(den))
+                    lds_st(misc, sp_id, w_sp * _rcp(den))
+            else:
+                if wave == 0:
+                    mx = wave_max(m_sp)
+                    w_sp = _exp(m_sp - mx)
+                    den = wave_sum(l_sp * w_sp) + _exp(sink - mx)
+                    if ok_sp:
+                        lds_st(misc, sp_id, w_sp * _rcp(den))
             stamp("uv", tt, 2)
             gpu.barrier()
             # Accumulate the per-split values a CHUNK at a time, in a runtime
