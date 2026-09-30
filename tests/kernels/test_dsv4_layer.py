@@ -28,8 +28,10 @@ from kernels.dsv4_moe_layer.reference import (
     contiguous_pool,
     make_weights,
     dequant,
+    fp4_row_bytes,
     qkv_a_split,
     rmsnorm,
+    unpack_fp4,
     window_idxs,
 )
 from kernels.mla_moe_layer.reference import bf, rope_table
@@ -960,7 +962,7 @@ def test_dsv4_indexer_compressor_in_kernel():
     kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     i_ks = torch.zeros(cfg.c_rows, cfg.c_coff * ihd, device=dev)
     i_ss = torch.full((cfg.c_rows, cfg.c_coff * ihd), float("-inf"), device=dev)
-    i_ref = torch.zeros(cfg.n_compressed, ihd, dtype=torch.bfloat16, device=dev)
+    i_ref = torch.zeros(cfg.n_compressed, fp4_row_bytes(ihd), dtype=torch.uint8, device=dev)
     dq = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
     cut = qkv_a_split(cfg)
 
@@ -995,7 +997,7 @@ def test_dsv4_indexer_compressor_in_kernel():
             continue
         emitted += 1
         slot = pos // ratio
-        a, b = layer.i_cache[0, slot].float(), i_ref[slot].float()
+        a, b = unpack_fp4(layer.i_cache[0, slot]), unpack_fp4(i_ref[slot])
         # FP4's levels are coarse enough that a last-bit difference upstream moves
         # one element a whole step; bound the bulk and the count instead of the max,
         # as the attention compressor's test does.
@@ -1097,7 +1099,7 @@ def test_dsv4_indexer_scoring_in_kernel():
     kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     i_ks = torch.zeros(cfg.c_rows, cfg.c_coff * ihd, device=dev)
     i_ss = torch.full((cfg.c_rows, cfg.c_coff * ihd), float("-inf"), device=dev)
-    i_ref = torch.zeros(cfg.n_compressed, ihd, dtype=torch.bfloat16, device=dev)
+    i_ref = torch.zeros(cfg.n_compressed, fp4_row_bytes(ihd), dtype=torch.uint8, device=dev)
     dq_qkv = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
     dq_iqb = dequant(t["w_i_q_b"], t["s_i_q_b"], 128)
     cut = qkv_a_split(cfg)
@@ -1141,7 +1143,7 @@ def test_dsv4_indexer_scoring_in_kernel():
             assert bool((got < 0).all()), f"pos={pos}: nothing compressed, nothing scorable"
             continue
         scored += 1
-        ref = (torch.einsum("hd,td->ht", q, i_ref[:n].float()).relu() * w.view(ih, 1)).sum(0)
+        ref = (torch.einsum("hd,td->ht", q, unpack_fp4(i_ref[:n])).relu() * w.view(ih, 1)).sum(0)
         a, b = got[:n], ref
         rel = ((a - b).norm() / max(b.norm().item(), 1e-6)).item()
         assert rel < 2e-2, f"pos={pos} score rel_l2 {rel:.5f}"
@@ -1235,7 +1237,7 @@ def _indexer_score_rank(rank, npes, port, results):
             if not n:
                 continue
             scored += 1
-            kcache = layer.i_cache[0, :n].float()
+            kcache = unpack_fp4(layer.i_cache[0, :n])
             part = (torch.einsum("hd,td->ht", q, kcache).relu() * w.view(ih, 1)).sum(0)
             parts = [torch.empty_like(part.cpu()) for _ in range(npes)]
             dist.all_gather(parts, part.cpu().contiguous())
@@ -1296,7 +1298,7 @@ def test_dsv4_indexer_topk_in_kernel():
     kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
     i_ks = torch.zeros(cfg.c_rows, cfg.c_coff * ihd, device=dev)
     i_ss = torch.full((cfg.c_rows, cfg.c_coff * ihd), float("-inf"), device=dev)
-    i_ref = torch.zeros(cfg.n_compressed, ihd, dtype=torch.bfloat16, device=dev)
+    i_ref = torch.zeros(cfg.n_compressed, fp4_row_bytes(ihd), dtype=torch.uint8, device=dev)
     dq_qkv = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
     cut = qkv_a_split(cfg)
 
@@ -1641,7 +1643,7 @@ def test_dsv4_state_slots_place_the_rolling_state():
             layer.score_state = torch.randn(pool, cfg.c_rows, coff * cfg.head_dim, device=dev)
             layer.i_kv_state = torch.randn(pool, cfg.c_rows, coff * ihd, device=dev)
             layer.i_score_state = torch.randn(pool, cfg.c_rows, coff * ihd, device=dev)
-            layer.i_cache = torch.randn(pool, cfg.n_compressed, ihd, device=dev).bfloat16()
+            layer.i_cache = torch.randint(0, 256, (pool, cfg.n_compressed, fp4_row_bytes(ihd)), device=dev).byte()
             for sl in slots:
                 layer.kv_state[sl] = 0
                 layer.score_state[sl] = float("-inf")
@@ -1831,7 +1833,7 @@ def test_dsv4_alternating_stack_matches_golden(n_layers):
                 st |= dict(
                     i_state=torch.zeros(S, c.c_rows, coff * ihd, device=dev),
                     i_score_state=torch.full((S, c.c_rows, coff * ihd), float("-inf"), device=dev),
-                    i_cache=torch.zeros(S, c.n_compressed, ihd, dtype=torch.bfloat16, device=dev),
+                    i_cache=torch.zeros(S, c.n_compressed, fp4_row_bytes(ihd), dtype=torch.uint8, device=dev),
                 )
             st_all.append(st)
         return st_all

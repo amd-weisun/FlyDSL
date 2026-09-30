@@ -384,11 +384,11 @@ def hadamard(x: torch.Tensor) -> torch.Tensor:
     return (y * n**-0.5).reshape(x.shape)
 
 
-def quant_dequant_fp4(x: torch.Tensor, block: int = FP4_BLOCK) -> torch.Tensor:
-    """FP4 (e2m1) round trip in blocks of ``block``, with power-of-2 scales.
+def _fp4_quant(x: torch.Tensor, block: int):
+    """Blocked e2m1 quantization: (sign, level index, power-of-2 exponent).
 
-    Unlike the FP8 path, the scale is rounded UP to a power of two, so it is
-    exact in the exponent and costs no mantissa. Ties round to the even code.
+    ``x`` [..., n] -> sign and index [..., n // block, block], exponent
+    [..., n // block, 1]; the value is ``sign * FP4_LEVELS[index] * 2**e``.
     """
     n = x.shape[-1]
     xb = x.float().reshape(*x.shape[:-1], n // block, block)
@@ -396,14 +396,55 @@ def quant_dequant_fp4(x: torch.Tensor, block: int = FP4_BLOCK) -> torch.Tensor:
     # ceil(log2(amax / FP4_MAX)) by exponent arithmetic, as the model does
     bits = (amax / FP4_MAX).view(torch.int32)
     e = ((bits >> 23) & 0xFF) - 127 + ((bits & ((1 << 23) - 1)) != 0).to(torch.int32)
-    s = torch.ldexp(torch.ones_like(amax), e)
-    q = (xb / s).clamp(-FP4_MAX, FP4_MAX)
+    q = (xb / torch.ldexp(torch.ones_like(amax), e)).clamp(-FP4_MAX, FP4_MAX)
     lv = torch.tensor(FP4_LEVELS, device=x.device, dtype=torch.float32)
     mid = (lv[1:] + lv[:-1]) / 2
     mag = q.abs()
     down, up = torch.bucketize(mag, mid, right=False), torch.bucketize(mag, mid, right=True)
     idx = torch.where(up != down, torch.where(down % 2 == 0, down, up), down)
-    return (torch.sign(q) * lv[idx] * s).reshape(x.shape).to(x.dtype)
+    return torch.sign(q), idx, e
+
+
+def quant_dequant_fp4(x: torch.Tensor, block: int = FP4_BLOCK) -> torch.Tensor:
+    """FP4 (e2m1) round trip in blocks of ``block``, with power-of-2 scales.
+
+    Unlike the FP8 path, the scale is rounded UP to a power of two, so it is
+    exact in the exponent and costs no mantissa. Ties round to the even code.
+    """
+    sign, idx, e = _fp4_quant(x, block)
+    lv = torch.tensor(FP4_LEVELS, device=x.device, dtype=torch.float32)
+    return (sign * torch.ldexp(lv[idx], e)).reshape(x.shape).to(x.dtype)
+
+
+def fp4_row_bytes(n: int) -> int:
+    """Bytes of one ``pack_fp4`` row of ``n`` elements: codes, then scales."""
+    return n // 2 + n // FP4_BLOCK
+
+
+def pack_fp4(x: torch.Tensor) -> torch.Tensor:
+    """``quant_dequant_fp4``'s result, stored: [..., n] -> uint8 [..., fp4_row_bytes(n)].
+
+    The indexer's key cache format. Element ``i`` is the e2m1 code (sign in bit 3,
+    level index below it) in the low nibble of byte ``i // 2`` when ``i`` is even
+    and the high nibble when odd; then one e8m0 byte (``e + 127``) per
+    ``FP4_BLOCK`` elements. Lossless: ``unpack_fp4(pack_fp4(x))`` equals
+    ``quant_dequant_fp4(x)``. A zero is stored as +0.
+    """
+    sign, idx, e = _fp4_quant(x, FP4_BLOCK)
+    code = (idx | ((sign < 0).to(idx.dtype) << 3)).reshape(*x.shape[:-1], -1, 2)
+    codes = (code[..., 0] | (code[..., 1] << 4)).to(torch.uint8)
+    return torch.cat([codes, (e[..., 0] + 127).to(torch.uint8)], dim=-1)
+
+
+def unpack_fp4(p: torch.Tensor) -> torch.Tensor:
+    """``pack_fp4``'s rows [..., fp4_row_bytes(n)] back to float32 [..., n]."""
+    n = p.shape[-1] * 2 * FP4_BLOCK // (FP4_BLOCK + 2)
+    b = p[..., : n // 2].long()
+    code = torch.stack([b & 0xF, b >> 4], dim=-1).reshape(*p.shape[:-1], n // FP4_BLOCK, FP4_BLOCK)
+    lv = torch.tensor(FP4_LEVELS, device=p.device, dtype=torch.float32)
+    v = torch.where(code >= 8, -1.0, 1.0) * lv[code & 7]
+    e = p[..., n // 2 :].long() - 127
+    return torch.ldexp(v, e[..., None]).reshape(*p.shape[:-1], n)
 
 
 def hc_split_sinkhorn(mixes: torch.Tensor, scale, base, cfg: V4Config):
@@ -521,8 +562,14 @@ def compress_step(
     # load-bearing: the model rotates a bf16 tensor and its transform casts back
     # before quantizing, so FP4 sees bf16 -- staying in fp32 here moves elements
     # that sit near a level boundary by a whole FP4 step.
-    v = quant_dequant_fp4(bf(hadamard(v))) if rotate else torch.cat([quant_dequant(v[:-rd], 64), v[-rd:]])
-    cache[cur_pos // r if dest_row is None else dest_row] = v.to(torch.bfloat16)
+    row = cur_pos // r if dest_row is None else dest_row
+    if rotate:
+        # the indexer's cache holds the FP4 codes themselves, not their values
+        v = bf(hadamard(v))
+        cache[row] = pack_fp4(v)
+        return quant_dequant_fp4(v)
+    v = torch.cat([quant_dequant(v[:-rd], 64), v[-rd:]])
+    cache[row] = v.to(torch.bfloat16)
     return v
 
 
@@ -567,7 +614,7 @@ def indexer_step(x, q_a_n, i_kv, i_gate, cur_pos, cfg, t, i_state, i_score_state
     n = (cur_pos + 1) // r  # compressed entries written so far
     out = torch.full((cfg.n_index,), -1, dtype=torch.int32, device=x.device)
     if n:
-        score = torch.einsum("hd,td->ht", q, i_cache[:n].float())
+        score = torch.einsum("hd,td->ht", q, unpack_fp4(i_cache[:n]))
         score = allreduce((score.relu() * w.view(ih, 1)).sum(dim=0))
         k = min(cfg.index_topk, n)
         out[:k] = score.topk(k)[1].to(torch.int32)

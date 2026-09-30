@@ -369,7 +369,8 @@ FP4_MAX = 6.0
 
 
 def _fp4_roundtrip(a, b):
-    """f32 pair -> E2M1 -> f32 pair (inputs already scaled into range).
+    """f32 pair -> E2M1 -> f32 pair (inputs already scaled into range), plus the
+    codes themselves: ``a`` in the low nibble of the returned word, ``b`` above it.
 
     The scale operand is 1.0 and the scaling is done in f32 around this, as
     ``_fp8_to_bf16x8`` does: the hardware honours only the scale's exponent, and
@@ -380,7 +381,7 @@ def _fp4_roundtrip(a, b):
     word = fx.Int32(rocdl.cvt_scalef32_pk_fp4_f32(T.i32, as_ir_value(fx.Int32(0)), a, b, one, 0))
     v2 = fx.Vector.make_type(2, fx.Float32)
     out = fx.Vector(rocdl.cvt_scalef32_pk_f32_fp4(res=v2, src=as_ir_value(word), scale=one, src_sel_index=0))
-    return out[0], out[1]
+    return out[0], out[1], word
 
 
 def _pow2_ceil(x):
@@ -681,6 +682,9 @@ def build_dsv4_kernel(
     # indexer" and compiles the whole thing out.
     IHD = index_head_dim
     IW = C_COFF * IHD
+    # its key cache row, in dwords: IHD FP4 codes, then one e8m0 scale byte per
+    # 32-element block (reference.pack_fp4's format)
+    IC_ROW_W = (IHD // 2 + IHD // 32) // 4
     CW = C_COFF * HEAD_DIM  # width of one state row
     C_ROWS = C_COFF * CR  # rows of state
     OVERLAP = C_COFF > 1
@@ -2181,14 +2185,17 @@ def build_dsv4_kernel(
             return v0 * sc, v1 * sc
 
         def fp4_block(v):
-            """FP4 round trip over aligned 32-lane blocks, power-of-two scale."""
+            """FP4 round trip over aligned 32-lane blocks, power-of-two scale.
+
+            Returns (value, the lane's E2M1 code, the block's scale).
+            """
             amax = fmath.absf(v)
             for off in (16, 8, 4, 2, 1):
                 amax = _xred(amax, off, fx.max)
             sc = _pow2_ceil(fx.max(amax, fx.Float32(FP4_MAX * 2.0**-126)) * (1.0 / FP4_MAX))
             q = fx.min(fx.max(v * _rcp(sc), -FP4_MAX), FP4_MAX)
-            d, _ = _fp4_roundtrip(q, fx.Float32(0.0))
-            return d * sc
+            d, _, word = _fp4_roundtrip(q, fx.Float32(0.0))
+            return d * sc, word & 0xF, sc
 
         # ========== 2c. the indexer's compressor: same pooling, different tail
         # Half the head_dim, and it finishes with a Hadamard rotation over the whole
@@ -2208,7 +2215,7 @@ def build_dsv4_kernel(
                 ilive = wave == 0
                 p = ld_pos(tt)  # tt is the sample: its own sequence, its own position
                 isb = ld_slot(tt, st_i)  # this sequence's slice of the rolling state
-                icb = ld_slot(tt, st_ic)  # ... and of the indexer's key cache
+                icb = ld_slot(tt, st_ic) // 4  # ... and of the indexer's key cache
                 slot = p % CR
                 chs = [ln, ln + 64]
                 ap0 = [[ld_f32(_rsrc(i_ape), slot * IW + j * IHD + c) for j in range(C_COFF)] for c in chs]
@@ -2269,12 +2276,24 @@ def build_dsv4_kernel(
                     nv[1] = bf16_round(even.select(nv[1] * rc - partner * rs2, partner * rs2 + nv[1] * rc))
                     h0, h1 = had_pair(nv[0], nv[1], ln)
                     q0, q1 = bf16_round(h0), bf16_round(h1)
-                    o0, o1 = fp4_block(q0), fp4_block(q1)
+                    (o0, k0, s0), (o1, k1, s1) = fp4_block(q0), fp4_block(q1)
+                    # The cache keeps the codes, not their values: eight lanes' codes
+                    # OR into one word (channel 8w + j in nibble j), and the four
+                    # blocks' exponents into the row's last word, block b in byte b.
+                    cw = [k0 << ((ln % 8) * 4), k1 << ((ln % 8) * 4)]
+                    for off in (1, 2, 4):
+                        cw = [_xred(w, off, lambda a, b: a | b) for w in cw]
+                    e8 = [(sc.bitcast(fx.Int32) >> 23) & 0xFF for sc in (s0, s1)]
+                    sw = (e8[0] << ((ln // 32) * 8)) | (e8[1] << ((ln // 32 + 2) * 8))
+                    sw = _xred(sw, 32, lambda a, b: a | b)
                     if ilive:
                         r_ic = _rsrc(i_cache)
-                        row = icb + (p // CR) * IHD
-                        bo.buffer_store(bf16_round(o0).to(fx.BFloat16), r_ic, row + ln)
-                        bo.buffer_store(bf16_round(o1).to(fx.BFloat16), r_ic, row + ln + 64)
+                        row = icb + (p // CR) * IC_ROW_W
+                        if ln % 8 == 0:
+                            bo.buffer_store(cw[0], r_ic, row + ln // 8)
+                            bo.buffer_store(cw[1], r_ic, row + ln // 8 + IHD // 16)
+                        if ln == 0:
+                            bo.buffer_store(sw, r_ic, row + IHD // 8)
                         put(mb("i_cnew"), tt * IHD + ln, bf16_round(o0))
                         put(mb("i_cnew"), tt * IHD + ln + 64, bf16_round(o1))
                     if const_expr(OVERLAP):
@@ -2393,7 +2412,7 @@ def build_dsv4_kernel(
                     v[1] = bf16_round(even.select(v[1] * rc - partner * rs2, partner * rs2 + v[1] * rc))
                     v[0] = bf16_round(v[0])
                     h0, h1 = had_pair(v[0], v[1], ln)
-                    o0, o1 = fp4_block(bf16_round(h0)), fp4_block(bf16_round(h1))
+                    o0, o1 = fp4_block(bf16_round(h0))[0], fp4_block(bf16_round(h1))[0]
                     put(mb("i_q"), base_i + chs[0], o0)
                     put(mb("i_q"), base_i + chs[1], o1)
                 stamp("i_q", tt, 4)
@@ -2491,47 +2510,51 @@ def build_dsv4_kernel(
                 # ONCE, outside the loop below -- `s` is loop-invariant, and adding
                 # it per iteration would put another live value in the body that
                 # was just trimmed to stop it spilling.
-                icb = ld_slot(s, st_ic) // 2
+                icb = ld_slot(s, st_ic) // 4
                 # the entry this launch just wrote is not reliably visible in the
                 # cache yet, so take it from the mailbox instead. The outer test is
                 # CTA-uniform, so every thread reaches the poll; only the thread
                 # holding that candidate uses the value.
                 is_new = c == sp // CR
-                # A RUNTIME loop, not range_constexpr. Unrolled, the compiler hoists
-                # all IHD / 8 key loads and every query read to the top of the stage;
-                # that is ~130 values more than the budget, so it spilled them and
-                # then fed the FMAs back one scratch load and one full vmcnt wait at
-                # a time -- 274 us of stall to do 1024 FMAs. Carrying the
-                # accumulators keeps a single iteration live and the spills go away.
-                for _d0, acc in range(
+                crow = icb + fx.min(c, N_COMP - 1) * IC_ROW_W
+                # the row's four block exponents, one byte each
+                e8s = fx.Int32(bo.buffer_load(r_ic2, crow + IHD // 8, vec_width=1, dtype=T.i32))
+                # A RUNTIME loop, not range_constexpr, one 32-element scale block
+                # per trip. Unrolled, the compiler hoists every key load and query
+                # read to the top of the stage; that is ~130 values more than the
+                # budget, so it spilled them and then fed the FMAs back one scratch
+                # load and one full vmcnt wait at a time -- 274 us of stall to do
+                # 1024 FMAs. Carrying the accumulators keeps one trip live.
+                f32_one = as_ir_value(fx.Float32(1.0))
+                f32x2 = fx.Vector.make_type(2, fx.Float32)
+                for _b, acc in range(
                     0,
-                    IHD // 8,
+                    IHD // 32,
                     fx.Int32(1),
                     init=[fx.Float32(0.0) for _ in range(IH)],
                 ):
-                    d0 = fx.Int32(_d0)
-                    kw = [
-                        v
-                        for v in fx.Vector(
-                            bo.buffer_load(
-                                r_ic2,
-                                icb + fx.min(c, N_COMP - 1) * (IHD // 2) + d0 * 4,
-                                vec_width=4,
-                                dtype=T.i32,
+                    kb = fx.Int32(_b)
+                    kwords = fx.Vector(bo.buffer_load(r_ic2, crow + kb * 4, vec_width=4, dtype=T.i32))
+                    kw = []
+                    for wi in range_constexpr(4):
+                        for sel in range_constexpr(4):
+                            pr = fx.Vector(
+                                rocdl.cvt_scalef32_pk_f32_fp4(
+                                    res=f32x2, src=as_ir_value(kwords[wi]), scale=f32_one, src_sel_index=sel
+                                )
                             )
-                        )
-                        .bitcast(fx.BFloat16)
-                        .to(fx.Float32)
-                    ]
+                            kw += [pr[0], pr[1]]
+                    # the scale goes on the block's partial sums, not on every code
+                    bsc = (((e8s >> (kb * 8)) & 0xFF) << 23).bitcast(fx.Float32)
                     if (sp + 1) % CR == 0:
-                        nv = [getf(mb("i_cnew"), s * IHD + d0 * 8 + e) for e in range(8)]
-                        kw = [is_new.select(nv[e], kw[e]) for e in range(8)]
-                    accs = [fx.Float32(acc[hh]) for hh in range(IH)]
-                    for e in range_constexpr(8):
-                        kv = kw[e]
+                        nv = [getf(mb("i_cnew"), s * IHD + kb * 32 + e) for e in range(32)]
+                        kw = [is_new.select(nv[e], kw[e]) for e in range(32)]
+                        bsc = is_new.select(fx.Float32(1.0), bsc)
+                    kpart = [fx.Float32(0.0) for _ in range(IH)]
+                    for e in range_constexpr(32):
                         for hh in range_constexpr(IH):
-                            accs[hh] = accs[hh] + kv * lds_ld(xs, hh * IHD + d0 * 8 + e)
-                    res = yield accs
+                            kpart[hh] = kpart[hh] + kw[e] * lds_ld(xs, hh * IHD + kb * 32 + e)
+                    res = yield [fx.Float32(acc[hh]) + kpart[hh] * bsc for hh in range(IH)]
                 sc_t = fx.Float32(0.0)
                 for hh in range_constexpr(IH):
                     sc_t = sc_t + fx.max(fx.Float32(res[hh]), fx.Float32(0.0)) * wv[hh]

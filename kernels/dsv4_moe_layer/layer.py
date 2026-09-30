@@ -22,7 +22,7 @@ from kernels.dsv4_moe_layer.dsv4_kernel import (
     stage_tasks,
 )
 from kernels.dsv4_moe_layer.packing import pack_layer_weights
-from kernels.dsv4_moe_layer.reference import LayerWeights
+from kernels.dsv4_moe_layer.reference import LayerWeights, fp4_row_bytes
 from kernels.mla_moe_layer.runtime import SymmetricPeerBuffer
 
 __all__ = ["MoeMode", "Dsv4MoeLayer", "Dsv4Variant", "shape_dims"]
@@ -246,8 +246,10 @@ class Dsv4MoeLayer:
             ishape = (samples, cfg.c_rows, cfg.c_coff * cfg.index_head_dim)
             self.i_kv_state = torch.zeros(*ishape, dtype=torch.float32, device=dev)
             self.i_score_state = torch.full(ishape, float("-inf"), dtype=torch.float32, device=dev)
-            # the indexer's cache holds compressed entries only, no window half
-            self.i_cache = torch.zeros(samples, cfg.n_compressed, cfg.index_head_dim, dtype=torch.bfloat16, device=dev)
+            # the indexer's cache holds compressed entries only, no window half,
+            # as packed FP4 rows (reference.pack_fp4)
+            row = fp4_row_bytes(cfg.index_head_dim)
+            self.i_cache = torch.zeros(samples, cfg.n_compressed, row, dtype=torch.uint8, device=dev)
         else:
             self.i_kv_state = self.i_score_state = self.i_cache = torch.zeros(1, device=dev)
         if cfg.compress_ratio:

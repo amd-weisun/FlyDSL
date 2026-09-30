@@ -26,13 +26,17 @@ from kernels.dsv4_moe_layer.reference import (
     V4Config,
     compress_step,
     contiguous_pool,
+    fp4_row_bytes,
     fp8_mats,
     golden_layer,
     indexer_step,
     layer_idxs,
     make_weights,
+    pack_fp4,
     qkv_a_split,
+    quant_dequant_fp4,
     rmsnorm,
+    unpack_fp4,
     window_idxs,
 )
 from kernels.mla_moe_layer.reference import bf, dequant, dequant_expert, rope_table
@@ -474,7 +478,7 @@ def test_v4_indexer_compressor_matches_deepseek():
         comp.norm.weight.copy_(gamma.float())
 
     cos, sin = rope_table(512, theta=cfg.compress_rope_theta, device=device)
-    cache = torch.zeros(n_comp, ihd, dtype=torch.bfloat16, device=device)
+    cache = torch.zeros(n_comp, fp4_row_bytes(ihd), dtype=torch.uint8, device=device)
     kv_state = torch.zeros(cfg.c_rows, coff * ihd, device=device)
     score_state = torch.full((cfg.c_rows, coff * ihd), float("-inf"), device=device)
 
@@ -508,6 +512,35 @@ def test_v4_indexer_compressor_matches_deepseek():
         assert d < 2e-2 * scale, f"pos={pos} indexer compressed entry differs: {d / scale:.5f}"
 
     assert emitted >= 4, f"expected several compressed entries, got {emitted}"
+
+
+def test_v4_indexer_cache_packs_fp4_losslessly():
+    """The indexer's key cache stores FP4 codes plus e8m0 block scales, not values.
+
+    Two things are pinned. The round trip: what the packed row decodes to is
+    exactly ``quant_dequant_fp4``, so the format loses nothing the quantizer
+    had not already dropped -- across block scales from tiny to large, with
+    zeros and signs. And the byte layout itself, which the kernel writes and
+    decodes on its own: a round trip alone would pass with the nibble order or
+    the scale bias swapped consistently on both host sides.
+    """
+    torch.manual_seed(0)
+    n = 128
+    x = torch.randn(64, n) * torch.logspace(-20, 12, 64, base=2.0)[:, None]
+    x[5] = 0  # a zero row: the clamp's smallest scale
+    x[6, 32:64] = 0  # one zero block among live ones
+    p = pack_fp4(x)
+    assert p.dtype == torch.uint8 and p.shape == (64, fp4_row_bytes(n)) == (64, 68)
+    assert torch.equal(unpack_fp4(p), quant_dequant_fp4(x))
+
+    # element i in nibble i % 2 of byte i // 2, sign in bit 3; one e8m0 per 32
+    y = torch.zeros(n)
+    y[0], y[1], y[2], y[33] = 6.0, -0.5, -6.0, 3.0  # block 0 scale 1, block 1 scale 0.5
+    q = pack_fp4(y)
+    assert q[0].item() == 0x7 | (0x9 << 4), f"byte 0 {q[0].item():#x}"
+    assert q[1].item() == 0xF, f"byte 1 {q[1].item():#x}"
+    assert q[16].item() == 0x7 << 4, f"byte 16 {q[16].item():#x}"
+    assert q[64:].tolist() == [127, 126, 1, 1], q[64:].tolist()
 
 
 def test_v4_indexer_matches_deepseek():
@@ -554,7 +587,7 @@ def test_v4_indexer_matches_deepseek():
         idxr.weights_proj.weight.copy_(t["i_w"])
 
     cos, sin = rope_table(512, theta=cfg.rope_base, device=device)
-    i_cache = torch.zeros(cfg.n_compressed, ihd, dtype=torch.bfloat16, device=device)
+    i_cache = torch.zeros(cfg.n_compressed, fp4_row_bytes(ihd), dtype=torch.uint8, device=device)
     i_state = torch.zeros(cfg.c_rows, cfg.c_coff * ihd, device=device)
     i_score = torch.full((cfg.c_rows, cfg.c_coff * ihd), float("-inf"), device=device)
 
@@ -635,7 +668,7 @@ def test_v4_csa_layer_matches_deepseek(steps):
     kv_cache = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=device)
     kv_state = torch.zeros(1, cfg.c_rows, coff * cfg.head_dim, device=device)
     score_state = torch.full((1, cfg.c_rows, coff * cfg.head_dim), float("-inf"), device=device)
-    i_cache = torch.zeros(1, cfg.n_compressed, ihd, dtype=torch.bfloat16, device=device)
+    i_cache = torch.zeros(1, cfg.n_compressed, fp4_row_bytes(ihd), dtype=torch.uint8, device=device)
     i_state = torch.zeros(1, cfg.c_rows, coff * ihd, device=device)
     i_score = torch.full((1, cfg.c_rows, coff * ihd), float("-inf"), device=device)
 
@@ -720,7 +753,7 @@ def test_v4_golden_batches_independent_sequences(ratio):
             d |= dict(
                 i_state=torch.zeros(n, cfg.c_rows, coff * ihd, device=device),
                 i_score_state=torch.full((n, cfg.c_rows, coff * ihd), float("-inf"), device=device),
-                i_cache=torch.zeros(n, cfg.n_compressed, ihd, dtype=torch.bfloat16, device=device),
+                i_cache=torch.zeros(n, cfg.n_compressed, fp4_row_bytes(ihd), dtype=torch.uint8, device=device),
             )
         return d
 
