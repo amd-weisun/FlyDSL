@@ -2527,6 +2527,13 @@ def build_dsv4_kernel(
                 for hh in range_constexpr(IH):
                     sc_t = sc_t + fx.max(fx.Float32(res[hh]), fx.Float32(0.0)) * wv[hh]
                 live = (c < n_live) & (c < N_COMP)
+                # Splits `compute` (the scoring loop) from `epi` (the exchange), and
+                # it is stamped whether or not there IS an exchange: inside the
+                # W > 1 branch a single-rank run left mark 3 unwritten, the report
+                # inherited mark 2 for it, and the whole scoring loop was reported
+                # as epilogue -- which read as 28 us of write overhead that was
+                # really the arithmetic, and sent one round of tuning the wrong way.
+                stamp("i_score", tt, 3)
                 if const_expr(W > 1):
                     # This rank holds only IH of the 64 index heads, so its score is
                     # a PARTIAL sum -- without this exchange the ranks would rank the
@@ -2534,11 +2541,6 @@ def build_dsv4_kernel(
                     # Push to every peer, then sum all ranks' partials in rank order
                     # from our own buffer: same order everywhere, so the totals are
                     # bit-identical and the top-k below cannot disagree.
-                    # mark 3, not 5: the report reads marks 0..4, so this is what
-                    # splits `compute` (the scoring loop) from `epi` (the exchange).
-                    # Stamping outside that range lumped them together.
-                    gpu.barrier()  # TEMP probe fence
-                    stamp("i_score", tt, 3)
                     for p in range_constexpr(W):
                         pv2 = fx.Vector(bo.buffer_load(r_peers, p * 2, vec_width=2, dtype=T.i32))
                         dst = (fx.Int64(_uniform(pv2[1])) << 32) | fx.Int64(fx.Uint32(_uniform(pv2[0])))
