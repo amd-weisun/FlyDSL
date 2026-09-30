@@ -1461,6 +1461,68 @@ def test_dsv4_indexer_topk_spans_many_candidates_per_thread():
     layer.close()
 
 
+def test_dsv4_indexer_topk_spans_several_ctas():
+    """The top-k holds when its candidates are split across CTAs.
+
+    Past a threshold the select runs as several parts on several CTAs, each
+    scanning its own contiguous block of candidates and learning the others'
+    bins through the mailbox. Every other indexer test sits below that
+    threshold and runs as a single part, so none of them executes the exchange
+    at all -- a part that summed only its own bins would pick a different digit
+    from every other part, and they would write over each other.
+
+    The shape is chosen so the live candidates REACH the second part: parts take
+    blocks of THREADS * TK_PER = 2048, so the position has to be deep enough for
+    candidate 2048 to exist, which is what the `reach` assertion pins down. A
+    shorter run leaves part one with nothing live and tests nothing.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+    from kernels.dsv4_moe_layer.dsv4_kernel import n_topk_parts
+
+    torch.manual_seed(0)
+    ratio = COMPRESS_CSA
+    cfg = _cfg(hc_mult=1)
+    cfg.compress_ratio, cfg.max_seq, cfg.index_topk = ratio, 65536, 300
+    assert n_topk_parts(cfg.max_seq, ratio, cfg.index_head_dim) > 1, "shape no longer splits"
+    dev, mode = "cuda", MoeMode.W8A8
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
+    cos, sin = rope_table(65536, theta=cfg.rope_base, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+
+    # 3000 live candidates: parts 0 and 1 hold some, parts 2 and 3 hold NONE.
+    # Both halves matter -- an empty part still has to publish its zeros and
+    # agree on the same threshold, and if it did not it would write over the
+    # others' picks.
+    last = 11999
+    checks = [9000, last]
+    reach = 0
+    for pos in range(last + 1):
+        h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
+        cur = torch.tensor([pos], dtype=torch.int32, device=dev)
+        idx, dest = contiguous_pool([pos], cfg, dev)
+        layer.forward(h, cur, kv_k, dest, idx, cos, sin)
+        if pos not in checks:
+            continue
+        torch.cuda.synchronize()
+        n = (pos + 1) // ratio
+        k = min(cfg.index_topk, n)
+        got = layer.debug("i_sel", (1, cfg.n_keys - cfg.window), torch.int32)[0]
+        sel = got[got >= 0].tolist()
+        assert len(sel) == k, f"pos={pos}: wrote {len(sel)} slots, want {k}"
+        assert len(set(sel)) == k, f"pos={pos}: {k - len(set(sel))} picks collided on a slot"
+        sc = layer.debug("i_score", (1, cfg.n_compressed))[0][:n]
+        srt = sc.sort(descending=True).values
+        margin = (srt[k - 1] - srt[k]).item() if n > k else 1.0
+        want = set((cfg.window + sc.topk(k).indices).tolist())
+        if set(sel) != want and margin > 1e-6:
+            raise AssertionError(f"pos={pos}: picked {len(set(sel) - want)} entries the scores do not rank")
+        reach = max(reach, max(s - cfg.window for s in sel))
+    # the point of the shape: without this the second part has no live candidate
+    assert reach >= 2048, f"picks stopped at candidate {reach}, so only part zero was tested"
+    layer.close()
+
+
 @pytest.mark.parametrize("ratio", [0, COMPRESS_CSA])
 def test_dsv4_batching_is_independent_sequences(ratio):
     """The kernel at S=2 must equal the kernel run twice at S=1.

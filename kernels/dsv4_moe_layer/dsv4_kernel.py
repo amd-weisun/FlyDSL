@@ -238,6 +238,10 @@ def layout(
         # the slots the indexer picked, which the attention gather reads instead of
         # the caller's index list for the compressed half
         ("i_sel", S * max((n_keys or window) - window, 1) * pr),
+        # the top-k parts' bins, one set per radix digit, and the counts each part
+        # contributes to the two compaction phases
+        ("tk_hist", S * 4 * n_topk_parts(max_seq, compress_ratio, index_head_dim) * 256 * pr or pr),
+        ("tk_cnt", S * 2 * n_topk_parts(max_seq, compress_ratio, index_head_dim) * pr or pr),
         ("q", S * heads * head_dim * pr),  # full per-head query: rope is inside it
         ("sp_acc", S * n_split * heads * head_dim * pr),
         ("sp_m", S * n_split * heads * pr),
@@ -447,6 +451,25 @@ def n_index(max_seq: int, compress_ratio: int, index_head_dim: int, index_topk: 
     return min(index_topk, n_compressed(max_seq, compress_ratio))
 
 
+def n_topk_parts(max_seq: int, compress_ratio: int, index_head_dim: int) -> int:
+    """CTAs the indexer's top-k splits its candidates over.
+
+    The select is one task per sample, so at batch 1 it ran on ONE CTA while 255
+    idled -- at a 1M context that is 6 MB read at 19 GB/s, single-CU territory,
+    and 72% of the layer. Each part scans its own share and the parts agree on
+    each radix digit by summing one another's bins.
+
+    Sized to leave a part a couple of trips of its own, and capped: the bins the
+    parts trade cost TK_PARTS * (TK_PARTS - 1) reads per digit, which grows
+    faster than the scan it is splitting, so past a point more parts is more
+    exchange for less work. ONE part compiles to exactly the single-CTA code,
+    which is why every shape below the threshold is untouched by any of this.
+    """
+    if not index_head_dim:
+        return 0
+    return min(16, max(1, n_compressed(max_seq, compress_ratio) // 4096))
+
+
 def n_score_tiles(max_seq: int, compress_ratio: int, index_head_dim: int) -> int:
     """Tiles of compressed entries the indexer scores, sized for the WHOLE cache.
 
@@ -521,7 +544,7 @@ def stage_tasks(
         ("i_wp", S if index_head_dim else 0),
         ("i_score", S * n_score_tiles(max_seq, compress_ratio, index_head_dim)),
         # ... and the top-k over them, which the split stage waits on
-        ("i_topk", S if index_head_dim else 0),
+        ("i_topk", S * n_topk_parts(max_seq, compress_ratio, index_head_dim)),
         ("split", S * ((window if n_keys is None else n_keys) // SPLIT_KEYS)),
         ("uv", S * (heads * head_dim // UV_TILE)),
         ("o_a", S * o_groups * o_lora // ROW_TILE),
@@ -765,7 +788,9 @@ def build_dsv4_kernel(
     # Splitting by lane spreads them over consecutive words, so over banks.
     TK_REP = 16
     TK_BC = TK_BINS * TK_REP  # the two words past the bins that broadcast a pass's result
-    TK_TRIPS = max(1, -(-N_COMP // (THREADS * TK_PER))) if N_COMP else 1
+    TK_PARTS = n_topk_parts(max_seq, compress_ratio, index_head_dim)
+    # trips PER PART: part q takes every TK_PARTS-th trip, starting at q
+    TK_TRIPS = max(1, -(-N_COMP // (THREADS * TK_PER * max(TK_PARTS, 1)))) if N_COMP else 1
     # the index list pads to a whole key tile, so its compressed half has room for
     # more than the indexer will ever pick; the surplus is filled with -1
     N_ISEL = N_KEYS - window
@@ -778,6 +803,10 @@ def build_dsv4_kernel(
         # wide read, and it puts a clamped group wholly past n_live, so the wrong
         # candidates it then reads are all masked off.
         assert N_COMP % TK_PER == 0, "the top-k reads whole groups of TK_PER candidates"
+        # Every part polls every other part's bins, so they must run CONCURRENTLY.
+        # Two parts sharing a CTA would have the first spin for a second that the
+        # same CTA has not started: a hang, not a wrong answer.
+        assert S * TK_PARTS <= BLOCKS, "each top-k part needs its own CTA"
         assert IHD == 128, "the indexer's Hadamard is written for a 128-wide head"
         assert IH % WAVES == 0, "one wave takes a whole index head"
         assert IHD - ROPE_DIM == 64, "rope must fall entirely in the head's second half"
@@ -1167,6 +1196,15 @@ def build_dsv4_kernel(
             for off in (8, 4, 2, 1):
                 v = _xred(v, off, fx.max)
             return v
+
+        def _other_parts(part):
+            """Every top-k part but this one, starting just after it.
+
+            Walking from ``part + 1`` rather than from 0 means a part never reads a
+            slot it wrote itself -- which would be a bet on seeing your own global
+            store, the very thing the ``cnew`` mailbox exists because you cannot
+            make."""
+            return [(part + 1 + k) % TK_PARTS for k in range(TK_PARTS - 1)]
 
         def score_keys(sbase, cb, first):
             """``TK_PER`` candidate scores from ``cb`` on, as order-preserving keys.
@@ -2545,10 +2583,11 @@ def build_dsv4_kernel(
         # pairs this thread has already polled, and a tag check serializes the walk
         # -- the next load cannot issue until the last one's tag has been compared.
         if const_expr(IHD):
-            for tt in range(start("i_topk"), S, G):
+            for tt in range(start("i_topk"), S * TK_PARTS, G):
                 tt = fx.Int32(tt)
                 stamp("i_topk", tt, 0)
-                s = tt
+                s = tt // TK_PARTS
+                part = tt % TK_PARTS  # which share of the candidates this CTA scans
                 c0 = ld_dest(1, s)  # plane row of this sequence's compressed entry 0
                 n_live = fx.min((ld_pos(s) + 1) // CR, fx.Int32(N_COMP))
                 k_want = fx.min(n_live, fx.Int32(N_INDEX))
@@ -2570,7 +2609,7 @@ def build_dsv4_kernel(
                             lds_st(hist, zi, fx.Int32(0))
                     gpu.barrier()
                     for _j in range(0, TK_TRIPS, fx.Int32(1)):
-                        cb = (fx.Int32(_j) * THREADS + tid) * TK_PER
+                        cb = ((fx.Int32(_j) * TK_PARTS + part) * THREADS + tid) * TK_PER
                         ks = score_keys(sbase, cb, d == 0)
                         for q in range_constexpr(TK_PER):
                             c = cb + q
@@ -2592,12 +2631,36 @@ def build_dsv4_kernel(
                     # which the pre-zeroed broadcast slots cover.
                     need = k_want - gt
                     cnt = fx.Int32(0)
+                    bn = TK_BINS - 1 - tid
                     if tid < TK_BINS:
                         for r in range_constexpr(TK_REP):
-                            cnt = cnt + lds_ld(hist, (TK_BINS - 1 - tid) * TK_REP + r)
+                            cnt = cnt + lds_ld(hist, bn * TK_REP + r)
+                    if const_expr(TK_PARTS > 1):
+                        # These bins only count THIS part's share, so the parts
+                        # trade them and every one picks the same digit from the
+                        # same totals. Each reads the OTHERS and adds its own from
+                        # the register it already holds -- walking from part + 1
+                        # means no part ever polls a slot it wrote itself, which
+                        # would be a bet on seeing your own global store.
+                        if tid < TK_BINS:
+                            put(mb("tk_hist"), ((s * 4 + d) * TK_PARTS + part) * TK_BINS + bn, cnt)
+                        tot = cnt
+                        if tid < TK_BINS:
+                            # ONE batch: polled one at a time these are TK_PARTS - 1
+                            # dependent round trips, since each tag has to be
+                            # compared before the next load can issue
+                            vs = poll(
+                                [
+                                    (mb("tk_hist"), ((s * 4 + d) * TK_PARTS + pp) * TK_BINS + bn, 1)
+                                    for pp in _other_parts(part)
+                                ]
+                            )
+                            for k in range_constexpr(TK_PARTS - 1):
+                                tot = tot + vs[k][0]
+                        cnt = tot
                     above, _tot = block_excl_scan(cnt)
                     if (tid < TK_BINS) & (above < need) & ((above + cnt) >= need):
-                        lds_st(hist, TK_BC, TK_BINS - 1 - tid)
+                        lds_st(hist, TK_BC, bn)
                         lds_st(hist, TK_BC + 1, above)
                     gpu.barrier()
                     pfx = pfx | (lds_ld(hist, TK_BC) << sh)
@@ -2622,33 +2685,57 @@ def build_dsv4_kernel(
                 stamp("i_topk", tt, 3)
                 w_base = fx.Int32(0)
                 for phase in range_constexpr(2):
-                    if tid == 0:
-                        lds_st(hist, TK_BC, fx.Int32(0))
-                    gpu.barrier()
-                    room = k_want - w_base
-                    for _j in range(0, TK_TRIPS, fx.Int32(1)):
-                        cb = (fx.Int32(_j) * THREADS + tid) * TK_PER
-                        ks = score_keys(sbase, cb, False)
-                        for q in range_constexpr(TK_PER):
-                            c = cb + q
-                            ok = c < n_live
-                            sk = ks[q] ^ MIN_I32  # back to the signed-comparable domain
-                            hit = (sk > thr) if phase == 0 else (sk == thr)
-                            if ok & hit:
-                                w = fx.Int32(
-                                    fx.atomic_add(
-                                        hist + TK_BC, fx.Int32(1), syncscope=fx.rocdl.SyncScope.Workgroup
+                    # Count, trade, then write. A part cannot know where its picks
+                    # go until it knows how many the parts before it wrote, and the
+                    # counted number is used rather than the one the radix
+                    # predicted -- so a bad threshold still shows up as a bad
+                    # selection a test can see, not as a slot nobody writes.
+                    for pss in range_constexpr(2):
+                        if tid == 0:
+                            lds_st(hist, TK_BC, fx.Int32(0))
+                        gpu.barrier()
+                        room = k_want - w_base
+                        for _j in range(0, TK_TRIPS, fx.Int32(1)):
+                            cb = ((fx.Int32(_j) * TK_PARTS + part) * THREADS + tid) * TK_PER
+                            ks = score_keys(sbase, cb, False)
+                            for q in range_constexpr(TK_PER):
+                                c = cb + q
+                                ok = c < n_live
+                                sk = ks[q] ^ MIN_I32  # back to the signed-comparable domain
+                                hit = (sk > thr) if phase == 0 else (sk == thr)
+                                if ok & hit:
+                                    w = fx.Int32(
+                                        fx.atomic_add(
+                                            hist + TK_BC, fx.Int32(1), syncscope=fx.rocdl.SyncScope.Workgroup
+                                        )
                                     )
-                                )
-                                if w < room:
-                                    put(mb("i_sel"), s * N_ISEL + w_base + w, c0 + c)
-                    gpu.barrier()
-                    w_base = w_base + fx.min(lds_ld(hist, TK_BC), room)
-                for j in range_constexpr((N_ISEL + THREADS - 1) // THREADS):
-                    o = fx.Int32(tid) + j * THREADS
-                    if o < N_ISEL:
-                        if o >= w_base:
-                            put(mb("i_sel"), s * N_ISEL + o, fx.Int32(-1))
+                                    if const_expr(pss == 1):
+                                        if (base2 + w) < room:
+                                            put(mb("i_sel"), s * N_ISEL + w_base + base2 + w, c0 + c)
+                        gpu.barrier()
+                        mycnt = lds_ld(hist, TK_BC)
+                        if const_expr(pss == 0):
+                            base2 = fx.Int32(0)  # picks the parts before me wrote
+                            total = mycnt
+                            if const_expr(TK_PARTS > 1):
+                                if tid == 0:
+                                    put(mb("tk_cnt"), (s * 2 + phase) * TK_PARTS + part, mycnt)
+                                others = _other_parts(part)
+                                vs = poll([(mb("tk_cnt"), (s * 2 + phase) * TK_PARTS + pp, 1) for pp in others])
+                                for k in range_constexpr(TK_PARTS - 1):
+                                    v = vs[k][0]
+                                    total = total + v
+                                    base2 = base2 + (others[k] < part).select(v, fx.Int32(0))
+                    w_base = w_base + fx.min(total, k_want - w_base)
+                # One part fills the tail, and it is the part that cannot collide:
+                # the others only ever write below w_base, which every part agrees
+                # on before any of them writes anything.
+                if part == 0:
+                    for j in range_constexpr((N_ISEL + THREADS - 1) // THREADS):
+                        o = fx.Int32(tid) + j * THREADS
+                        if o < N_ISEL:
+                            if o >= w_base:
+                                put(mb("i_sel"), s * N_ISEL + o, fx.Int32(-1))
                 stamp("i_topk", tt, 4)
 
         # ============== 4. per-head query RMS (no weight) + RoPE -> bf16 query
