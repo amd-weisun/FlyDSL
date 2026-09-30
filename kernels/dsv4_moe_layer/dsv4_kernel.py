@@ -2226,24 +2226,33 @@ def build_dsv4_kernel(
                 if (p + 1) % CR == 0:  # uniform across the CTA
                     pooled = []
                     for e in range_constexpr(2):
+                        # a chunk of rows per trip, loads first -- see the KV
+                        # compressor's loop, which this one mirrors
                         for _i, acc in range(
                             0,
-                            C_ROWS,
+                            C_ROWS // CMP_CHUNK,
                             fx.Int32(1),
                             init=[fx.Float32(NEG), fx.Float32(0.0), fx.Float32(0.0)],
                         ):
+                            ib = fx.Int32(_i) * CMP_CHUNK
+                            svs, kvs = [], []
+                            for z in range_constexpr(CMP_CHUNK):
+                                i = ib + z
+                                coff = (i >= CR).select(fx.Int32(IHD), fx.Int32(0)) if OVERLAP else 0
+                                wi = isb + i * IW + coff + chs[e]
+                                svs.append(ld_f32(r_iscst, wi))
+                                kvs.append(ld_f32(r_ikvst, wi))
                             m = fx.Float32(acc[0])
                             den = fx.Float32(acc[1])
                             num = fx.Float32(acc[2])
-                            i = fx.Int32(_i)
-                            coff = (i >= CR).select(fx.Int32(IHD), fx.Int32(0)) if OVERLAP else 0
-                            wi = isb + i * IW + coff + chs[e]
-                            sv = ld_f32(r_iscst, wi)
-                            kv_i = ld_f32(r_ikvst, wi)
-                            m_new = fx.max(m, sv)
-                            rescale = _exp(m - m_new)
-                            w = _exp(sv - m_new)
-                            res = yield [m_new, den * rescale + w, num * rescale + w * kv_i]
+                            for z in range_constexpr(CMP_CHUNK):
+                                m_new = fx.max(m, svs[z])
+                                rescale = _exp(m - m_new)
+                                w = _exp(svs[z] - m_new)
+                                den = den * rescale + w
+                                num = num * rescale + w * kvs[z]
+                                m = m_new
+                            res = yield [m, den, num]
                         pooled.append(bf16_round(fx.Float32(res[2]) * _rcp(fx.Float32(res[1]))))
                     # RMS over the whole IHD row: both halves, one wave
                     sq = pooled[0] * pooled[0] + pooled[1] * pooled[1]
