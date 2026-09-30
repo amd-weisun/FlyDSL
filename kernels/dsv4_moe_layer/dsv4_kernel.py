@@ -685,14 +685,16 @@ def build_dsv4_kernel(
     # 32-element block (reference.pack_fp4's format)
     IC_ROW_W = (IHD // 2 + IHD // 32) // 4
     CW = C_COFF * HEAD_DIM  # width of one state row
-    C_ROWS = C_COFF * CR  # rows of state
+    # Rows of state, a RING indexed by absolute position (row = pos % C_ROWS), as
+    # ATOM's compressor keeps it: the window pooled at position p is rows
+    # (p + 1 + i) % C_ROWS for i in [0, C_ROWS), oldest first. No row ever moves.
+    C_ROWS = C_COFF * CR
     OVERLAP = C_COFF > 1
     # Rows of state the pooling loop folds per trip. Its online softmax carries
     # (max, den, num) serially, but the LOADS do not depend on the carry, so
     # issuing a trip's worth together is what keeps the loop off memory latency:
     # one row at a time, HCA's 128 rows cost 270 ns each and 37% of the layer.
     CMP_CHUNK = max(c for c in range(1, 9) if C_ROWS % c == 0) if C_ROWS else 1
-    CBASE = CR if OVERLAP else 0  # the current window fills the second half
     # the window and the compressed entries share one cache, the compressed half
     # starting at `window`, so the attention gathers both from one index list
     CACHE_ROWS = window if window_rows is None else window_rows
@@ -2123,7 +2125,7 @@ def build_dsv4_kernel(
                 stamp("cmp", tt, 2)
                 if live:
                     for j in range_constexpr(C_COFF):
-                        w = sb + (CBASE + slot) * CW + j * HEAD_DIM + ch
+                        w = sb + (p % C_ROWS) * CW + j * HEAD_DIM + ch
                         bo.buffer_store(kvv[j], r_kvst, w)
                         bo.buffer_store(gtv[j] + ap0[j], r_scst, w)
                 if (p + 1) % CR == 0:  # uniform across the CTA
@@ -2147,7 +2149,7 @@ def build_dsv4_kernel(
                             # their SECOND
                             i = ib + e
                             coff = (i >= CR).select(fx.Int32(HEAD_DIM), fx.Int32(0)) if OVERLAP else 0
-                            wi = sb + i * CW + coff + ch
+                            wi = sb + ((p + 1 + i) % C_ROWS) * CW + coff + ch
                             svs.append(ld_f32(r_scst, wi))
                             kvs.append(ld_f32(r_kvst, wi))
                         m = fx.Float32(acc[0])
@@ -2180,16 +2182,6 @@ def build_dsv4_kernel(
                         crow = ld_dest(1, tt) + p // CR  # this sequence's entry p // CR
                         bo.buffer_store(cv.to(fx.BFloat16), _rsrc(kv_cache), crow * HEAD_DIM + tid)
                         put(mb("cnew"), tt * HEAD_DIM + tid, cv)
-                    if const_expr(OVERLAP):
-                        # the current window becomes the previous one. Each thread
-                        # owns channels {ch, HEAD_DIM + ch} of every row it touches,
-                        # and read both before writing either, so no barrier is owed.
-                        for i in range_constexpr(CR):
-                            for j in range_constexpr(C_COFF):
-                                o = j * HEAD_DIM + ch
-                                if live:
-                                    bo.buffer_store(ld_f32(r_kvst, sb + (CR + i) * CW + o), r_kvst, sb + i * CW + o)
-                                    bo.buffer_store(ld_f32(r_scst, sb + (CR + i) * CW + o), r_scst, sb + i * CW + o)
                 stamp("cmp", tt, 4)
 
         def had_pair(v0, v1, ln):
@@ -2255,7 +2247,7 @@ def build_dsv4_kernel(
                 if ilive:
                     for e in range_constexpr(2):
                         for j in range_constexpr(C_COFF):
-                            w = isb + (CBASE + slot) * IW + j * IHD + chs[e]
+                            w = isb + (p % C_ROWS) * IW + j * IHD + chs[e]
                             bo.buffer_store(kvv[e][j], r_ikvst, w)
                             bo.buffer_store(gtv[e][j] + ap0[e][j], r_iscst, w)
                 if (p + 1) % CR == 0:  # uniform across the CTA
@@ -2274,7 +2266,7 @@ def build_dsv4_kernel(
                             for z in range_constexpr(CMP_CHUNK):
                                 i = ib + z
                                 coff = (i >= CR).select(fx.Int32(IHD), fx.Int32(0)) if OVERLAP else 0
-                                wi = isb + i * IW + coff + chs[e]
+                                wi = isb + ((p + 1 + i) % C_ROWS) * IW + coff + chs[e]
                                 svs.append(ld_f32(r_iscst, wi))
                                 kvs.append(ld_f32(r_ikvst, wi))
                             m = fx.Float32(acc[0])
@@ -2324,19 +2316,6 @@ def build_dsv4_kernel(
                             bo.buffer_store(sw, r_ic, row + IHD // 8)
                         put(mb("i_cnew"), tt * IHD + ln, bf16_round(o0))
                         put(mb("i_cnew"), tt * IHD + ln + 64, bf16_round(o1))
-                    if const_expr(OVERLAP):
-                        # retire the window, as the attention compressor does
-                        for i in range_constexpr(CR):
-                            for e in range_constexpr(2):
-                                for j in range_constexpr(C_COFF):
-                                    o = j * IHD + chs[e]
-                                    if ilive:
-                                        bo.buffer_store(
-                                            ld_f32(r_ikvst, isb + (CR + i) * IW + o), r_ikvst, isb + i * IW + o
-                                        )
-                                        bo.buffer_store(
-                                            ld_f32(r_iscst, isb + (CR + i) * IW + o), r_iscst, isb + i * IW + o
-                                        )
                 stamp("i_cmp", tt, 4)
 
         # ==================================== 3. q_a RMSNorm -> q_b (raw f32 query)

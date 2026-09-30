@@ -533,17 +533,17 @@ def compress_step(
     kv = kv.float()
     score = score.float() + ape[cur_pos % r]
     if cfg.overlap:
-        # the current window fills the second half of the state; the first half
-        # still holds the previous window, and a pooled entry spans both
-        kv_state[r + cur_pos % r] = kv
-        score_state[r + cur_pos % r] = score
+        # A ring over the last 2r positions, row = pos % 2r (ATOM's layout). A pooled
+        # entry takes the previous window's rows from their first half and the
+        # current window's from their second.
+        kv_state[cur_pos % (2 * r)] = kv
+        score_state[cur_pos % (2 * r)] = score
         if (cur_pos + 1) % r:
             return None
-        ks = torch.cat([kv_state[:r, :d], kv_state[r:, d:]], dim=0)
-        ss = torch.cat([score_state[:r, :d], score_state[r:, d:]], dim=0)
+        rows = [(cur_pos + 1 + i) % (2 * r) for i in range(2 * r)]  # oldest first
+        ks = torch.cat([kv_state[rows[:r], :d], kv_state[rows[r:], d:]], dim=0)
+        ss = torch.cat([score_state[rows[:r], :d], score_state[rows[r:], d:]], dim=0)
         pooled = (ks * ss.softmax(dim=0)).sum(dim=0)
-        kv_state[:r] = kv_state[r:]  # the current window becomes the previous one
-        score_state[:r] = score_state[r:]
     else:
         kv_state[cur_pos % r] = kv
         score_state[cur_pos % r] = score
