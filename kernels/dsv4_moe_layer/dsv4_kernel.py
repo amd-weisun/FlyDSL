@@ -211,7 +211,6 @@ def layout(
         # explicit mailbox rather than contracting at each consumer -- `a` alone is
         # read in six places and inline contraction would quadruple that traffic.
         ("xin", S * hidden * pr if hc_mult > 1 else pr),
-        ("ain", S * hidden * pr if hc_mult > 1 else pr),
         ("q_a", S * q_lora * pr),
         ("kv_a", S * head_dim * pr),  # the single shared KV row, pre-norm
         # The compressor's own kv / gate, split out of the same fused qkv_a GEMV.
@@ -550,7 +549,8 @@ def stage_tasks(
         ("o_b", hidden // ROW_TILE),
         # ... and for the ffn side, once o_b has produced the new residual stream
         ("hcd_f", S * hc_tasks),
-        ("hcc_f", (hidden // ROW_TILE) if hc_mult > 1 else 0),
+        # none: the router contracts the FFN side's streams itself
+        ("hcc_f", 0),
         ("router", S * N_ROUTER),
         # one tile per (routed slot, 8 intermediates); tasks below INTER / UG8 also
         # carry the shared expert.  GLM-5/V3 happened to make this exactly BLOCKS
@@ -707,6 +707,10 @@ def build_dsv4_kernel(
     HC = hc_mult
     HC_TASKS, HC_KSLICE, HC_ROWS, HC_VALS = hc_shape(HC, HIDDEN)
     HC_MIX = (2 + HC) * HC if HC > 1 else 0
+    # waves that share the coefficient poll, and the hcd tasks each takes: one
+    # poll batch apiece (POLL_MAX)
+    HC_PW = min(WAVES, -(-HC_TASKS // 12)) if HC > 1 else 1
+    HC_TPW = -(-HC_TASKS // HC_PW) if HC > 1 else 1
     HC_COEF = 2 * HC + HC * HC if HC > 1 else 0
     # comb lane = j * HC + k, so XORing the low bits walks a row and the high bits
     # a column -- the whole Sinkhorn is cross-lane inside one wave
@@ -724,7 +728,6 @@ def build_dsv4_kernel(
     down_scale_words = 0 if fmt.activation_group is None else S * MOE_SLOTS * INTER // fmt.activation_group
     # the router and up/gate read the contracted stream, which is a separate
     # mailbox once hyper-connections widen `a`
-    A_IN = "ain" if hc_mult > 1 else "a"
     HC_MISC = 8 + max(S * XQ_BLOCKS, down_scale_words)
     # `uv` stores one per-split weight in misc, so it must hold N_SPLIT of them
     misc_words = max(HC_MISC + S * max(HC_COEF, 1), n_keys // SPLIT_KEYS)
@@ -1802,7 +1805,10 @@ def build_dsv4_kernel(
                     o1 = o1 + cjk * rj[j][1]
                 emit(s, k, row, o0, o1)
 
-        def hc_pre_stages(side, sd, fn_ptr, sb_ptr, src_word, out_name):
+        def hc_pre_stages(side, sd, fn_ptr, sb_ptr, src_word, out_name, contract=True):
+            """hcd (the mixing projection's partials) and, with ``contract``, hcc (the
+            streams contracted into one input). Returns the coefficient routine, for a
+            consumer that contracts the streams itself."""
             r_fn = _rsrc(fn_ptr)
             r_sb = _rsrc(sb_ptr)  # [3 scales | HC_MIX bases]
             for tt in range(start(f"hcd_{side}"), S * HC_TASKS, G):
@@ -1856,17 +1862,32 @@ def build_dsv4_kernel(
                 sc0 = ld_f32(r_sb, 0)
                 sc1 = ld_f32(r_sb, 1)
                 sc2 = ld_f32(r_sb, 2)
-                for blk in range_constexpr((S * HC_VALS + 63) // 64):
+                # The partials are split over HC_PW waves so each polls one batch:
+                # all HC_TASKS on wave 0 was three dependent round trips (POLL_MAX
+                # is 12), and this routine sits on the FFN's critical path -- the
+                # router runs it before it can contract its input. Each wave sums
+                # its share, then wave 0 adds the shares in wave order, which every
+                # rank does identically.
+                NBLK = (S * HC_VALS + 63) // 64
+                for blk in range_constexpr(NBLK):
                     idx = lane + blk * 64
-                    if wave == 0 and idx < S * HC_VALS:
+                    if (wave < HC_PW) & (idx < S * HC_VALS):
                         s_ = idx // HC_VALS
                         j = idx % HC_VALS
-                        parts = poll(
-                            [(mb("hc_d"), ((s_ * 2 + sd) * HC_TASKS + i) * HC_VALS + j, 1) for i in range(HC_TASKS)]
-                        )
+                        tasks = [fx.min(wave * HC_TPW + i, HC_TASKS - 1) for i in range(HC_TPW)]
+                        parts = poll([(mb("hc_d"), ((s_ * 2 + sd) * HC_TASKS + ti) * HC_VALS + j, 1) for ti in tasks])
                         tot = fx.Float32(0.0)
-                        for i in range_constexpr(HC_TASKS):
-                            tot = tot + parts[i][0].bitcast(fx.Float32)
+                        for i in range_constexpr(HC_TPW):
+                            ok = (wave * HC_TPW + i) < HC_TASKS
+                            tot = tot + ok.select(parts[i][0].bitcast(fx.Float32), fx.Float32(0.0))
+                        lds_st(red, (wave * NBLK + blk) * 64 + lane, tot)
+                gpu.barrier()
+                for blk in range_constexpr(NBLK):
+                    idx = lane + blk * 64
+                    if (wave == 0) & (idx < S * HC_VALS):
+                        tot = fx.Float32(0.0)
+                        for w_ in range_constexpr(HC_PW):
+                            tot = tot + lds_ld(red, (w_ * NBLK + blk) * 64 + lane)
                         lds_st(red, idx, tot)
                 gpu.barrier()
                 if wave == 0:
@@ -1914,6 +1935,9 @@ def build_dsv4_kernel(
                                 put(mb("hc_c"), (s_ * 2 + sd) * HC_COEF + 2 * HC + lane, c)
                 gpu.barrier()
 
+            if const_expr(not contract):
+                return hc_coefficients
+
             # --- contract the hc_mult streams by `pre` into the single-width input
             for t in range(start(f"hcc_{side}"), N_ROW_TILES, G):
                 t = fx.Int32(t)
@@ -1933,6 +1957,7 @@ def build_dsv4_kernel(
                         a1 = a1 + pj * x1
                     put_bf(mb(out_name), s_ * HIDDEN + row, [a0, a1])
                 stamp(f"hcc_{side}", t, 4)
+            return hc_coefficients
 
         if const_expr(HC > 1):
             hc_pre_stages(
@@ -3153,14 +3178,19 @@ def build_dsv4_kernel(
                     lambda s, row, v0, v1: put_bf(mb("a"), s * HIDDEN + row, [v0, v1]),
                 )
             stamp("o_b", t, 4)
+        # The FFN side has no hcc stage: its only consumer, the router, contracts
+        # the streams itself (below), which takes a whole grid-wide handoff off the
+        # FFN's chain -- hcc publishing x and the router then polling it.
+        hc_coef_f = None
         if const_expr(HC > 1):
-            hc_pre_stages(
+            hc_coef_f = hc_pre_stages(
                 "f",
                 1,
                 hc_ffn_fn,
                 hc_ffn_sb,
                 lambda s, k: get(mb("a"), (s * HC * HIDDEN + k) // 2),
-                "ain",
+                None,
+                contract=False,
             )
 
         # ====== 8. post-attn RMSNorm -> router scores + this task's FP8 activation blocks
@@ -3187,11 +3217,7 @@ def build_dsv4_kernel(
                 return unit_bf16(r_wr, t * ROUTER_TILE // 16, kc, R_NKC, (r_ns * HIDDEN + kc * 64) // 2, r_ln)
 
             pre = [u_r(c) for c in range(R_CPW)]
-            hint_wait(
-                N_ROW_TILES,
-                lambda k: (mb(A_IN), router_sample * HIDDEN + k * ROW_TILE + ROW_TILE - 1),
-                mark=("router", tt),
-            )
+            hint_wait(0, None, mark=("router", tt))
             # This task's expert-activation block inputs ride along with the staging
             # loads. MXFP8 uses four independent 16-lane groups per wave.
             r_gp = _rsrc(g_post)
@@ -3207,12 +3233,38 @@ def build_dsv4_kernel(
             xa = []
 
             def ld_a(sks):
-                specs = [(mb(A_IN), (router_sample * HIDDEN + k) // 2, 2) for s, k in sks]
-                specs.append((mb(A_IN), (x_s * HIDDEN + xk) // 2, 1))
-                v = poll(specs, batch=len(specs))
+                if const_expr(HC == 1):
+                    specs = [(mb("a"), (router_sample * HIDDEN + k) // 2, 2) for s, k in sks]
+                    specs.append((mb("a"), (x_s * HIDDEN + xk) // 2, 1))
+                    v = poll(specs, batch=len(specs))
+                    stamp("router", tt, 5, lead=THREADS - 64)
+                    xa.append(bf2_f32(v[-1][0]))
+                    return [list(bf2_f32(w[0])) + list(bf2_f32(w[1])) for w in v[:-1]]
+                # x = sum_j pre[j] * stream j, contracted here from the streams and
+                # the hcd partials rather than polled from an hcc stage. Same order
+                # and the same bf16 rounding hcc used, so x is bit-identical.
+                sb = router_sample * HC * HIDDEN
+                specs = [(mb("a"), (sb + j * HIDDEN + k) // 2, 2) for s, k in sks for j in range(HC)]
+                specs += [(mb("a"), (x_s * HC * HIDDEN + j * HIDDEN + xk) // 2, 1) for j in range(HC)]
+                v = poll(specs)  # the streams land before the partials do
                 stamp("router", tt, 5, lead=THREADS - 64)
-                xa.append(bf2_f32(v[-1][0]))
-                return [list(bf2_f32(w[0])) + list(bf2_f32(w[1])) for w in v[:-1]]
+                hc_coef_f(1, tt == 0)  # task 0 also publishes post / comb for down
+                pj = [lds_ld(misc, HC_MISC + router_sample * HC_COEF + j) for j in range(HC)]
+
+                def mix(words):
+                    """bf16(sum_j pre[j] * x_j) for each element of the words' streams."""
+                    xs_ = [list(bf2_f32(w[0])) + (list(bf2_f32(w[1])) if len(w) > 1 else []) for w in words]
+                    out = []
+                    for e in range_constexpr(len(xs_[0])):
+                        acc = fx.Float32(0.0)
+                        for j in range_constexpr(HC):
+                            acc = acc + pj[j] * xs_[j][e]
+                        out.append(bf16_round(acc))
+                    return out
+
+                n4 = len(sks)
+                xa.append(tuple(mix(v[n4 * HC :])))
+                return [mix(v[i * HC : (i + 1) * HC]) for i in range(n4)]
 
             rstds = stage_x_rmsnorm(ld_a, HIDDEN, g_post, mark=("router", tt), count=1)
             stamp("router", tt, 2)
@@ -3290,16 +3342,6 @@ def build_dsv4_kernel(
                 s_u, c = fx.Int32(0), u % UG_PER_SLOT
                 has_sh = u < UG_PER_SLOT
                 slot = has_sh.select(fx.Int32(MOE_SLOTS - 1), u // UG_PER_SLOT)
-                # The expert activation is recomputed here in parallel with the router.
-                # MXFP8 uses the four independent 16-lane groups in each wave.
-                if const_expr(use_mxfp8_block32):
-                    NB = XQ_BLOCKS // (WAVES * 4)
-                    ks_ = [((wave + j * WAVES) * 4 + lane // 16) * 32 + lane % 16 * 2 for j in range(NB)]
-                else:
-                    NB = PUBLISH_BLOCKS // WAVES
-                    ks_ = [(wave + j * WAVES) * 128 + lane * 2 for j in range(NB)]
-                r_gp = _rsrc(g_post)
-                gps = [(ld_bf16(r_gp, k), ld_bf16(r_gp, k + 1)) for k in ks_]  # issued ahead of the wait
                 bs = load_bias()
                 w_rg = ((lane % 16) // 8) * (INTER // 16) + c // 2  # MFMA rows 0-7 gate, 8-15 up
                 w_ln = (lane & -16) | ((c % 2) * 8 + lane % 8)
@@ -3358,48 +3400,16 @@ def build_dsv4_kernel(
                 pre = [u_ug8(cc, fx.Int32(SHARED_EXPERT), has_sh) for cc in range(UG8_UNITS)]
                 # The normed, quantized input and the routing are the SAME for every
                 # task of the sample, and S == 1 has one sample, so only a CTA's first
-                # task computes them; the ones after it find them in LDS (xs, the
+                # task stages them; the ones after it find them in LDS (xs, the
                 # scales in misc[8:], the picks in keys / misc[:TOP_K]), which
-                # nothing between two of its tasks writes. Recomputing them -- poll
-                # x, RMS, quantize, route -- was 4.6 us of every task, and the 32
-                # CTAs that take a second tile are the tail `down` waits on.
+                # nothing between two of its tasks writes. Staging them per task was
+                # 4.6 us of every task, and the 32 CTAs that take a second tile are
+                # the tail `down` waits on. The input is the router's quantized copy,
+                # published ahead of its scores, which routing waits for anyway --
+                # so up/gate never needs x itself, and no stage has to publish x.
                 if u == fx.Int32(start("ug")):
-                    hint_wait(
-                        N_ROW_TILES, lambda k: (mb(A_IN), s_u * HIDDEN + k * ROW_TILE + ROW_TILE - 1), mark=("ug", u)
-                    )
-                    # the sum of squares takes the router's element partition and order
-                    # (stage_x_rmsnorm, via the same _rmsnorm_tail_ks), so rstd -- and
-                    # every FP8 rounding -- is bit-identical
-                    nq4_ks, nq4_active = _rmsnorm_tail_ks(HIDDEN)
-                    NQ4 = len(nq4_ks)
-                    got = poll(
-                        [(mb(A_IN), (s_u * HIDDEN + k) // 2, 2) for k in nq4_ks]
-                        + [(mb(A_IN), (s_u * HIDDEN + k) // 2, 1) for k in ks_]
-                    )
-                    av = [bf2_f32(w[0]) for w in got[NQ4:]]
-                    ss = fx.Float32(0.0)
-                    for i in range_constexpr(NQ4):
-                        for a in list(bf2_f32(got[i][0])) + list(bf2_f32(got[i][1])):
-                            term = a * a
-                            if const_expr(nq4_active is not None and i == NQ4 - 1):
-                                term = nq4_active.select(term, fx.Float32(0.0))
-                            ss = ss + term
-                    rstd = _rsq(block_sum(ss) * (1.0 / HIDDEN) + EPS)
-                    for j in range_constexpr(NB):
-                        v0, v1 = av[j][0] * rstd * gps[j][0], av[j][1] * rstd * gps[j][1]
-                        if const_expr(use_fp8_block128):
-                            q0, q1, qs = quant_scaled(v0, v1)
-                            st_f8(ks_[j], q0, q1)
-                            if lane == 0:
-                                lds_st(misc, 8 + wave + j * WAVES, qs)
-                        elif const_expr(use_mxfp8_block32):
-                            d0, d1, qs = quant_mxfp8(v0, v1)
-                            lds_st(xs, ks_[j] // 2, bf16_pair(d0, d1))
-                            if lane % 16 == 0:
-                                block = (wave + j * WAVES) * 4 + lane // 16
-                                lds_st(misc, 8 + block, qs)
-                        else:
-                            lds_st(xs, ks_[j] // 2, bf16_pair(v0, v1))
+                    hint_wait(0, None, mark=("ug", u))
+                    stage_moe_input([0])
                     if wave == 0:
                         e, w = route_topk(s_u, bs=bs)
                         # every pick, not just this task's slot: a later task on this

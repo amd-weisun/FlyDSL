@@ -182,8 +182,8 @@ def test_dsv4_layer_matches_golden(S, moe_mode, hc_mult):
 
 
 @pytest.mark.large_shape
-@pytest.mark.parametrize("S", [1, 8])
-def test_dsv4_layer_matches_golden_at_real_dims(S):
+@pytest.mark.parametrize("S,hc_mult", [(1, 1), (8, 1), (1, 4)])
+def test_dsv4_layer_matches_golden_at_real_dims(S, hc_mult):
     """The reduced shard above cannot catch mappings that only break at V4's own
     numbers -- 384 experts overflowed the selection key's id field, which 256 (and
     the reduced 128) fit exactly. Keep a real-shard case.
@@ -191,17 +191,22 @@ def test_dsv4_layer_matches_golden_at_real_dims(S):
     S=8 is the only case that puts two up/gate tiles on one CTA: V4-Pro's top-6
     over INTER 384 is 288 tiles for 256 CTAs, while the reduced shard's 96 fit in
     one rep. It is also the only one where the down tile is 7168 / 256 = 28 rows
-    before rounding, which is the width emit_dn cannot actually cover."""
+    before rounding, which is the width emit_dn cannot actually cover.
+
+    hc_mult=4 is the only case with the hyper-connections at the real hidden
+    size: the reduced shard's mixing projection is one or two tasks, so the
+    split of its 28 partials over several polling waves never runs there."""
     from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
 
     torch.manual_seed(0)
-    cfg = V4Config(hc_mult=1)  # defaults are DeepSeek-V4-Pro at TP8
+    cfg = V4Config(hc_mult=hc_mult)  # defaults are DeepSeek-V4-Pro at TP8
     cfg.validate()
     dev, mode = "cuda", MoeMode.A8W4
     W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
     layer = Dsv4MoeLayer(W, samples=S, rank=0, npes=1, moe_mode=mode)
 
-    h = (0.5 * torch.randn(S, cfg.hidden, device=dev)).bfloat16()
+    hshape = (S, cfg.hidden) if hc_mult == 1 else (S, hc_mult, cfg.hidden)
+    h = (0.5 * torch.randn(*hshape, device=dev)).bfloat16()
     pos = cfg.window
     cur = torch.tensor([pos] * S, dtype=torch.int32, device=dev)
     kv0 = (0.3 * torch.randn(S * cfg.window, cfg.head_dim, device=dev)).bfloat16()
