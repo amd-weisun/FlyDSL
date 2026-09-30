@@ -809,6 +809,9 @@ def build_dsv4_kernel(
         # Two parts sharing a CTA would have the first spin for a second that the
         # same CTA has not started: a hang, not a wrong answer.
         assert S * TK_PARTS <= BLOCKS, "each top-k part needs its own CTA"
+        # every thread holds its share of the candidates in registers; 32 is a 1M
+        # context, V4's longest
+        assert TK_TRIPS * TK_PER <= 32, "the top-k's candidates per thread must fit in registers"
         assert IHD == 128, "the indexer's Hadamard is written for a 128-wide head"
         assert IH % WAVES == 0, "one wave takes a whole index head"
         assert IHD - ROPE_DIM == 64, "rope must fall entirely in the head's second half"
@@ -1149,25 +1152,6 @@ def build_dsv4_kernel(
         def getf(base_addr, i):
             return get(base_addr, i).bitcast(fx.Float32)
 
-        def get_raw(base_addr, i, n):
-            """``n`` mailbox value words from pair ``i`` on, with NO tag check.
-
-            Only ever a RE-read: this thread has already polled exactly these pairs
-            and passed a barrier since, so the values are known to have landed and
-            are still in the cache level the loads read. Re-checking the tag costs a
-            serialized round trip per candidate -- the load cannot issue until the
-            previous one's tag has been compared -- and at a 1M context that spin,
-            not the bandwidth, was most of what the top-k spent."""
-            out = []
-            for g in range_constexpr(n // 2):  # dwordx4 is the widest buffer load
-                v = fx.Vector(
-                    bo.buffer_load(
-                        _rsrc(base_addr), (fx.Int32(i) + 2 * g) * 2, vec_width=4, dtype=T.i32, cache_modifier=CM_DEV
-                    )
-                )
-                out += [v[0], v[2]]
-            return out
-
         def getf_many(specs):
             """[(base, i)] single pairs -> list of f32."""
             return [v[0].bitcast(fx.Float32) for v in poll([(b, i, 1) for b, i in specs])]
@@ -1208,26 +1192,28 @@ def build_dsv4_kernel(
             make."""
             return [(part + 1 + k) % TK_PARTS for k in range(TK_PARTS - 1)]
 
-        def score_keys(sbase, cb, first):
-            """``TK_PER`` candidate scores from ``cb`` on, as order-preserving keys.
+        def part_keys(sbase, part):
+            """This thread's candidates in top-k part ``part``, as order-preserving keys.
 
             f32 bits -> a signed int32 whose ORDER matches the float's (flip the low
             31 bits of negatives, which puts -2 below -1 and both below 0), then ^
             MIN_I32 into the unsigned domain, where MSB-first prefixes work.
 
-            ``first`` on the pass that reads a sequence's scores for the first time,
-            where the producer may still be landing; every later pass re-reads the
-            same pairs from the same thread and takes them untagged. The base is
-            clamped so a whole vector stays in range -- the caller masks on the
+            Returns (trip bases, keys): trip j covers ``TK_PER`` consecutive
+            candidates from its base, and the threads stride over those groups, so a
+            wave's trip is one contiguous run. Polled ONCE, all trips in one batched
+            poll, and held in registers for every radix pass and the compaction --
+            re-walking them per pass was eight serial round trips a pass. Each base
+            is clamped so a whole vector stays in range; the caller masks on the
             UNCLAMPED candidate index, which is past the end exactly when it was
             clamped, so a clamped trip contributes nothing."""
-            a = fx.min(cb, fx.Int32(N_COMP - TK_PER))
-            if const_expr(first):
-                specs = [(mb("i_score"), sbase + a + 2 * q, 2) for q in range(TK_PER // 2)]
-                ws = [w[e] for w in poll(specs) for e in range(2)]
-            else:
-                ws = get_raw(mb("i_score"), sbase + a, TK_PER)
-            return [(w ^ ((w >> 31) & 0x7FFFFFFF)) ^ MIN_I32 for w in ws]
+            cbs = [((fx.Int32(j) * TK_PARTS + part) * THREADS + tid) * TK_PER for j in range(TK_TRIPS)]
+            specs = []
+            for cb in cbs:
+                a = fx.min(cb, fx.Int32(N_COMP - TK_PER))
+                specs += [(mb("i_score"), sbase + a + 2 * q, 2) for q in range(TK_PER // 2)]
+            ws = [w[e] for w in poll(specs) for e in range(2)]
+            return cbs, [(w ^ ((w >> 31) & 0x7FFFFFFF)) ^ MIN_I32 for w in ws]
 
         def block_isum(v):
             """Block-wide sum of a per-thread int32."""
@@ -2611,16 +2597,14 @@ def build_dsv4_kernel(
         # running count crosses what the pick still needs. Four passes cover a
         # 32-bit key where a bit-at-a-time select needs 32.
         #
-        # Three properties carry the cost, and all are about how the scores are read
-        # rather than about the select. The scans are runtime loops, so the compiler
-        # cannot hoist a context's worth of loads into registers -- doing so spilled
-        # 5387 slots at 1M. A thread takes TK_PER consecutive candidates and the
-        # threads stride over those groups, so a wave's trip is one contiguous run:
-        # mailbox loads bypass the cache by design, since they have to observe a
-        # remote CTA's write, so a wave whose lanes sit 4 KB apart pays a whole line
-        # per lane. And only the first pass checks the tag. Every later one re-reads
-        # pairs this thread has already polled, and a tag check serializes the walk
-        # -- the next load cannot issue until the last one's tag has been compared.
+        # How the scores are read carries the cost, not the select. A thread takes
+        # TK_PER consecutive candidates and the threads stride over those groups, so
+        # a wave's trip is one contiguous run: mailbox loads bypass the cache by
+        # design, since they have to observe a remote CTA's write, so a wave whose
+        # lanes sit 4 KB apart pays a whole line per lane. And a thread's share is
+        # polled once and held in registers (part_keys) -- which is only possible
+        # because the parts split the candidates: on ONE CTA a thread held 512 of
+        # them, and holding those spilled 5387 slots at 1M.
         if const_expr(IHD):
             for tt in range(start("i_topk"), S * TK_PARTS, G):
                 tt = fx.Int32(tt)
@@ -2631,6 +2615,7 @@ def build_dsv4_kernel(
                 n_live = fx.min((ld_pos(s) + 1) // CR, fx.Int32(N_COMP))
                 k_want = fx.min(n_live, fx.Int32(N_INDEX))
                 sbase = s * N_COMP
+                tk_cbs, tk_keys = part_keys(sbase, part)
                 stamp("i_topk", tt, 2)
 
                 pfx = fx.Int32(0)  # the digits already fixed, in the unsigned domain
@@ -2651,14 +2636,12 @@ def build_dsv4_kernel(
                         if zi < TK_BC + 4:
                             lds_st(hist, zi, fx.Int32(0))
                     gpu.barrier()
-                    for _j in range(0, TK_TRIPS, fx.Int32(1)):
-                        cb = ((fx.Int32(_j) * TK_PARTS + part) * THREADS + tid) * TK_PER
-                        ks = score_keys(sbase, cb, d == 0)
+                    for j in range_constexpr(TK_TRIPS):
                         for q in range_constexpr(TK_PER):
-                            c = cb + q
+                            c = tk_cbs[j] + q
                             ok = c < n_live
                             # a dead candidate keys as 0, the very bottom
-                            u = ok.select(ks[q], fx.Int32(0))
+                            u = ok.select(tk_keys[j * TK_PER + q], fx.Int32(0))
                             if ok & (((u ^ pfx) & hi) == 0):
                                 fx.atomic_add(
                                     hist + ((u >> sh) & (TK_BINS - 1)) * TK_REP + (tid & (TK_REP - 1)),
@@ -2743,13 +2726,11 @@ def build_dsv4_kernel(
                     lds_st(hist, TK_BC, fx.Int32(0))
                     lds_st(hist, TK_BC + 1, fx.Int32(0))
                 gpu.barrier()
-                for _j in range(0, TK_TRIPS, fx.Int32(1)):
-                    cb = ((fx.Int32(_j) * TK_PARTS + part) * THREADS + tid) * TK_PER
-                    ks = score_keys(sbase, cb, False)
+                for j in range_constexpr(TK_TRIPS):
                     for q in range_constexpr(TK_PER):
-                        c = cb + q
+                        c = tk_cbs[j] + q
                         ok = c < n_live
-                        sk = ks[q] ^ MIN_I32  # back to the signed-comparable domain
+                        sk = tk_keys[j * TK_PER + q] ^ MIN_I32  # back to the signed-comparable domain
                         if ok & (sk > thr):
                             w = fx.Int32(
                                 fx.atomic_add(hist + TK_BC, fx.Int32(1), syncscope=fx.rocdl.SyncScope.Workgroup)

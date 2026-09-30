@@ -1573,6 +1573,54 @@ def test_dsv4_indexer_topk_spans_several_ctas():
     layer.close()
 
 
+def test_dsv4_indexer_topk_at_a_full_1m_context():
+    """The top-k at V4's longest context, where every thread holds several trips.
+
+    A thread's candidates are polled once and held in registers, in trips of
+    TK_PER, and at 1M it holds eight trips in each of sixteen parts. Every other
+    top-k test runs at most two trips and leaves the second past the live
+    candidates, so a thread that read the wrong trip's keys passed all of them.
+    Stepping a million positions is not needed to get here: the key cache is
+    filled directly with valid packed rows and the layer runs once at the last
+    position, so every candidate of every trip is live. As in the other top-k
+    tests, the selection is judged against the kernel's own scores.
+    """
+    from kernels.dsv4_moe_layer.dsv4_kernel import THREADS, n_topk_parts
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+    from kernels.dsv4_moe_layer.reference import pack_fp4
+
+    torch.manual_seed(0)
+    ratio = COMPRESS_CSA
+    cfg = _cfg(hc_mult=1)
+    cfg.compress_ratio, cfg.max_seq = ratio, 1 << 20
+    n, ihd = cfg.n_compressed, cfg.index_head_dim
+    trips = n // (THREADS * 4 * n_topk_parts(cfg.max_seq, ratio, ihd))
+    assert trips >= 8, f"only {trips} trips a thread; the point is several"
+    dev, mode = "cuda", MoeMode.W8A8
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
+    layer.i_cache[0] = pack_fp4(torch.randn(n, ihd, device=dev))
+    cos, sin = rope_table(cfg.max_seq, theta=cfg.rope_base, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+
+    pos = cfg.max_seq - 1
+    h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
+    idx, dest = contiguous_pool([pos], cfg, dev)
+    layer.forward(h, torch.tensor([pos], dtype=torch.int32, device=dev), kv_k, dest, idx, cos, sin)
+    torch.cuda.synchronize()
+    k = min(cfg.index_topk, n)
+    got = layer.debug("i_sel", (1, cfg.n_keys - cfg.window), torch.int32)[0]
+    sel = got[got >= 0].tolist()
+    assert len(sel) == k, f"wrote {len(sel)} slots, want {k}"
+    assert len(set(sel)) == k, f"{k - len(set(sel))} picks collided on a slot"
+    sc = layer.debug("i_score", (1, n))[0]
+    srt = sc.sort(descending=True).values
+    want = set((cfg.window + sc.topk(k).indices).tolist())
+    if set(sel) != want and (srt[k - 1] - srt[k]).item() > 1e-6:
+        raise AssertionError(f"picked {len(set(sel) - want)} entries the scores do not rank")
+    layer.close()
+
+
 @pytest.mark.parametrize("ratio", [0, COMPRESS_CSA])
 def test_dsv4_batching_is_independent_sequences(ratio):
     """The kernel at S=2 must equal the kernel run twice at S=1.
