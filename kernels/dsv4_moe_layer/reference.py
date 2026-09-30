@@ -29,6 +29,7 @@ import torch
 
 from kernels.common.mx_formats import quant_dequant_mxfp8, quantize_mxfp4
 from kernels.dsv4_moe_layer.config import (
+    BLOCK_TOKENS,
     COMPRESS_CSA,
     COMPRESS_ROPE_THETA,
     COMPRESS_SWA,
@@ -412,6 +413,44 @@ def decode_kv_fp8(nope: torch.Tensor, rope: torch.Tensor, head_dim: int = HEAD_D
     e = nope[..., n : n + 2 * ng : 2].long()
     v = (q * torch.ldexp(torch.ones_like(q[..., 0]), e - 127)[..., None]).reshape(*nope.shape[:-1], n)
     return torch.cat([v, rope.float()], dim=-1)
+
+
+def fp4_pool_shapes(cfg: V4Config, samples: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """(codes, scales) shapes of the indexer's paged FP4 pool with ``samples`` runs of
+    blocks: [samples, blocks, groups * K_PB * 16] and [samples, blocks, groups * K_PB]."""
+    k_pb = BLOCK_TOKENS // cfg.compress_ratio
+    nb = -(-cfg.n_compressed // k_pb)
+    ng = cfg.index_head_dim // FP4_BLOCK
+    return (samples, nb, ng * k_pb * 16), (samples, nb, ng * k_pb)
+
+
+def _fp4_pool_index(n, bt_row, k_pb, device):
+    e = torch.arange(n, device=device)
+    blk = bt_row.long()[e // k_pb]
+    sl = e % k_pb
+    # the scale pool's entry axis is interleaved in runs of 16 (ATOM / aiter's writer)
+    return blk, sl, (sl % 16) * (k_pb // 16) + sl // 16
+
+
+def fp4_pool_rows(codes, scales, bt_row, n, index_head_dim=INDEX_HEAD_DIM, k_pb=BLOCK_TOKENS // COMPRESS_CSA):
+    """The first ``n`` entries of one sequence's paged FP4 pool (ATOM's gfx950 layout:
+    per block [group][entry][16 B] codes, [group][entry'] E8M0) as ``pack_fp4`` rows."""
+    ng = index_head_dim // FP4_BLOCK
+    blk, sl, sfl = _fp4_pool_index(n, bt_row, k_pb, codes.device)
+    c = codes.reshape(-1, ng, k_pb, 16)[blk, :, sl, :].reshape(n, ng * 16)
+    e = scales.reshape(-1, ng, k_pb)[blk, :, sfl]
+    return torch.cat([c, e], dim=-1)
+
+
+def fp4_pool_store(codes, scales, bt_row, rows, index_head_dim=INDEX_HEAD_DIM, k_pb=BLOCK_TOKENS // COMPRESS_CSA):
+    """Write ``pack_fp4`` rows [n, fp4_row_bytes] into one sequence's paged FP4 pool."""
+    ng = index_head_dim // FP4_BLOCK
+    n = rows.shape[0]
+    blk, sl, sfl = _fp4_pool_index(n, bt_row, k_pb, codes.device)
+    cv = codes.view(-1, ng, k_pb, 16)
+    sv = scales.view(-1, ng, k_pb)
+    cv[blk, :, sl, :] = rows[:, : ng * 16].reshape(n, ng, 16)
+    sv[blk, :, sfl] = rows[:, ng * 16 :]
 
 
 def hadamard(x: torch.Tensor) -> torch.Tensor:

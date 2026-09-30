@@ -22,7 +22,8 @@ from kernels.dsv4_moe_layer.dsv4_kernel import (
     stage_tasks,
 )
 from kernels.dsv4_moe_layer.packing import pack_layer_weights
-from kernels.dsv4_moe_layer.reference import LayerWeights, fp4_row_bytes
+from kernels.dsv4_moe_layer.config import BLOCK_TOKENS
+from kernels.dsv4_moe_layer.reference import LayerWeights, fp4_pool_shapes
 from kernels.mla_moe_layer.runtime import SymmetricPeerBuffer
 
 __all__ = ["MoeMode", "Dsv4MoeLayer", "Dsv4Variant", "shape_dims"]
@@ -247,12 +248,13 @@ class Dsv4MoeLayer:
             ishape = (samples, cfg.c_rows, cfg.c_coff * cfg.index_head_dim)
             self.i_kv_state = torch.zeros(*ishape, dtype=torch.float32, device=dev)
             self.i_score_state = torch.full(ishape, float("-inf"), dtype=torch.float32, device=dev)
-            # the indexer's cache holds compressed entries only, no window half,
-            # as packed FP4 rows (reference.pack_fp4)
-            row = fp4_row_bytes(cfg.index_head_dim)
-            self.i_cache = torch.zeros(samples, cfg.n_compressed, row, dtype=torch.uint8, device=dev)
+            # the indexer's key cache: ATOM's paged FP4 pool (codes, scales), each
+            # sample its own run of blocks here (reference.fp4_pool_shapes)
+            dshape, sshape = fp4_pool_shapes(cfg, samples)
+            self.i_cache = torch.zeros(*dshape, dtype=torch.uint8, device=dev)
+            self.i_cache_s = torch.zeros(*sshape, dtype=torch.uint8, device=dev)
         else:
-            self.i_kv_state = self.i_score_state = self.i_cache = torch.zeros(1, device=dev)
+            self.i_kv_state = self.i_score_state = self.i_cache = self.i_cache_s = torch.zeros(1, device=dev)
         if cfg.compress_ratio:
             shape = (samples, cfg.c_rows, cfg.c_coff * cfg.head_dim)
             self.kv_state = torch.zeros(*shape, dtype=torch.float32, device=dev)
@@ -270,7 +272,15 @@ class Dsv4MoeLayer:
         self.state_slots = torch.arange(samples, dtype=torch.int32, device=dev)
         self.st_kv = self.kv_state[0].numel() if cfg.compress_ratio else 0
         self.st_i = self.i_kv_state[0].numel() if cfg.indexed else 0
-        self.st_ic = self.i_cache[0].numel() if cfg.indexed else 0
+        self.st_ic = self.i_cache[0].numel() if cfg.indexed else 0  # bytes per sample
+        # Compressed entries are paged (see the kernel's K_PB). The trivial table:
+        # every sample's block b is b, one entry per plane row, so entry e of
+        # sample s sits at dest_rows[1, s] + e -- a contiguous pool. ATOM passes
+        # its own tables and envelope height to forward().
+        self.k_pb = BLOCK_TOKENS // cfg.compress_ratio if cfg.compress_ratio else 1
+        n_blocks = max(1, -(-cfg.n_compressed // self.k_pb)) if cfg.compress_ratio else 1
+        self.block_tables = torch.arange(n_blocks, dtype=torch.int32, device=dev).repeat(samples, 1)
+        self.env_rows = self.k_pb
         n_tasks = sum(n for _, n in self.stages)
         self.timeline = torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev) if timeline else None
         self.step = variant.step
@@ -291,7 +301,20 @@ class Dsv4MoeLayer:
         return words.view(dtype).view(shape)
 
     def forward(
-        self, h, cur_pos, kv_cache, dest_rows, indices, cos, sin, x_out=None, layer=0, advance=True, tokens=None
+        self,
+        h,
+        cur_pos,
+        kv_cache,
+        dest_rows,
+        indices,
+        cos,
+        sin,
+        x_out=None,
+        layer=0,
+        advance=True,
+        tokens=None,
+        block_tables=None,
+        env_rows=None,
     ):
         """One layer.  Mailbox epochs are ``step * 128 + layer + 1``: layers sharing
         this scratch within a decode step need distinct ``layer``; call
@@ -332,6 +355,7 @@ class Dsv4MoeLayer:
                 "the samples are independent sequences, each at its own offset"
             )
         t = dict(self.W.t, **self.packed)
+        bt = self.block_tables if block_tables is None else block_tables
         # A hash-routed layer picks its experts by token id: tid2eid [vocab, top_k].
         use_hash = "tid2eid" in t
         if use_hash and (tokens is None or tokens.numel() != self.S or tokens.dtype != torch.int32):
@@ -392,12 +416,16 @@ class Dsv4MoeLayer:
             p(self.state_slots),
             p(tokens) if use_hash else 0,
             p(t["tid2eid"]) if use_hash else 0,
+            p(bt),
+            p(self.i_cache_s),
             self.rank,
             layer,
             self.st_kv,
             self.st_i,
             self.st_ic,
             int(use_hash),
+            bt.stride(0),
+            self.env_rows if env_rows is None else env_rows,
             stream=torch.cuda.current_stream(),
         )
         if advance:

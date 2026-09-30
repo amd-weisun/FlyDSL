@@ -30,6 +30,8 @@ from kernels.dsv4_moe_layer.reference import (
     encode_kv_fp8,
     make_weights,
     dequant,
+    fp4_pool_rows,
+    fp4_pool_store,
     fp4_row_bytes,
     qkv_a_split,
     rmsnorm,
@@ -85,6 +87,12 @@ def _cfg(hc_mult=1):
         window=128,
         hc_mult=hc_mult,
     )
+
+
+def _icache_rows(layer, s, n):
+    """Sample ``s``'s first ``n`` indexer-cache entries, read out of the kernel's
+    paged FP4 pool as reference.pack_fp4 rows."""
+    return fp4_pool_rows(layer.i_cache[s], layer.i_cache_s[s], layer.block_tables[s], n)
 
 
 def _routing_flipped(got, ref, W, cfg, S):
@@ -1016,7 +1024,7 @@ def test_dsv4_indexer_compressor_in_kernel():
             continue
         emitted += 1
         slot = pos // ratio
-        a, b = unpack_fp4(layer.i_cache[0, slot]), unpack_fp4(i_ref[slot])
+        a, b = unpack_fp4(_icache_rows(layer, 0, slot + 1)[slot]), unpack_fp4(i_ref[slot])
         # FP4's levels are coarse enough that a last-bit difference upstream moves
         # one element a whole step; bound the bulk and the count instead of the max,
         # as the attention compressor's test does.
@@ -1256,7 +1264,7 @@ def _indexer_score_rank(rank, npes, port, results):
             if not n:
                 continue
             scored += 1
-            kcache = unpack_fp4(layer.i_cache[0, :n])
+            kcache = unpack_fp4(_icache_rows(layer, 0, n))
             part = (torch.einsum("hd,td->ht", q, kcache).relu() * w.view(ih, 1)).sum(0)
             parts = [torch.empty_like(part.cpu()) for _ in range(npes)]
             dist.all_gather(parts, part.cpu().contiguous())
@@ -1316,6 +1324,7 @@ def test_dsv4_indexer_scores_the_new_entry_past_the_first_tile():
     W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
     layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
     layer.i_cache.copy_(torch.randint(0, 256, layer.i_cache.shape, device=dev))
+    layer.i_cache_s.copy_(torch.randint(0, 256, layer.i_cache_s.shape, device=dev))
     cos, sin = rope_table(cfg.max_seq, theta=cfg.rope_base, device=dev)
     kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
 
@@ -1333,7 +1342,7 @@ def test_dsv4_indexer_scores_the_new_entry_past_the_first_tile():
         q = layer.debug("i_q", (1, ih, ihd))[0]
         w = layer.debug("i_wp", (1, ih))[0]
         got = layer.debug("i_score", (1, cfg.n_compressed))[0][new].item()
-        ref = ((q @ unpack_fp4(layer.i_cache[0, new])).relu() * w).sum().item()
+        ref = ((q @ unpack_fp4(_icache_rows(layer, 0, new + 1)[new])).relu() * w).sum().item()
         assert abs(got - ref) <= 1e-3 * max(abs(ref), 1e-3), f"pos={pos} entry {new}: score {got} vs {ref}"
     layer.close()
 
@@ -1618,7 +1627,8 @@ def test_dsv4_indexer_topk_at_a_full_1m_context():
     dev, mode = "cuda", MoeMode.W8A8
     W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
     layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
-    layer.i_cache[0] = pack_fp4(torch.randn(n, ihd, device=dev))
+    rows = pack_fp4(torch.randn(n, ihd, device=dev))
+    fp4_pool_store(layer.i_cache[0], layer.i_cache_s[0], layer.block_tables[0], rows)
     cos, sin = rope_table(cfg.max_seq, theta=cfg.rope_base, device=dev)
     kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
 
@@ -1802,6 +1812,79 @@ def test_dsv4_batching_is_independent_sequences(ratio):
             assert rel < 1e-3, f"pos={pos} sample {s}: x_out rel {rel:.3e} when batched"
 
 
+@pytest.mark.parametrize("ratio", [COMPRESS_CSA, COMPRESS_HCA])
+def test_dsv4_paged_blocks_are_pure_addressing(ratio):
+    """Compressed entries paged the way ATOM keeps them must change NOTHING but where
+    the bytes sit.
+
+    The same sequence of steps runs twice: once contiguous (the identity block
+    table every other test uses) and once paged as ATOM lays it out -- each
+    sample's blocks scattered through one pool shared by all samples (st_ic = 0,
+    the physical block id alone places an indexer entry), an envelope twice a
+    block's height (another layer's rows interleaved), the compressed region
+    after every window. Outputs must be bit-identical at every step, and every
+    compressed KV row and indexer entry must hold the same bytes at its paged
+    address as at its contiguous one. An identity table cannot tell a block
+    lookup from its absence; this can.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    torch.manual_seed(0)
+    dev, mode, S = "cuda", MoeMode.W8A8, 2
+    cfg = _cfg(hc_mult=1)
+    cfg.compress_ratio, cfg.max_seq = ratio, 1024
+    if cfg.indexed:
+        cfg.index_topk = 4
+    cfg.validate()
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
+    lay_a = Dsv4MoeLayer(W, samples=S, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
+    lay_b = Dsv4MoeLayer(W, samples=S, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
+    k_pb, nb = lay_a.k_pb, lay_a.block_tables.shape[1]
+    env = 2 * k_pb
+    phys = torch.randperm(2 * nb * S, device=dev)[: S * nb].to(torch.int32).view(S, nb)
+    comp_base = S * cfg.cache_rows
+    kv_a = torch.zeros(S * cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    kv_b = torch.zeros(comp_base + 2 * nb * S * env, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    if cfg.indexed:
+        lay_b.st_ic = 0
+        lay_b.i_cache = torch.zeros(2 * nb * S, lay_a.i_cache.shape[-1], dtype=torch.uint8, device=dev)
+        lay_b.i_cache_s = torch.zeros(2 * nb * S, lay_a.i_cache_s.shape[-1], dtype=torch.uint8, device=dev)
+
+    def paged(row, s):
+        # clamped: torch.where below evaluates this for window and -1 rows too, and
+        # an out-of-range block lookup is a device-side fault, not a masked value
+        e = (row - s * cfg.cache_rows - cfg.window).clamp(min=0)
+        return comp_base + phys[s, e // k_pb] * env + e % k_pb
+
+    steps = 3 * k_pb * ratio
+    for pos in range(steps):
+        h = (0.5 * torch.randn(S, cfg.hidden, device=dev)).bfloat16()
+        cur = torch.tensor([pos] * S, dtype=torch.int32, device=dev)
+        idx, dest = contiguous_pool([pos] * S, cfg, dev)
+        idx_b, dest_b = idx.clone(), dest.clone()
+        dest_b[1] = comp_base
+        for s in range(S):
+            row = idx[s]
+            comp = (row >= s * cfg.cache_rows + cfg.window) & (row >= 0)
+            idx_b[s] = torch.where(comp, paged(row, s), row)
+        a = lay_a.forward(h, cur, kv_a, dest, idx, cos, sin)
+        b = lay_b.forward(h, cur, kv_b, dest_b, idx_b, cos, sin, block_tables=phys, env_rows=env)
+        torch.cuda.synchronize()
+        assert torch.equal(a, b), f"pos={pos}: paging changed the output by {(a.float() - b.float()).abs().max():.3e}"
+    n = steps // ratio
+    for s in range(S):
+        rows_a = kv_a[s * cfg.cache_rows + cfg.window : s * cfg.cache_rows + cfg.window + n]
+        rows_b = kv_b[paged(torch.arange(n, device=dev) + s * cfg.cache_rows + cfg.window, s)]
+        assert torch.equal(rows_a, rows_b), f"sample {s}: compressed KV rows differ at their paged addresses"
+        if cfg.indexed:
+            ia = fp4_pool_rows(lay_a.i_cache[s], lay_a.i_cache_s[s], lay_a.block_tables[s], n)
+            ib = fp4_pool_rows(lay_b.i_cache, lay_b.i_cache_s, phys[s], n)
+            assert torch.equal(ia, ib), f"sample {s}: indexer entries differ at their paged addresses"
+    lay_a.close()
+    lay_b.close()
+
+
 def test_dsv4_state_slots_place_the_rolling_state():
     """The compressor's state lives where `state_slots` says, not at sample s.
 
@@ -1839,13 +1922,15 @@ def test_dsv4_state_slots_place_the_rolling_state():
             layer.score_state = torch.randn(pool, cfg.c_rows, coff * cfg.head_dim, device=dev)
             layer.i_kv_state = torch.randn(pool, cfg.c_rows, coff * ihd, device=dev)
             layer.i_score_state = torch.randn(pool, cfg.c_rows, coff * ihd, device=dev)
-            layer.i_cache = torch.randint(0, 256, (pool, cfg.n_compressed, fp4_row_bytes(ihd)), device=dev).byte()
+            layer.i_cache = torch.randint(0, 256, (pool, *layer.i_cache.shape[1:]), device=dev).byte()
+            layer.i_cache_s = torch.randint(0, 256, (pool, *layer.i_cache_s.shape[1:]), device=dev).byte()
             for sl in slots:
                 layer.kv_state[sl] = 0
                 layer.score_state[sl] = float("-inf")
                 layer.i_kv_state[sl] = 0
                 layer.i_score_state[sl] = float("-inf")
                 layer.i_cache[sl] = 0
+                layer.i_cache_s[sl] = 0
         kv = torch.zeros(S * cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
         outs = []
         for pos in range(steps):

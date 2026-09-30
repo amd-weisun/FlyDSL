@@ -29,6 +29,9 @@ NOPE_DIM = HEAD_DIM - ROPE_DIM  # 448, the FP8-quantized part of the KV row
 O_LORA = 1024
 O_GROUPS = 2  # local; 16 global / 8 ranks
 WINDOW = 128  # sliding-window KV ring
+# Tokens per KV block, ATOM's paging unit for V4 (atom/config.py forces 256): a
+# block holds BLOCK_TOKENS // ratio compressed entries of each compressing layer.
+BLOCK_TOKENS = 256
 
 # MoE. V4 drops V3's group-limited routing: flat top-k over all experts, scored
 # with sqrt(softplus(.)) instead of sigmoid, and a clamped SwiGLU.

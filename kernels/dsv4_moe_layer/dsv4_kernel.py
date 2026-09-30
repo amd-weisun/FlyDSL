@@ -71,6 +71,7 @@ from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 from kernels.common import buffer_ops as bo
 from kernels.common.dpp_utils import update_dpp_i32
 from kernels.dsv4_moe_layer.config import (
+    BLOCK_TOKENS,
     EPS,
     FP8_MAX,
     HC_EPS,
@@ -687,13 +688,25 @@ def build_dsv4_kernel(
     # FP8 bytes, then each 64-wide group's E8M0 byte twice, then padding) and a
     # bf16 RoPE plane [rows, ROPE_DIM]. Otherwise one bf16 plane [rows, HEAD_DIM].
     KV_FP8 = kv_fp8
+    if CR:
+        assert BLOCK_TOKENS % CR == 0, "a block holds a whole number of compressed entries"
     KV_ROW_BYTES = 512
     if KV_FP8:
         assert NOPE_DIM % 64 == 0 and HEAD_DIM - NOPE_DIM == ROPE_DIM and THREADS == HEAD_DIM
     IW = C_COFF * IHD
-    # its key cache row, in dwords: IHD FP4 codes, then one e8m0 scale byte per
-    # 32-element block (reference.pack_fp4's format)
-    IC_ROW_W = (IHD // 2 + IHD // 32) // 4
+    # Compressed entries are PAGED, as ATOM keeps them: entry e of sequence s lives
+    # in block block_tables[s][e // K_PB], K_PB = BLOCK_TOKENS // CR entries a block.
+    # A compressed KV row is dest_rows[1, s] + block * env_rows + e % K_PB (ATOM:
+    # 0, its tables, its envelope height; a contiguous pool: an identity table
+    # with env_rows = K_PB gives dest_rows[1, s] + e). The indexer's key cache is
+    # ATOM's FP4 pool: per block, codes [IHD / 32 groups][K_PB][16 bytes] and E8M0
+    # scales [IHD / 32][K_PB] with the entry axis interleaved (16-row runs:
+    # byte (e % 16) * 4 + (e % K_PB) // 16), at a per-sequence base
+    # state_slots[s] * st_ic bytes (the scale pool's base is 1/16 of it).
+    K_PB = BLOCK_TOKENS // CR if CR else 1
+    IC_GRP_WORDS = K_PB * 16 // 4  # one 32-element group of one block, in dwords
+    IC_BLK_WORDS = (IHD // 32) * IC_GRP_WORDS if IHD else 0
+    IC_S_BLK = (IHD // 32) * K_PB if IHD else 0  # scale bytes of one block
     CW = C_COFF * HEAD_DIM  # width of one state row
     # Rows of state, a RING indexed by absolute position (row = pos % C_ROWS), as
     # ATOM's compressor keeps it: the window pooled at position p is rows
@@ -829,6 +842,7 @@ def build_dsv4_kernel(
         # context, V4's longest
         assert TK_TRIPS * TK_PER <= 32, "the top-k's candidates per thread must fit in registers"
         assert IHD == 128, "the indexer's Hadamard is written for a 128-wide head"
+        assert K_PB == 64, "the FP4 pool's scale interleave is written for 64 entries a block (4 runs of 16)"
         assert IH % WAVES == 0, "one wave takes a whole index head"
         assert IHD - ROPE_DIM == 64, "rope must fall entirely in the head's second half"
     N_UV = H * HEAD_DIM // UV_TILE
@@ -984,12 +998,16 @@ def build_dsv4_kernel(
         state_slots: Int64,
         tok_ids: Int64,
         tid2eid: Int64,
+        block_tables: Int64,
+        i_cache_s: Int64,
         rank: Int32,
         layer: Int32,
         st_kv: Int32,
         st_i: Int32,
         st_ic: Int32,
         use_hash: Int32,
+        bt_stride: Int32,
+        env_rows: Int32,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -1034,6 +1052,14 @@ def build_dsv4_kernel(
             write and the split's 'did we just write this row' test read the same
             value, so they cannot drift apart."""
             return _uniform(bo.buffer_load(r_dest, j * S + s, vec_width=1, dtype=T.i32))
+
+        def bt_block(s, e):
+            """The physical block holding sequence ``s``'s compressed entry ``e``."""
+            return fx.Int32(bo.buffer_load(_rsrc(block_tables), s * bt_stride + e // K_PB, vec_width=1, dtype=T.i32))
+
+        def comp_row(s, e):
+            """Plane row of sequence ``s``'s compressed entry ``e`` (see K_PB)."""
+            return ld_dest(1, s) + bt_block(s, e) * env_rows + e % K_PB
 
         r_slot = _rsrc(state_slots)
 
@@ -2225,7 +2251,7 @@ def build_dsv4_kernel(
                     rot = even.select(nv * rc - partner * rs, partner * rs + nv * rc)
                     dq, byte, e8 = kv_quant(nv)
                     cv = bf16_round((tid < NOPE_DIM).select(dq, rot))
-                    put_kv_row(ld_dest(1, tt) + p // CR, cv, byte, e8)  # this sequence's entry p // CR
+                    put_kv_row(comp_row(tt, p // CR), cv, byte, e8)  # this sequence's entry p // CR
                     if live:
                         put(mb("cnew"), tt * HEAD_DIM + tid, cv)
                 stamp("cmp", tt, 4)
@@ -2281,7 +2307,7 @@ def build_dsv4_kernel(
                 ilive = wave == 0
                 p = ld_pos(tt)  # tt is the sample: its own sequence, its own position
                 isb = ld_slot(tt, st_i)  # this sequence's slice of the rolling state
-                icb = ld_slot(tt, st_ic) // 4  # ... and of the indexer's key cache
+                icb = ld_slot(tt, st_ic)  # ... and of the indexer's key cache (bytes)
                 slot = p % CR
                 chs = [ln, ln + 64]
                 ap0 = [[ld_f32(_rsrc(i_ape), slot * IW + j * IHD + c) for j in range(C_COFF)] for c in chs]
@@ -2345,7 +2371,7 @@ def build_dsv4_kernel(
                     (o0, k0, s0), (o1, k1, s1) = fp4_block(q0), fp4_block(q1)
                     # The cache keeps the codes, not their values: eight lanes' codes
                     # OR into one word (channel 8w + j in nibble j), and the four
-                    # blocks' exponents into the row's last word, block b in byte b.
+                    # groups' exponents into one word, group g in byte g.
                     cw = [k0 << ((ln % 8) * 4), k1 << ((ln % 8) * 4)]
                     for off in (1, 2, 4):
                         cw = [_xred(w, off, lambda a, b: a | b) for w in cw]
@@ -2353,13 +2379,20 @@ def build_dsv4_kernel(
                     sw = (e8[0] << ((ln // 32) * 8)) | (e8[1] << ((ln // 32 + 2) * 8))
                     sw = _xred(sw, 32, lambda a, b: a | b)
                     if ilive:
-                        r_ic = _rsrc(i_cache)
-                        row = icb + (p // CR) * IC_ROW_W
+                        # ATOM's FP4 pool (see K_PB): word w of the entry is group w // 4,
+                        # dword w % 4 of the entry's 16 bytes in that group
+                        e_i = p // CR
+                        blk_i = bt_block(tt, e_i)
+                        sl = e_i % K_PB
+                        dbase = icb // 4 + blk_i * IC_BLK_WORDS + sl * 4
                         if ln % 8 == 0:
-                            bo.buffer_store(cw[0], r_ic, row + ln // 8)
-                            bo.buffer_store(cw[1], r_ic, row + ln // 8 + IHD // 16)
+                            for h in range_constexpr(2):
+                                w = ln // 8 + 8 * h
+                                bo.buffer_store(cw[h], _rsrc(i_cache), dbase + (w // 4) * IC_GRP_WORDS + w % 4)
                         if ln == 0:
-                            bo.buffer_store(sw, r_ic, row + IHD // 8)
+                            sbase = icb // 16 + blk_i * IC_S_BLK + (sl % 16) * 4 + (sl % K_PB) // 16
+                            for g in range_constexpr(IHD // 32):
+                                bo.buffer_store(fx.Int8((sw >> (8 * g)) & 0xFF), _rsrc(i_cache_s), sbase + g * K_PB)
                         put(mb("i_cnew"), tt * IHD + ln, bf16_round(o0))
                         put(mb("i_cnew"), tt * IHD + ln + 64, bf16_round(o1))
                 stamp("i_cmp", tt, 4)
@@ -2563,7 +2596,7 @@ def build_dsv4_kernel(
                 # ONCE, outside the loop below -- `s` is loop-invariant, and adding
                 # it per iteration would put another live value in the body that
                 # was just trimmed to stop it spilling.
-                icb = ld_slot(s, st_ic) // 4
+                icb = ld_slot(s, st_ic)  # bytes; the scale pool's base is 1/16 of it
                 # the entry this launch just wrote is not reliably visible in the
                 # cache yet, so take it from the mailbox instead. Only the task whose
                 # tile holds it polls: the test is CTA-uniform, so all of that task's
@@ -2572,9 +2605,14 @@ def build_dsv4_kernel(
                 # was two thirds of this stage at 1M (23.3 -> 8.6 us a task).
                 is_new = c == sp // CR
                 has_new = ((sp + 1) % CR == 0) & (blk == (sp // CR) // SCORE_TILE)
-                crow = icb + fx.min(c, N_COMP - 1) * IC_ROW_W
-                # the row's four block exponents, one byte each
-                e8s = fx.Int32(bo.buffer_load(r_ic2, crow + IHD // 8, vec_width=1, dtype=T.i32))
+                # ATOM's FP4 pool (see K_PB): this candidate's 16 bytes of each group,
+                # and the dword holding its scale byte of each group
+                cc = fx.min(c, N_COMP - 1)
+                blk_c = bt_block(s, cc)
+                sl = cc % K_PB
+                dbase = icb // 4 + blk_c * IC_BLK_WORDS + sl * 4
+                sdbase = icb // 64 + blk_c * (IC_S_BLK // 4) + sl % 16
+                r_ics = _rsrc(i_cache_s)
                 # A RUNTIME loop, not range_constexpr, one 32-element scale block
                 # per trip. Unrolled, the compiler hoists every key load and query
                 # read to the top of the stage; that is ~130 values more than the
@@ -2590,7 +2628,8 @@ def build_dsv4_kernel(
                     init=[fx.Float32(0.0) for _ in range(IH)],
                 ):
                     kb = fx.Int32(_b)
-                    kwords = fx.Vector(bo.buffer_load(r_ic2, crow + kb * 4, vec_width=4, dtype=T.i32))
+                    kwords = fx.Vector(bo.buffer_load(r_ic2, dbase + kb * IC_GRP_WORDS, vec_width=4, dtype=T.i32))
+                    sdw = fx.Int32(bo.buffer_load(r_ics, sdbase + kb * (K_PB // 4), vec_width=1, dtype=T.i32))
                     kw = []
                     for wi in range_constexpr(4):
                         for sel in range_constexpr(4):
@@ -2601,7 +2640,7 @@ def build_dsv4_kernel(
                             )
                             kw += [pr[0], pr[1]]
                     # the scale goes on the block's partial sums, not on every code
-                    bsc = (((e8s >> (kb * 8)) & 0xFF) << 23).bitcast(fx.Float32)
+                    bsc = (((sdw >> ((sl // 16) * 8)) & 0xFF) << 23).bitcast(fx.Float32)
                     if has_new:
                         nv = getf_many([(mb("i_cnew"), s * IHD + kb * 32 + e) for e in range(32)])
                         kw = [is_new.select(nv[e], kw[e]) for e in range(32)]
@@ -2680,7 +2719,6 @@ def build_dsv4_kernel(
                 stamp("i_topk", tt, 0)
                 s = tt // TK_PARTS
                 part = tt % TK_PARTS  # which share of the candidates this CTA scans
-                c0 = ld_dest(1, s)  # plane row of this sequence's compressed entry 0
                 n_live = fx.min((ld_pos(s) + 1) // CR, fx.Int32(N_COMP))
                 k_want = fx.min(n_live, fx.Int32(N_INDEX))
                 sbase = s * N_COMP
@@ -2804,13 +2842,13 @@ def build_dsv4_kernel(
                             w = fx.Int32(
                                 fx.atomic_add(hist + TK_BC, fx.Int32(1), syncscope=fx.rocdl.SyncScope.Workgroup)
                             )
-                            put(mb("i_sel"), s * N_ISEL + gt_b + w, c0 + c)
+                            put(mb("i_sel"), s * N_ISEL + gt_b + w, comp_row(s, c))
                         if ok & (sk == thr):
                             w = fx.Int32(
                                 fx.atomic_add(hist + TK_BC + 1, fx.Int32(1), syncscope=fx.rocdl.SyncScope.Workgroup)
                             )
                             if (gt + eq_b + w) < k_want:
-                                put(mb("i_sel"), s * N_ISEL + gt + eq_b + w, c0 + c)
+                                put(mb("i_sel"), s * N_ISEL + gt + eq_b + w, comp_row(s, c))
                 # the next task's first digit re-zeroes these counters
                 gpu.barrier()
                 # One part fills the tail, and it is the part that cannot collide:
@@ -2942,7 +2980,7 @@ def build_dsv4_kernel(
             reached by a whole wave or none of it."""
             sp = ld_pos(s)
             w_row = ld_dest(0, s)
-            c_row = (ld_dest(1, s) + sp // CR) if const_expr(CR) else fx.Int32(0)
+            c_row = comp_row(s, sp // CR) if const_expr(CR) else fx.Int32(0)
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
                 kr = lds_ld(keys, j)
@@ -3896,12 +3934,16 @@ def build_dsv4_kernel(
         state_slots: Int64,
         tok_ids: Int64,
         tid2eid: Int64,
+        block_tables: Int64,
+        i_cache_s: Int64,
         rank: Int32,
         layer: Int32,
         st_kv: Int32,
         st_i: Int32,
         st_ic: Int32,
         use_hash: Int32,
+        bt_stride: Int32,
+        env_rows: Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         dsv4_kernel(
@@ -3957,12 +3999,16 @@ def build_dsv4_kernel(
             state_slots,
             tok_ids,
             tid2eid,
+            block_tables,
+            i_cache_s,
             rank,
             layer,
             st_kv,
             st_i,
             st_ic,
             use_hash,
+            bt_stride,
+            env_rows,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
     return launch_dsv4
