@@ -1271,6 +1271,54 @@ def test_dsv4_indexer_score_allreduce_tp8():
     assert all(results[r] for r in range(8))
 
 
+def test_dsv4_indexer_scores_the_new_entry_past_the_first_tile():
+    """The entry written THIS launch is scored from the mailbox, wherever it sits.
+
+    Its cache row is not reliably visible yet when the scorer runs, so the one
+    score task whose tile holds it reads the compressor's copy instead -- and
+    only that task polls, since polling in all of them was two thirds of the
+    stage. Every other scoring test keeps all entries inside the first tile of
+    SCORE_TILE candidates, so a gate that picked the wrong task would still pass
+    them. Here the newest entry lands in the second tile. The cache is poisoned
+    first, so a read of the row before its write lands is garbage, not a lucky
+    zero; the reference is the kernel's own query, weights and (by then written)
+    row, so what is checked is exactly where the score's key came from.
+    """
+    from kernels.dsv4_moe_layer.dsv4_kernel import SCORE_TILE
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    torch.manual_seed(0)
+    ratio = COMPRESS_CSA
+    cfg = _cfg(hc_mult=1)
+    cfg.compress_ratio, cfg.max_seq = ratio, 4096
+    ih, ihd = cfg.index_heads, cfg.index_head_dim
+    assert cfg.n_compressed > SCORE_TILE + 4, "the shape must reach the second score tile"
+    dev, mode = "cuda", MoeMode.W8A8
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
+    layer.i_cache.copy_(torch.randint(0, 256, layer.i_cache.shape, device=dev))
+    cos, sin = rope_table(cfg.max_seq, theta=cfg.rope_base, device=dev)
+    kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+
+    # the last entry of tile 0 as a control, then the first four of tile 1
+    checks = [ratio * (SCORE_TILE + j) - 1 for j in range(5)]
+    for pos in range(checks[-1] + 1):
+        h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
+        cur = torch.tensor([pos], dtype=torch.int32, device=dev)
+        idx, dest = contiguous_pool([pos], cfg, dev)
+        layer.forward(h, cur, kv_k, dest, idx, cos, sin)
+        if pos not in checks:
+            continue
+        torch.cuda.synchronize()
+        new = pos // ratio
+        q = layer.debug("i_q", (1, ih, ihd))[0]
+        w = layer.debug("i_wp", (1, ih))[0]
+        got = layer.debug("i_score", (1, cfg.n_compressed))[0][new].item()
+        ref = ((q @ unpack_fp4(layer.i_cache[0, new])).relu() * w).sum().item()
+        assert abs(got - ref) <= 1e-3 * max(abs(ref), 1e-3), f"pos={pos} entry {new}: score {got} vs {ref}"
+    layer.close()
+
+
 def test_dsv4_indexer_topk_in_kernel():
     """Which compressed entries the kernel's indexer selects, against the golden.
 

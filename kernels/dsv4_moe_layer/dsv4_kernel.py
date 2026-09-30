@@ -2512,10 +2512,13 @@ def build_dsv4_kernel(
                 # was just trimmed to stop it spilling.
                 icb = ld_slot(s, st_ic) // 4
                 # the entry this launch just wrote is not reliably visible in the
-                # cache yet, so take it from the mailbox instead. The outer test is
-                # CTA-uniform, so every thread reaches the poll; only the thread
-                # holding that candidate uses the value.
+                # cache yet, so take it from the mailbox instead. Only the task whose
+                # tile holds it polls: the test is CTA-uniform, so all of that task's
+                # threads reach the poll and only the one holding the entry uses it.
+                # Polling in every task cost 128 coherent round trips per thread and
+                # was two thirds of this stage at 1M (23.3 -> 8.6 us a task).
                 is_new = c == sp // CR
+                has_new = ((sp + 1) % CR == 0) & (blk == (sp // CR) // SCORE_TILE)
                 crow = icb + fx.min(c, N_COMP - 1) * IC_ROW_W
                 # the row's four block exponents, one byte each
                 e8s = fx.Int32(bo.buffer_load(r_ic2, crow + IHD // 8, vec_width=1, dtype=T.i32))
@@ -2546,14 +2549,18 @@ def build_dsv4_kernel(
                             kw += [pr[0], pr[1]]
                     # the scale goes on the block's partial sums, not on every code
                     bsc = (((e8s >> (kb * 8)) & 0xFF) << 23).bitcast(fx.Float32)
-                    if (sp + 1) % CR == 0:
-                        nv = [getf(mb("i_cnew"), s * IHD + kb * 32 + e) for e in range(32)]
+                    if has_new:
+                        nv = getf_many([(mb("i_cnew"), s * IHD + kb * 32 + e) for e in range(32)])
                         kw = [is_new.select(nv[e], kw[e]) for e in range(32)]
                         bsc = is_new.select(fx.Float32(1.0), bsc)
+                    # the query four floats per LDS read: every lane reads the same
+                    # address, so a read is a broadcast and width is all it costs
                     kpart = [fx.Float32(0.0) for _ in range(IH)]
-                    for e in range_constexpr(32):
+                    for g in range_constexpr(8):
                         for hh in range_constexpr(IH):
-                            kpart[hh] = kpart[hh] + kw[e] * lds_ld(xs, hh * IHD + kb * 32 + e)
+                            qv = fx.Vector(fx.ptr_load(xs + (hh * IHD + kb * 32 + g * 4), result_type=v4f))
+                            for e in range_constexpr(4):
+                                kpart[hh] = kpart[hh] + kw[g * 4 + e] * qv[e]
                     res = yield [fx.Float32(acc[hh]) + kpart[hh] * bsc for hh in range(IH)]
                 sc_t = fx.Float32(0.0)
                 for hh in range_constexpr(IH):
