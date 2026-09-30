@@ -289,7 +289,9 @@ class Dsv4MoeLayer:
         words = self.scratch[off : off + n * 8].view(torch.int32).view(n, 2)[:, 0].contiguous()
         return words.view(dtype).view(shape)
 
-    def forward(self, h, cur_pos, kv_cache, dest_rows, indices, cos, sin, x_out=None, layer=0, advance=True):
+    def forward(
+        self, h, cur_pos, kv_cache, dest_rows, indices, cos, sin, x_out=None, layer=0, advance=True, tokens=None
+    ):
         """One layer.  Mailbox epochs are ``step * 128 + layer + 1``: layers sharing
         this scratch within a decode step need distinct ``layer``; call
         ``advance_step`` (or pass ``advance=True``) once per step.  Both are
@@ -319,6 +321,10 @@ class Dsv4MoeLayer:
                 "the samples are independent sequences, each at its own offset"
             )
         t = dict(self.W.t, **self.packed)
+        # A hash-routed layer picks its experts by token id: tid2eid [vocab, top_k].
+        use_hash = "tid2eid" in t
+        if use_hash and (tokens is None or tokens.numel() != self.S or tokens.dtype != torch.int32):
+            raise ValueError(f"a hash-routed layer needs tokens: int32, one per sample ({self.S})")
         if x_out is None:
             x_out = torch.empty(*hshape, dtype=torch.bfloat16, device=h.device)
         p = lambda x: x.data_ptr()  # noqa: E731
@@ -372,11 +378,14 @@ class Dsv4MoeLayer:
             0 if self.timeline is None else p(self.timeline),
             p(self.step),
             p(self.state_slots),
+            p(tokens) if use_hash else 0,
+            p(t["tid2eid"]) if use_hash else 0,
             self.rank,
             layer,
             self.st_kv,
             self.st_i,
             self.st_ic,
+            int(use_hash),
             stream=torch.cuda.current_stream(),
         )
         if advance:

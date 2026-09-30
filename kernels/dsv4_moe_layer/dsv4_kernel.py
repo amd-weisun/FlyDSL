@@ -969,11 +969,14 @@ def build_dsv4_kernel(
         timeline_buf: Int64,
         step: Int64,
         state_slots: Int64,
+        tok_ids: Int64,
+        tid2eid: Int64,
         rank: Int32,
         layer: Int32,
         st_kv: Int32,
         st_i: Int32,
         st_ic: Int32,
+        use_hash: Int32,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -1636,7 +1639,13 @@ def build_dsv4_kernel(
             lane + 64 i).  V4 has no group-limited routing -- selection is flat over all
             experts.  Returns (expert id, route weight = raw score / sum of the TOP_K
             raw scores * ROUTE_SCALE) of pick ``lane`` in score order, valid in
-            lanes < TOP_K."""
+            lanes < TOP_K.
+
+            A hash-routed layer (``use_hash``, V4's first ``num_hash_layers``) takes the
+            ids from ``tid2eid[token]`` instead of selecting them, and weights them the
+            same way. Decided at run time, not build time, so hash and scored layers
+            of one attention variant still share a kernel; the selection is a few
+            wave-max rounds either way."""
             KPL = N_EXPERTS // 64  # selection keys held per lane
             if const_expr(bs is None):
                 bs = load_bias()
@@ -1668,6 +1677,15 @@ def build_dsv4_kernel(
                     )
                 )
             e = ID_MASK - (mv & ID_MASK)
+            # A scored layer passes null for both tables: zero records makes these
+            # loads return 0 in the texture unit instead of faulting on the address.
+            nrec = (use_hash != 0).select(fx.Int32(0x7FFFFFF0), fx.Int32(0))
+            r_tok = bo.create_buffer_resource_from_addr(tok_ids, num_records_bytes=nrec)
+            r_t2e = bo.create_buffer_resource_from_addr(tid2eid, num_records_bytes=nrec)
+            tok = fx.Int32(bo.buffer_load(r_tok, s, vec_width=1, dtype=T.i32))
+            hk = tok * TOP_K + fx.min(lane, fx.Int32(TOP_K - 1))
+            e_hash = fx.Int32(bo.buffer_load(r_t2e, hk, vec_width=1, dtype=T.i32))
+            e = (use_hash != 0).select(e_hash, e)
             src = (e % 64) * 4
             got = [fx.Int32(rocdl.ds_bpermute(T.i32, src.ir_value(), r.bitcast(fx.Int32).ir_value())) for r in raws]
             raw = got[0]
@@ -3823,11 +3841,14 @@ def build_dsv4_kernel(
         timeline_buf: Int64,
         step: Int64,
         state_slots: Int64,
+        tok_ids: Int64,
+        tid2eid: Int64,
         rank: Int32,
         layer: Int32,
         st_kv: Int32,
         st_i: Int32,
         st_ic: Int32,
+        use_hash: Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         dsv4_kernel(
@@ -3880,11 +3901,14 @@ def build_dsv4_kernel(
             timeline_buf,
             step,
             state_slots,
+            tok_ids,
+            tid2eid,
             rank,
             layer,
             st_kv,
             st_i,
             st_ic,
+            use_hash,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
     return launch_dsv4

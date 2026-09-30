@@ -1626,6 +1626,48 @@ def test_dsv4_indexer_topk_at_a_full_1m_context():
     layer.close()
 
 
+@pytest.mark.parametrize("S", [1, 2])
+def test_dsv4_hash_routing_takes_the_table(S):
+    """V4's first layers route by token id: tid2eid[token] names the experts.
+
+    The kernel must pick exactly the table's row for each sample's token -- no
+    scored selection leaking through -- and weight them as the golden does. A
+    random table has none of the scores' structure, so a kernel that ignored it
+    and routed by score would pick an unrelated set.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    torch.manual_seed(0)
+    dev, mode = "cuda", MoeMode.W8A8
+    cfg = _cfg(hc_mult=1)
+    cfg.validate()
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    vocab = 1000
+    W.t["tid2eid"] = torch.stack([torch.randperm(cfg.n_experts, device=dev)[: cfg.top_k] for _ in range(vocab)]).to(
+        torch.int32
+    )
+    layer = Dsv4MoeLayer(W, samples=S, rank=0, npes=1, moe_mode=mode)
+    tokens = torch.randint(0, vocab, (S,), dtype=torch.int32, device=dev)
+    h = (0.5 * torch.randn(S, cfg.hidden, device=dev)).bfloat16()
+    pos = cfg.window
+    cur = torch.tensor([pos] * S, dtype=torch.int32, device=dev)
+    kv0 = (0.3 * torch.randn(S * cfg.window, cfg.head_dim, device=dev)).bfloat16()
+    idx, dest = contiguous_pool([pos] * S, cfg, dev)
+    cos, sin = rope_table(4096, theta=cfg.rope_theta, device=dev)
+    out = layer.forward(h, cur, kv0.clone(), dest, idx, cos, sin, tokens=tokens)
+    torch.cuda.synchronize()
+    got = layer.intermediates()
+    ref = golden_layer(W, h, [pos] * S, kv0.clone(), dest, idx, cos, sin, lambda z: z, moe_mode=mode, tokens=tokens)
+    for s in range(S):
+        want = set(W.t["tid2eid"][tokens[s].long()].tolist())
+        picked = set(got["sel"][s].tolist()[1:])  # slot 0 is the shared expert
+        assert picked == want, f"sample {s}: routed to {sorted(picked)}, table says {sorted(want)}"
+    a, b = out.float(), ref["x_out"].float()
+    rel = ((a - b).norm() / b.norm()).item()
+    assert rel < _tol(OUT_REL_L2, cfg.hc_mult, 1), f"x_out rel_l2 {rel:.5f}"
+    layer.close()
+
+
 @pytest.mark.parametrize("ratio", [0, COMPRESS_CSA])
 def test_dsv4_batching_is_independent_sequences(ratio):
     """The kernel at S=2 must equal the kernel run twice at S=1.

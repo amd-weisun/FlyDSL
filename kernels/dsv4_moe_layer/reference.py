@@ -765,8 +765,12 @@ def golden_layer(
     i_state=None,
     i_score_state=None,
     i_cache=None,
+    tokens=None,
 ):
     """One rank's view of a V4 layer. Mutates ``kv_cache`` (and the compressor state).
+
+    A hash-routed layer (``W.t`` holds ``tid2eid``) routes by ``tokens`` [S], one
+    token id per sample, instead of by score.
 
     ``h`` is [S, hidden] when ``cfg.hc_mult == 1`` (plain residual) and
     [S, hc_mult, hidden] otherwise -- V4 carries hc_mult parallel residual
@@ -892,7 +896,11 @@ def golden_layer(
     else:
         a = (h.float() + attn_out).to(torch.bfloat16)
 
-    moe = golden_moe(W, a, allreduce, moe_mode=moe_mode)
+    hash_ids = None
+    if "tid2eid" in t:
+        assert tokens is not None, "a hash-routed layer needs the token ids"
+        hash_ids = t["tid2eid"][tokens.long()]
+    moe = golden_moe(W, a, allreduce, moe_mode=moe_mode, hash_ids=hash_ids)
     # attn_out is the attention half BEFORE the residual/hc mix -- the exact
     # thing ATOM's DeepseekV4Attention.forward_impl returns, so the two can be
     # compared without modelling either side's residual path.
