@@ -192,6 +192,7 @@ def layout(
     index_heads_total: int = 0,
     index_topk: int = 0,
     max_seq: int = 0,
+    kv_fp8: bool = False,
 ):
     """Byte offsets of the per-rank scratch and of the symmetric buffer.
 
@@ -515,6 +516,7 @@ def stage_tasks(
     index_heads_total: int = 0,
     index_topk: int = 0,
     max_seq: int = 0,
+    kv_fp8: bool = False,
 ):
     """[(stage name, task count)] in execution order.
 
@@ -589,6 +591,7 @@ def build_dsv4_kernel(
     index_heads_total: int = 0,
     index_topk: int = 0,
     max_seq: int = 0,
+    kv_fp8: bool = False,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole V4 layer.
 
@@ -680,6 +683,13 @@ def build_dsv4_kernel(
     # own smaller head_dim, Hadamard-rotated and FP4-quantized. IHD == 0 is "no
     # indexer" and compiles the whole thing out.
     IHD = index_head_dim
+    # KV rows in ATOM's fp8 layout: a NoPE plane of KV_ROW_BYTES per row (NOPE_DIM
+    # FP8 bytes, then each 64-wide group's E8M0 byte twice, then padding) and a
+    # bf16 RoPE plane [rows, ROPE_DIM]. Otherwise one bf16 plane [rows, HEAD_DIM].
+    KV_FP8 = kv_fp8
+    KV_ROW_BYTES = 512
+    if KV_FP8:
+        assert NOPE_DIM % 64 == 0 and HEAD_DIM - NOPE_DIM == ROPE_DIM and THREADS == HEAD_DIM
     IW = C_COFF * IHD
     # its key cache row, in dwords: IHD FP4 codes, then one e8m0 scale byte per
     # 32-element block (reference.pack_fp4's format)
@@ -926,6 +936,7 @@ def build_dsv4_kernel(
         x_out: Int64,
         cur_pos: Int64,
         kv_cache: Int64,
+        kv_rope: Int64,
         dest_rows: Int64,
         indices: Int64,
         rope_cos: Int64,
@@ -2048,13 +2059,57 @@ def build_dsv4_kernel(
                     put(mb("i_gate"), s * IW + row - Q_LORA - HEAD_DIM - 2 * CW - IW, v)
             stamp("qkv_a", t, 4)
 
+        def kv_quant(nv):
+            """This thread's KV channel through the NoPE FP8 round trip, one 64-wide
+            group per wave with a power-of-two scale, 2**ceil(log2(amax / 448)) (the
+            checkpoint's ue8m0; what ATOM's writers use).
+
+            Returns (dequantized value, FP8 byte, the group's E8M0 byte)."""
+            amax = wave_max(fmath.absf(nv))
+            sc = _pow2_ceil(fx.max(amax, fx.Float32(FP8_MAX * 2.0**-126)) * (1.0 / FP8_MAX))
+            q = fx.min(fx.max(nv * _rcp(sc), -FP8_MAX), FP8_MAX)  # _rcp is exact on a power of two
+            word = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q, q, fx.Int32(0), False))
+            v2 = fx.Vector.make_type(2, fx.Float32)
+            d = fx.Vector(rocdl.cvt_pk_f32_fp8(res=v2, src=word, word_sel=False))[0]
+            return d * sc, word & 0xFF, (sc.bitcast(fx.Int32) >> 23) & 0xFF
+
+        def put_kv_row(row, kvn, byte, e8):
+            """Write one KV row (thread = channel; ``kvn`` its value, ``byte`` / ``e8``
+            from kv_quant). CTA-uniform: the fp8 layout trades scale bytes through LDS."""
+            if const_expr(KV_FP8):
+                r_nope, r_rope = _rsrc(kv_cache), _rsrc(kv_rope)
+                # four lanes' FP8 bytes to one dword, channel tid in byte tid % 4
+                wb = byte << ((tid % 4) * 8)
+                for off in (1, 2):
+                    wb = _xred(wb, off, lambda a, b: a | b)
+                if (tid < NOPE_DIM) & (tid % 4 == 0):
+                    bo.buffer_store(wb, r_nope, row * (KV_ROW_BYTES // 4) + tid // 4)
+                if tid >= NOPE_DIM:
+                    bo.buffer_store(kvn.to(fx.BFloat16), r_rope, row * ROPE_DIM + tid - NOPE_DIM)
+                if (lane == 0) & (tid < NOPE_DIM):
+                    lds_st(misc, wave, e8.bitcast(fx.Float32))
+                gpu.barrier()
+                # scale dword k: groups 2k and 2k + 1, each byte twice (the last
+                # dword's high half is padding)
+                NG = NOPE_DIM // 64
+                if tid < (NG + 1) // 2:
+                    lo = lds_ld(misc, fx.min(2 * tid, fx.Int32(NG - 1))).bitcast(fx.Int32)
+                    hi = (2 * tid + 1 < NG).select(
+                        lds_ld(misc, fx.min(2 * tid + 1, fx.Int32(NG - 1))).bitcast(fx.Int32), fx.Int32(0)
+                    )
+                    sw = lo | (lo << 8) | (hi << 16) | (hi << 24)
+                    bo.buffer_store(sw, r_nope, row * (KV_ROW_BYTES // 4) + NOPE_DIM // 4 + tid)
+                gpu.barrier()
+            else:
+                if tid < HEAD_DIM:
+                    bo.buffer_store(kvn.to(fx.BFloat16), _rsrc(kv_cache), row * HEAD_DIM + tid)
+
         # ====== 2. KV RMSNorm + RoPE + FP8 round trip -> sliding-window ring cache
         # V4's K and V are the same HEAD_DIM row: RoPE occupies its last ROPE_DIM
         # lanes and the leading NOPE_DIM is FP8 round-tripped in 64-wide blocks
         # (one block per wave), matching the checkpoint's QAT.
         for t in range(start("cache"), 1, G):
             stamp("cache", t, 0)
-            r_kv = _rsrc(kv_cache)
             # gamma and the RoPE factors are issued ahead of the wait
             g = ld_bf16(_rsrc(g_kv), fx.min(tid, HEAD_DIM - 1))
             ri = fx.max(tid - NOPE_DIM, fx.Int32(0)) // 2
@@ -2077,15 +2132,11 @@ def build_dsv4_kernel(
                 partner = _xshfl(nv, 1)
                 even = tid % 2 == 0
                 rot = even.select(nv * cs[s] - partner * sns[s], partner * sns[s] + nv * cs[s])
-                # nope head: one 64-wide FP8 block per wave
-                amax = wave_max(fmath.absf(nv))
-                nz = amax > 0.0
-                qs = nz.select(amax * (1.0 / FP8_MAX), fx.Float32(1.0))
-                inv = nz.select(_rcp(amax) * FP8_MAX, fx.Float32(1.0))
-                d0, _ = _fp8_roundtrip(fx.min(fx.max(nv * inv, -FP8_MAX), FP8_MAX), fx.Float32(0.0))
-                kvn = bf16_round((tid < NOPE_DIM).select(d0 * qs, rot))
+                # nope head: one 64-wide FP8 group per wave
+                dq, byte, e8 = kv_quant(nv)
+                kvn = bf16_round((tid < NOPE_DIM).select(dq, rot))
+                put_kv_row(ld_dest(0, s), kvn, byte, e8)
                 if live:
-                    bo.buffer_store(kvn.to(fx.BFloat16), r_kv, ld_dest(0, s) * HEAD_DIM + tid)
                     put(mb("kvnew"), s * HEAD_DIM + tid, kvn)
             stamp("cache", t, 4)
 
@@ -2172,15 +2223,10 @@ def build_dsv4_kernel(
                     partner = _xshfl(nv, 1)
                     even = tid % 2 == 0
                     rot = even.select(nv * rc - partner * rs, partner * rs + nv * rc)
-                    amax = wave_max(fmath.absf(nv))
-                    nz = amax > 0.0
-                    qs = nz.select(amax * (1.0 / FP8_MAX), fx.Float32(1.0))
-                    inv = nz.select(_rcp(amax) * FP8_MAX, fx.Float32(1.0))
-                    d0, _ = _fp8_roundtrip(fx.min(fx.max(nv * inv, -FP8_MAX), FP8_MAX), fx.Float32(0.0))
-                    cv = bf16_round((tid < NOPE_DIM).select(d0 * qs, rot))
+                    dq, byte, e8 = kv_quant(nv)
+                    cv = bf16_round((tid < NOPE_DIM).select(dq, rot))
+                    put_kv_row(ld_dest(1, tt) + p // CR, cv, byte, e8)  # this sequence's entry p // CR
                     if live:
-                        crow = ld_dest(1, tt) + p // CR  # this sequence's entry p // CR
-                        bo.buffer_store(cv.to(fx.BFloat16), _rsrc(kv_cache), crow * HEAD_DIM + tid)
                         put(mb("cnew"), tt * HEAD_DIM + tid, cv)
                 stamp("cmp", tt, 4)
 
@@ -2853,9 +2899,36 @@ def build_dsv4_kernel(
             krows = [fx.max(lds_ld(keys, wave * KPW + jj), fx.Int32(0)) for jj in range(KPW)]
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
-                kv8 = fx.Vector(
-                    bo.buffer_load(r_kv, krows[jj] * (HEAD_DIM // 2) + lane * WPL, vec_width=WPL, dtype=T.i32)
-                )
+                if const_expr(KV_FP8):
+                    # lanes < NOPE_DIM / EPL take 8 FP8 bytes of the NoPE plane and
+                    # their group's E8M0 byte; the rest read the bf16 RoPE plane.
+                    # FP8 times a power of two is exact in bf16, so the tile holds
+                    # the very values the model would.
+                    rb = krows[jj] * (KV_ROW_BYTES // 4)
+                    q8 = fx.Vector(
+                        bo.buffer_load(
+                            r_kv, rb + fx.min(lane, fx.Int32(NOPE_DIM // EPL - 1)) * 2, vec_width=2, dtype=T.i32
+                        )
+                    )
+                    g = fx.min(lane, fx.Int32(NOPE_DIM // EPL - 1)) // (64 // EPL)  # this lane's 64-group
+                    sw = fx.Int32(bo.buffer_load(r_kv, rb + NOPE_DIM // 4 + g // 2, vec_width=1, dtype=T.i32))
+                    sc = (((sw >> ((g % 2) * 16)) & 0xFF) << 23).bitcast(fx.Float32)
+                    nope = (_fp8_to_bf16x8(q8[0], q8[1]).to(fx.Float32) * sc).to(fx.BFloat16)
+                    rope = fx.Vector(
+                        bo.buffer_load(
+                            _rsrc(kv_rope),
+                            krows[jj] * (ROPE_DIM // 2) + fx.max(lane - NOPE_DIM // EPL, fx.Int32(0)) * WPL,
+                            vec_width=WPL,
+                            dtype=T.i32,
+                        )
+                    )
+                    nw = nope.bitcast(fx.Int32)
+                    is_n = lane < NOPE_DIM // EPL
+                    kv8 = fx.Vector.from_elements([is_n.select(nw[m], rope[m]) for m in range(WPL)], fx.Int32)
+                else:
+                    kv8 = fx.Vector(
+                        bo.buffer_load(r_kv, krows[jj] * (HEAD_DIM // 2) + lane * WPL, vec_width=WPL, dtype=T.i32)
+                    )
                 fx.ptr_store(kv8.bitcast(fx.Float32), ktile + (j * KS + lane * WPL))
 
         def patch_new_kv(s):
@@ -3775,6 +3848,7 @@ def build_dsv4_kernel(
         x_out: Int64,
         cur_pos: Int64,
         kv_cache: Int64,
+        kv_rope: Int64,
         dest_rows: Int64,
         indices: Int64,
         rope_cos: Int64,
@@ -3835,6 +3909,7 @@ def build_dsv4_kernel(
             x_out,
             cur_pos,
             kv_cache,
+            kv_rope,
             dest_rows,
             indices,
             rope_cos,

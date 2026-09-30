@@ -33,6 +33,7 @@ from kernels.dsv4_moe_layer.config import (
     COMPRESS_ROPE_THETA,
     COMPRESS_SWA,
     EPS,
+    FP8_MAX,
     HC_EPS,
     HC_MULT,
     HC_SINKHORN_ITERS,
@@ -99,6 +100,9 @@ class V4Config:
     hc_mult: int = HC_MULT  # 1 = plain residual
     hc_sinkhorn_iters: int = HC_SINKHORN_ITERS
     hc_eps: float = HC_EPS
+    # KV rows in ATOM's fp8 layout (packed NoPE + E8M0 plane, bf16 RoPE plane)
+    # rather than one bf16 plane. A storage format: the values are the same.
+    kv_fp8: bool = False
 
     @property
     def hc_mix(self) -> int:
@@ -363,6 +367,53 @@ FP4_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 FP4_BLOCK = 32
 
 
+# The KV row's NoPE part is FP8 E4M3 in 64-wide groups with a power-of-two (E8M0)
+# scale: 2**ceil(log2(amax / 448)), the checkpoint's ue8m0 rule and the one ATOM's
+# writers use. ATOM's fp8 KV row packs it as 448 FP8 bytes, then each group's scale
+# byte twice (bytes 448..461), then padding to 512; the RoPE tail is a separate bf16
+# plane [rows, 64] (atom/model_ops/v4_kernels/v4_quant.py).
+KV_GROUP = 64
+KV_ROW_BYTES = 512
+
+
+def _kv_group_exp(xb: torch.Tensor) -> torch.Tensor:
+    """Per-group biased E8M0 exponent of ``2**ceil(log2(amax / 448))`` (int32)."""
+    amax = xb.abs().amax(-1).clamp(min=FP8_MAX * 2.0**-126)
+    bits = (amax / FP8_MAX).view(torch.int32)
+    return ((bits >> 23) & 0xFF) + ((bits & ((1 << 23) - 1)) != 0).to(torch.int32)
+
+
+def kv_quant_dequant(x: torch.Tensor) -> torch.Tensor:
+    """The KV NoPE part's FP8 round trip: 64-wide groups, power-of-two scales."""
+    xb = x.float().reshape(*x.shape[:-1], -1, KV_GROUP)
+    s = torch.ldexp(torch.ones_like(xb[..., 0]), _kv_group_exp(xb) - 127)[..., None]
+    return ((xb / s).to(torch.float8_e4m3fn).float() * s).reshape(x.shape)
+
+
+def encode_kv_fp8(rows: torch.Tensor, rope_dim: int = ROPE_DIM) -> tuple[torch.Tensor, torch.Tensor]:
+    """KV rows [..., head_dim] -> ATOM's fp8 layout: (NoPE plane uint8 [..., 512], RoPE bf16 [..., rope_dim])."""
+    nope = rows[..., :-rope_dim].float()
+    xb = nope.reshape(*nope.shape[:-1], -1, KV_GROUP)
+    e = _kv_group_exp(xb)
+    q = (xb / torch.ldexp(torch.ones_like(xb[..., 0]), e - 127)[..., None]).to(torch.float8_e4m3fn)
+    out = torch.zeros(*rows.shape[:-1], KV_ROW_BYTES, dtype=torch.uint8, device=rows.device)
+    n = nope.shape[-1]
+    out[..., :n] = q.reshape(nope.shape).view(torch.uint8)
+    out[..., n : n + 2 * e.shape[-1]] = e.to(torch.uint8).repeat_interleave(2, dim=-1)
+    # contiguous: a slice of `rows` would carry its row stride, and the plane is [rows, rope_dim]
+    return out, rows[..., -rope_dim:].to(torch.bfloat16).contiguous()
+
+
+def decode_kv_fp8(nope: torch.Tensor, rope: torch.Tensor, head_dim: int = HEAD_DIM) -> torch.Tensor:
+    """ATOM's fp8 KV layout -> float rows [..., head_dim] (first copy of each scale byte)."""
+    n = head_dim - rope.shape[-1]
+    ng = n // KV_GROUP
+    q = nope[..., :n].contiguous().view(torch.float8_e4m3fn).float().reshape(*nope.shape[:-1], ng, KV_GROUP)
+    e = nope[..., n : n + 2 * ng : 2].long()
+    v = (q * torch.ldexp(torch.ones_like(q[..., 0]), e - 127)[..., None]).reshape(*nope.shape[:-1], n)
+    return torch.cat([v, rope.float()], dim=-1)
+
+
 def hadamard(x: torch.Tensor) -> torch.Tensor:
     """Fast Walsh-Hadamard transform over the last dim, scaled by n**-0.5.
 
@@ -568,7 +619,7 @@ def compress_step(
         v = bf(hadamard(v))
         cache[row] = pack_fp4(v)
         return quant_dequant_fp4(v)
-    v = torch.cat([quant_dequant(v[:-rd], 64), v[-rd:]])
+    v = torch.cat([kv_quant_dequant(v[:-rd]), v[-rd:]])
     cache[row] = v.to(torch.bfloat16)
     return v
 
@@ -824,7 +875,7 @@ def golden_layer(
     for s in range(S):
         p = positions[s]
         v = rmsnorm(kv[s], t["g_kv"], cfg.eps)
-        v = torch.cat([quant_dequant(v[:-rd], 64), rope(v[-rd:], cos[p], sin[p])])
+        v = torch.cat([kv_quant_dequant(v[:-rd]), rope(v[-rd:], cos[p], sin[p])])
         kv_cache[int(dest_rows[0, s])] = v.to(torch.bfloat16)
         if cfg.compress_ratio:
             # the compressor sees the same normed input the projections do, and

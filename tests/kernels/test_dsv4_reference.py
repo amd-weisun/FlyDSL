@@ -56,6 +56,11 @@ def _oracle():
         sys.path.insert(0, ORACLE_DIR)
     import model as oracle_model
 
+    # model.py keeps scale_fmt as a module global that only Transformer.__init__
+    # sets; these tests build its submodules directly, so without this every FP8
+    # round trip in the oracle used exact scales whatever ModelArgs said. The
+    # checkpoint's is ue8m0 -- power-of-two scales, as the golden and kernel use.
+    oracle_model.scale_fmt = "ue8m0"
     return oracle_model
 
 
@@ -85,7 +90,7 @@ def _oracle_modules(om, cfg, device):
         max_batch_size=1,
         max_seq_len=256,
         dtype="bf16",
-        scale_fmt=None,  # exact amax scales, matching the kernel's FP8 path
+        scale_fmt="ue8m0",  # the checkpoint's power-of-two scales, as the golden and the kernel use
         scale_dtype="fp32",
         vocab_size=32,
         dim=cfg.hidden,
@@ -199,7 +204,7 @@ def _oracle_args(om, cfg):
         max_batch_size=1,
         max_seq_len=256,
         dtype="bf16",
-        scale_fmt=None,
+        scale_fmt="ue8m0",
         scale_dtype="fp32",
         vocab_size=32,
         dim=cfg.hidden,

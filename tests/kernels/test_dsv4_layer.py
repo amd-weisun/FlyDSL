@@ -26,6 +26,8 @@ from kernels.dsv4_moe_layer.reference import (
     golden_moe,
     layer_idxs,
     contiguous_pool,
+    decode_kv_fp8,
+    encode_kv_fp8,
     make_weights,
     dequant,
     fp4_row_bytes,
@@ -105,9 +107,21 @@ def _routing_flipped(got, ref, W, cfg, S):
             # scores traded places. `mid` is per slot so the caller still rebases,
             # but there is no membership change to explain and the cut margin is
             # not the gap that moved.
-        sc = (got["scores"][s].float() + W.t["bias"].float()).sort(descending=True).values
+        key = got["scores"][s].float() + W.t["bias"].float()
+        if "tid2eid" not in W.t:
+            # the selection itself is checked exactly, on the kernel's own scores:
+            # a routing bug shows here whatever the noise between the two sides
+            own = set(key.topk(cfg.top_k).indices.tolist())
+            assert set(a) - {cfg.shared_expert} == own, f"sample {s} did not pick its own top-{cfg.top_k}"
+        sc = key.sort(descending=True).values
         margin = (sc[cfg.top_k - 1] - sc[cfg.top_k]).item()
-        assert margin < 1e-4, f"sample {s} chose a different expert SET on a {margin:.3e} margin"
+        # Against the golden it is a flip only if the cut is within the two
+        # sides' score noise. A fixed 1e-4 held only by luck of the seeds: in a
+        # chained stack the scores differ by ~1e-2, and a new seed found a 4e-4 tie.
+        noise = 2 * (got["scores"][s].float() - ref["scores"][s].float()).abs().max().item()
+        assert margin < max(1e-4, noise), (
+            f"sample {s} chose a different expert SET on a {margin:.3e} margin (score noise {noise:.1e})"
+        )
     return True
 
 
@@ -1626,6 +1640,45 @@ def test_dsv4_indexer_topk_at_a_full_1m_context():
     layer.close()
 
 
+def test_dsv4_fp8_kv_reads_each_groups_own_scale():
+    """The fp8 KV read must take each 64-wide group's scale from its own byte.
+
+    Rows the kernel writes itself are no test of this: neighbouring groups of a
+    normed row nearly always share a power-of-two scale, so reading a neighbour's
+    byte changes nothing -- which is how such a read bug passed the stack test.
+    Here the window is pre-filled with rows whose group g is scaled by 4**g, so a
+    group read at another's scale is off by 4x or more.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    torch.manual_seed(0)
+    dev, mode, S = "cuda", MoeMode.W8A8, 1
+    cfg = _cfg(hc_mult=1)
+    cfg.kv_fp8 = True
+    cfg.validate()
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    layer = Dsv4MoeLayer(W, samples=S, rank=0, npes=1, moe_mode=mode)
+    nope = cfg.head_dim - cfg.rope_dim
+    gain = torch.ones(cfg.head_dim, device=dev)
+    gain[:nope] = 4.0 ** (torch.arange(nope, device=dev) // 64 - 3).float()
+    kv0 = (0.3 * torch.randn(S * cfg.window, cfg.head_dim, device=dev) * gain).bfloat16()
+    planes = encode_kv_fp8(kv0)
+    kv_ref = decode_kv_fp8(*planes).bfloat16()  # the same values, as the golden's bf16 plane
+    h = (0.5 * torch.randn(S, cfg.hidden, device=dev)).bfloat16()
+    pos = cfg.window
+    cur = torch.tensor([pos] * S, dtype=torch.int32, device=dev)
+    idx, dest = contiguous_pool([pos] * S, cfg, dev)
+    cos, sin = rope_table(4096, theta=cfg.rope_theta, device=dev)
+    layer.forward(h, cur, planes, dest, idx, cos, sin)
+    torch.cuda.synchronize()
+    got = layer.intermediates()
+    ref = golden_layer(W, h, [pos] * S, kv_ref, dest, idx, cos, sin, lambda z: z, moe_mode=mode)
+    a, b = got["o"].float(), ref["o"].float()
+    rel = ((a - b).norm() / b.norm()).item()
+    assert rel < 2e-2, f"attention output off the golden by rel_l2 {rel:.4f}"
+    layer.close()
+
+
 @pytest.mark.parametrize("S", [1, 2])
 def test_dsv4_hash_routing_takes_the_table(S):
     """V4's first layers route by token id: tid2eid[token] names the experts.
@@ -1907,8 +1960,9 @@ def test_dsv4_split_merge_spans_the_block():
     assert rel_l2 < _tol(OUT_REL_L2, cfg.hc_mult, 1), f"x_out diverged: rel_l2 {rel_l2:.5f}"
 
 
+@pytest.mark.parametrize("kv_fp8", [False, True])
 @pytest.mark.parametrize("n_layers", [4])
-def test_dsv4_alternating_stack_matches_golden(n_layers):
+def test_dsv4_alternating_stack_matches_golden(n_layers, kv_fp8):
     """A stack whose attention variant changes per layer, against the golden.
 
     This is what per-layer variants is for. Layers of one variant SHARE a
@@ -1922,6 +1976,10 @@ def test_dsv4_alternating_stack_matches_golden(n_layers):
     shared by three layers with three different weight sets and three different
     rolling states, which is exactly the case a per-layer object would get right
     by accident and a shared one has to get right on purpose.
+
+    ``kv_fp8`` keeps the kernel's KV in ATOM's fp8 layout (packed NoPE + E8M0
+    plane, bf16 RoPE plane) while the golden keeps bf16 rows of the same values;
+    the planes are decoded at the end and must hold the golden's rows.
     """
     from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer, Dsv4Variant
 
@@ -1932,6 +1990,7 @@ def test_dsv4_alternating_stack_matches_golden(n_layers):
     cfgs = []
     for i in range(n_layers):
         c = base.for_layer(i)
+        c.kv_fp8 = kv_fp8
         if c.indexed:
             c.index_topk = 4
         c.validate()
@@ -1960,6 +2019,8 @@ def test_dsv4_alternating_stack_matches_golden(n_layers):
     # separate caches: the two sides each evolve their own, or the golden would
     # gather rows the kernel wrote and the comparison would stop being one
     kvs_k = [torch.zeros(c.cache_rows, c.head_dim, dtype=torch.bfloat16, device=dev) for c in cfgs]
+    if kv_fp8:
+        kvs_k = [encode_kv_fp8(k) for k in kvs_k]
     kvs_r = [torch.zeros(c.cache_rows, c.head_dim, dtype=torch.bfloat16, device=dev) for c in cfgs]
 
     # each layer keeps its OWN rolling compressor state, as every layer of a real
@@ -2016,5 +2077,10 @@ def test_dsv4_alternating_stack_matches_golden(n_layers):
             assert rel < tol, f"pos={pos} layer {i} (ratio {c.compress_ratio}): rel_l2 {rel:.4f} >= {tol}"
         for v in variants.values():
             v.advance_step()
+    if kv_fp8:
+        for i, c in enumerate(cfgs):
+            a, b = decode_kv_fp8(*kvs_k[i]), kvs_r[i].float()
+            rel = ((a - b).norm() / b.norm()).item()
+            assert rel < 1e-2, f"layer {i} (ratio {c.compress_ratio}): fp8 KV rows off the golden's, rel_l2 {rel:.4f}"
     for v in variants.values():
         v.close()

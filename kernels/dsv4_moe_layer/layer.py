@@ -54,6 +54,7 @@ def shape_dims(cfg) -> dict:
         max_seq=cfg.max_seq,
         index_heads_total=cfg.index_heads_total if cfg.indexed else 0,
         index_topk=cfg.index_topk if cfg.indexed else 0,
+        kv_fp8=cfg.kv_fp8,
     )
 
 
@@ -306,11 +307,21 @@ class Dsv4MoeLayer:
         hshape = (self.S, cfg.hidden) if cfg.hc_mult == 1 else (self.S, cfg.hc_mult, cfg.hidden)
         if tuple(h.shape) != hshape:
             raise ValueError(f"h must be {hshape}, got {tuple(h.shape)}")
-        if kv_cache.ndim != 2 or kv_cache.shape[1] != cfg.head_dim:
-            raise ValueError(
-                f"kv_cache must be one plane [rows, {cfg.head_dim}], got {tuple(kv_cache.shape)} -- "
-                "which rows a sequence owns is the caller's, supplied through indices and dest_rows"
-            )
+        if cfg.kv_fp8:
+            # ATOM's fp8 layout: (NoPE plane uint8 [rows, 512], RoPE plane bf16 [rows, rope_dim])
+            kv_nope, kv_rope = kv_cache
+            if kv_nope.dtype != torch.uint8 or kv_nope.shape[-1] != 512 or kv_rope.shape[-1] != cfg.rope_dim:
+                raise ValueError(
+                    f"kv_fp8 wants (uint8 [rows, 512], bf16 [rows, {cfg.rope_dim}]), "
+                    f"got {kv_nope.dtype} {tuple(kv_nope.shape)}, {tuple(kv_rope.shape)}"
+                )
+        else:
+            kv_nope, kv_rope = kv_cache, None
+            if kv_cache.ndim != 2 or kv_cache.shape[1] != cfg.head_dim:
+                raise ValueError(
+                    f"kv_cache must be one plane [rows, {cfg.head_dim}], got {tuple(kv_cache.shape)} -- "
+                    "which rows a sequence owns is the caller's, supplied through indices and dest_rows"
+                )
         if tuple(dest_rows.shape) != (2, self.S):
             raise ValueError(f"dest_rows must be {(2, self.S)}, got {tuple(dest_rows.shape)}")
         if tuple(indices.shape) != (self.S, cfg.n_keys):
@@ -332,7 +343,8 @@ class Dsv4MoeLayer:
             p(h),
             p(x_out),
             p(cur_pos),
-            p(kv_cache),
+            p(kv_nope),
+            p(kv_rope) if kv_rope is not None else 0,
             p(dest_rows),
             p(indices),
             p(cos),
