@@ -652,6 +652,7 @@ def build_dsv4_kernel(
     INTER = inter
     NOPE_DIM = HEAD_DIM - ROPE_DIM
     MOE_SLOTS = 1 + TOP_K
+    assert TOP_K <= 8, "ug keeps the routing weights in misc[:8], below the quant scales"
     SHARED_EXPERT = N_EXPERTS
     QKV_A_ROWS = qkv_a_rows(Q_LORA, HEAD_DIM, compress_ratio, c_coff, index_head_dim)
     N_QKV_A = QKV_A_ROWS // QKV_A_TILE
@@ -3355,48 +3356,60 @@ def build_dsv4_kernel(
                 # the shared expert's weights do not depend on routing: prefetch them (the
                 # later zero-weight MMAs of the other tasks are cheaper than a branch)
                 pre = [u_ug8(cc, fx.Int32(SHARED_EXPERT), has_sh) for cc in range(UG8_UNITS)]
-                hint_wait(N_ROW_TILES, lambda k: (mb(A_IN), s_u * HIDDEN + k * ROW_TILE + ROW_TILE - 1), mark=("ug", u))
-                # the sum of squares takes the router's element partition and order
-                # (stage_x_rmsnorm, via the same _rmsnorm_tail_ks), so rstd -- and
-                # every FP8 rounding -- is bit-identical
-                nq4_ks, nq4_active = _rmsnorm_tail_ks(HIDDEN)
-                NQ4 = len(nq4_ks)
-                got = poll(
-                    [(mb(A_IN), (s_u * HIDDEN + k) // 2, 2) for k in nq4_ks]
-                    + [(mb(A_IN), (s_u * HIDDEN + k) // 2, 1) for k in ks_]
-                )
-                av = [bf2_f32(w[0]) for w in got[NQ4:]]
-                ss = fx.Float32(0.0)
-                for i in range_constexpr(NQ4):
-                    for a in list(bf2_f32(got[i][0])) + list(bf2_f32(got[i][1])):
-                        term = a * a
-                        if const_expr(nq4_active is not None and i == NQ4 - 1):
-                            term = nq4_active.select(term, fx.Float32(0.0))
-                        ss = ss + term
-                rstd = _rsq(block_sum(ss) * (1.0 / HIDDEN) + EPS)
-                for j in range_constexpr(NB):
-                    v0, v1 = av[j][0] * rstd * gps[j][0], av[j][1] * rstd * gps[j][1]
-                    if const_expr(use_fp8_block128):
-                        q0, q1, qs = quant_scaled(v0, v1)
-                        st_f8(ks_[j], q0, q1)
-                        if lane == 0:
-                            lds_st(misc, 8 + wave + j * WAVES, qs)
-                    elif const_expr(use_mxfp8_block32):
-                        d0, d1, qs = quant_mxfp8(v0, v1)
-                        lds_st(xs, ks_[j] // 2, bf16_pair(d0, d1))
-                        if lane % 16 == 0:
-                            block = (wave + j * WAVES) * 4 + lane // 16
-                            lds_st(misc, 8 + block, qs)
-                    else:
-                        lds_st(xs, ks_[j] // 2, bf16_pair(v0, v1))
-                if wave == 0:
-                    e, w = route_topk(s_u, bs=bs)
-                    if lane == slot - 1:
-                        lds_st(keys, 0, e)
-                        lds_st(misc, 0, w)
+                # The normed, quantized input and the routing are the SAME for every
+                # task of the sample, and S == 1 has one sample, so only a CTA's first
+                # task computes them; the ones after it find them in LDS (xs, the
+                # scales in misc[8:], the picks in keys / misc[:TOP_K]), which
+                # nothing between two of its tasks writes. Recomputing them -- poll
+                # x, RMS, quantize, route -- was 4.6 us of every task, and the 32
+                # CTAs that take a second tile are the tail `down` waits on.
+                if u == fx.Int32(start("ug")):
+                    hint_wait(
+                        N_ROW_TILES, lambda k: (mb(A_IN), s_u * HIDDEN + k * ROW_TILE + ROW_TILE - 1), mark=("ug", u)
+                    )
+                    # the sum of squares takes the router's element partition and order
+                    # (stage_x_rmsnorm, via the same _rmsnorm_tail_ks), so rstd -- and
+                    # every FP8 rounding -- is bit-identical
+                    nq4_ks, nq4_active = _rmsnorm_tail_ks(HIDDEN)
+                    NQ4 = len(nq4_ks)
+                    got = poll(
+                        [(mb(A_IN), (s_u * HIDDEN + k) // 2, 2) for k in nq4_ks]
+                        + [(mb(A_IN), (s_u * HIDDEN + k) // 2, 1) for k in ks_]
+                    )
+                    av = [bf2_f32(w[0]) for w in got[NQ4:]]
+                    ss = fx.Float32(0.0)
+                    for i in range_constexpr(NQ4):
+                        for a in list(bf2_f32(got[i][0])) + list(bf2_f32(got[i][1])):
+                            term = a * a
+                            if const_expr(nq4_active is not None and i == NQ4 - 1):
+                                term = nq4_active.select(term, fx.Float32(0.0))
+                            ss = ss + term
+                    rstd = _rsq(block_sum(ss) * (1.0 / HIDDEN) + EPS)
+                    for j in range_constexpr(NB):
+                        v0, v1 = av[j][0] * rstd * gps[j][0], av[j][1] * rstd * gps[j][1]
+                        if const_expr(use_fp8_block128):
+                            q0, q1, qs = quant_scaled(v0, v1)
+                            st_f8(ks_[j], q0, q1)
+                            if lane == 0:
+                                lds_st(misc, 8 + wave + j * WAVES, qs)
+                        elif const_expr(use_mxfp8_block32):
+                            d0, d1, qs = quant_mxfp8(v0, v1)
+                            lds_st(xs, ks_[j] // 2, bf16_pair(d0, d1))
+                            if lane % 16 == 0:
+                                block = (wave + j * WAVES) * 4 + lane // 16
+                                lds_st(misc, 8 + block, qs)
+                        else:
+                            lds_st(xs, ks_[j] // 2, bf16_pair(v0, v1))
+                    if wave == 0:
+                        e, w = route_topk(s_u, bs=bs)
+                        # every pick, not just this task's slot: a later task on this
+                        # CTA reads its own from here
+                        if lane < TOP_K:
+                            lds_st(keys, lane, e)
+                            lds_st(misc, lane, w)
                 stamp("ug", u, 2)
                 gpu.barrier()
-                e_sel = _uniform(lds_ld(keys, 0))
+                e_sel = _uniform(lds_ld(keys, slot - 1))
                 post = [u_ug8(cc, e_sel) for cc in range(UG8_UNITS)]
                 reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16))
                 gpu.barrier()
@@ -3419,7 +3432,7 @@ def build_dsv4_kernel(
                         )
                 if (c == 0) & (tid == 0):  # routing record (debug / tests)
                     put(mb("sel"), slot, e_sel)
-                    put(mb("prob"), slot, lds_ld(misc, 0))
+                    put(mb("prob"), slot, lds_ld(misc, slot - 1))
                     if has_sh:
                         put(mb("sel"), 0, fx.Int32(SHARED_EXPERT))
                         put(mb("prob"), 0, fx.Float32(1.0))
