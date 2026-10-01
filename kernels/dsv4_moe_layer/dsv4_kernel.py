@@ -411,13 +411,14 @@ def f8_word(k):
     return (k // 64) * 16 + ((k % 32) // 8) * 4 + ((k % 64) // 32) * 2 + (k % 8) // 4
 
 
-def _fp8_to_bf16x8(w0, w1):
+def _fp8_to_bf16x8(w0, w1, scale=None):
     """Two dwords of 8 FP8 -> vector<8 x bf16> (exact: E4M3 is a subset of bf16).
 
-    ``cvt_scalef32_pk_bf16_fp8`` only honours the scale's exponent, so the scale
-    is 1 here and the f32 block scale is applied to the MFMA partials instead.
+    ``cvt_scalef32_pk_bf16_fp8`` only honours the scale's exponent, so ``scale``
+    must be a power of two (an E8M0 block scale, applied exactly); a non-power-of-
+    two block scale stays 1 here and goes on the MFMA partials instead.
     """
-    one = as_ir_value(fx.Float32(1.0))
+    one = as_ir_value(fx.Float32(1.0) if scale is None else scale)
     parts = []
     for w in (w0, w1):
         for half in range_constexpr(2):
@@ -1399,8 +1400,8 @@ def build_dsv4_kernel(
         def unit_fp8mx(w_rsrc, s_rsrc, rg, s_rg, kc, K, b_word, coef=None, ln=None):
             """One 128-K chunk ``kc`` of row group ``rg`` of a packed FP8 matrix (128x128
             block scales; ``s_rg`` = the row group of this lane's OUTPUT rows) against the
-            bf16 activation at LDS word ``b_word``, whose per-32 factors are ``coef``
-            (a list of four, as unit_mxfp4's) or one factor (None = 1)."""
+            bf16 activation at LDS word ``b_word`` (any MXFP8 scale already folded in);
+            ``coef`` = one extra factor for the whole unit (None = 1)."""
             ln = lane if ln is None else ln
             wv = [
                 fx.Vector(
@@ -1418,11 +1419,10 @@ def build_dsv4_kernel(
             raw = fx.Vector(bo.buffer_load(w_rsrc, ((rg * (K // 128) + kc) * 64 + ln) * 4, vec_width=4, dtype=T.i32))
             row = rg * 16 + ln % 16
             packed_scale = fx.Int32(bo.buffer_load(s_rsrc, row * (K // 128) + kc, vec_width=1, dtype=T.i32))
-            scales = [
-                ((packed_scale.shrui(fx.Int32(sp * 8)) & fx.Int32(0xFF)) << fx.Int32(23)).bitcast(fx.Float32)
-                for sp in range_constexpr(4)
-            ]
-            return ("mxfp4", (raw, scales), coef, b_word + (lane // 16) * 4)
+            # the four E8M0 scales stay packed in one register until their conversion
+            # (unpacked here they held four VGPRs per in-flight unit, and the kernel is
+            # at its VGPR ceiling: they spilled)
+            return ("mxfp4", (raw, packed_scale), coef, b_word + (lane // 16) * 4)
 
         def unit_bf16(w_rsrc, rg, kc, NKC, b_word, ln=None):
             ln = lane if ln is None else ln
@@ -1436,32 +1436,35 @@ def build_dsv4_kernel(
             """acc[4] += coef * (W_chunk @ X_chunk) for every issued unit."""
             for unit_format, wv, coef, bw in units:
                 if const_expr(unit_format == "fp8mx"):
-                    ws, coefs = coef
+                    # one factor per unit (the weight's block scale, times a route
+                    # weight if any), so the four K32 MFMAs chain into one partial
+                    ws, f = coef
+                    c = fx.Vector.filled(4, 0.0, fx.Float32)
                     for sp in range_constexpr(4):
                         a = _fp8_to_bf16x8(wv[sp // 2][(sp % 2) * 2], wv[sp // 2][(sp % 2) * 2 + 1])
                         b = fx.ptr_load(xs + (bw + sp * 16), result_type=v4f).bitcast(fx.BFloat16)
-                        c = fx.Vector.filled(4, 0.0, fx.Float32)
                         c = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
-                        f = coefs[sp] if const_expr(isinstance(coefs, list)) else coefs
-                        f = ws if const_expr(f is None) else ws * (f() if const_expr(callable(f)) else f)
-                        acc = [acc[e] + c[e] * f for e in range(4)]
+                    f = ws if const_expr(f is None) else ws * (f() if const_expr(callable(f)) else f)
+                    acc = [acc[e] + c[e] * f for e in range(4)]
                     continue
                 if const_expr(callable(coef) and unit_format != "mxfp4"):
                     coef = coef()
                 if const_expr(unit_format == "mxfp4"):
-                    raw, scales = wv
+                    # The four K32 MFMAs chain: with no factor straight into the running
+                    # sum, else into one partial that takes its factor once per unit.
+                    raw, packed_scale = wv
+                    assert not isinstance(coef, list), "per-K32 factors are folded into the operands"
+                    c = fx.Vector.from_elements(acc, fx.Float32) if coef is None else fx.Vector.filled(4, 0.0, fx.Float32)
                     for sp in range_constexpr(4):
-                        a = _mxfp4_to_bf16x8(raw[sp], scales[sp])
+                        sc = ((packed_scale.shrui(fx.Int32(sp * 8)) & fx.Int32(0xFF)) << fx.Int32(23)).bitcast(fx.Float32)
+                        a = _mxfp4_to_bf16x8(raw[sp], sc)
                         b = fx.ptr_load(xs + (bw + sp * 16), result_type=v4f).bitcast(fx.BFloat16)
-                        c = fx.Vector.filled(4, 0.0, fx.Float32)
                         c = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
-                        part_coef = coef[sp] if const_expr(isinstance(coef, list)) else coef
-                        if const_expr(callable(part_coef)):
-                            part_coef = part_coef()
-                        if const_expr(part_coef is None):
-                            acc = [acc[e] + c[e] for e in range(4)]
-                        else:
-                            acc = [acc[e] + c[e] * part_coef for e in range(4)]
+                    if const_expr(coef is None):
+                        acc = [c[e] for e in range(4)]
+                    else:
+                        f = coef() if const_expr(callable(coef)) else coef
+                        acc = [acc[e] + c[e] * f for e in range(4)]
                     continue
                 c = fx.Vector.filled(4, 0.0, fx.Float32)
                 if const_expr(unit_format == "f8f8"):  # one FP8 x FP8 MFMA (E8M0 scales = 1)
@@ -1666,19 +1669,24 @@ def build_dsv4_kernel(
             elif const_expr(use_mxfp8_block32):
                 chunks = HIDDEN // 8
                 per_thread = (chunks + THREADS - 1) // THREADS
-                data_specs = []
+                # each 8-byte chunk with its own 32-block's scale (chunk // 4): the
+                # power-of-two scale folds into the conversion exactly, so the expert
+                # MFMAs read finished activations and need no per-block factor
+                data_specs, scale_specs = [], []
                 for sx in samples:
                     for i in range_constexpr(per_thread):
                         chunk = fx.min(tid + i * THREADS, chunks - 1)
                         data_specs.append((mb("xq"), sx * (HIDDEN // 4) + chunk * 2, 2))
-                scale_specs = [(mb("xqs"), sx * XQ_BLOCKS + fx.min(tid, XQ_BLOCKS - 1), 1) for sx in samples]
+                        scale_specs.append((mb("xqs"), sx * XQ_BLOCKS + chunk // 4, 1))
                 got = poll(data_specs + scale_specs)
+                nd = len(data_specs)
                 for j in range_constexpr(len(samples)):
                     for i in range_constexpr(per_thread):
                         chunk = tid + i * THREADS
                         if chunk < chunks:
                             words = got[j * per_thread + i]
-                            values = _fp8_to_bf16x8(words[0], words[1])
+                            qs = got[nd + j * per_thread + i][0].bitcast(fx.Float32)
+                            values = _fp8_to_bf16x8(words[0], words[1], qs)
                             for pair in range_constexpr(4):
                                 lds_st(
                                     xs,
@@ -1687,12 +1695,6 @@ def build_dsv4_kernel(
                                         [values[2 * pair], values[2 * pair + 1]], fx.BFloat16
                                     ).bitcast(fx.Float32)[0],
                                 )
-                    if tid < XQ_BLOCKS:
-                        lds_st(
-                            misc,
-                            8 + j * XQ_BLOCKS + tid,
-                            got[len(samples) * per_thread + j][0].bitcast(fx.Float32),
-                        )
             else:
                 nxw = HIDDEN // 2 // THREADS
                 got = poll(
@@ -3526,15 +3528,7 @@ def build_dsv4_kernel(
                     )
                     unit = wave * UG8_UNITS + cc
                     if const_expr(use_mxfp4_weight):
-                        coefficients = None
-                        if const_expr(use_mxfp8_block32):
-                            coefficients = []
-                            for sp in range_constexpr(4):
-
-                                def coefficient(sp=sp, unit=unit):
-                                    return _uniform_f32(lds_ld(misc, 8 + unit * 4 + sp))
-
-                                coefficients.append(coefficient)
+                        coefficients = None  # MXFP8 scales are folded into the staged activations
                         return unit_mxfp4(
                             r_wug,
                             r_sug,
@@ -3569,15 +3563,7 @@ def build_dsv4_kernel(
 
                     def u_ug8_sh(cc, live):
                         unit = wave * UG8_UNITS + cc
-                        coefficients = None
-                        if const_expr(use_mxfp8_block32):
-                            coefficients = []
-                            for sp in range_constexpr(4):
-
-                                def coefficient(sp=sp, unit=unit):
-                                    return _uniform_f32(lds_ld(misc, 8 + unit * 4 + sp))
-
-                                coefficients.append(coefficient)
+                        coefficients = None  # MXFP8 scales are folded into the staged activations
                         return unit_fp8mx(
                             bo.create_buffer_resource_from_addr(
                                 w_sug, num_records_bytes=live.select(fx.Int32(2 * INTER * HIDDEN), fx.Int32(0))
@@ -3679,15 +3665,7 @@ def build_dsv4_kernel(
                 for cc in range_constexpr(UG8_UNITS):
                     unit = wave * UG8_UNITS + cc
                     if const_expr(use_mxfp4_weight):
-                        coefficients = None
-                        if const_expr(use_mxfp8_block32):
-                            coefficients = []
-                            for sp in range_constexpr(4):
-
-                                def coefficient(sp=sp, unit=unit, sn=sn):
-                                    return lds_ld(misc, 8 + sn * XQ_BLOCKS + unit * 4 + sp)
-
-                                coefficients.append(coefficient)
+                        coefficients = None  # MXFP8 scales are folded into the staged activations
                         units.append(
                             unit_mxfp4(
                                 rw,
@@ -3734,15 +3712,7 @@ def build_dsv4_kernel(
                 units = []
                 for cc in range_constexpr(UG8_UNITS):
                     unit = wave * UG8_UNITS + cc
-                    coefficients = None
-                    if const_expr(use_mxfp8_block32):
-                        coefficients = []
-                        for sp in range_constexpr(4):
-
-                            def coefficient(sp=sp, unit=unit, sn=sn):
-                                return lds_ld(misc, 8 + sn * XQ_BLOCKS + unit * 4 + sp)
-
-                            coefficients.append(coefficient)
+                    coefficients = None  # MXFP8 scales are folded into the staged activations
                     units.append(
                         unit_fp8mx(rw, rs, w_rg, s_rg, unit, HIDDEN, sn * XW + unit * 64, coefficients, w_ln)
                     )
@@ -3875,22 +3845,15 @@ def build_dsv4_kernel(
             dn_ln = ((dn_lr >= 0) & (dn_lr < DN_TILE)).select(lane, lane ^ 8)
 
             def dn_coefficients(q, s_q, slot_q):
-                """A unit's factors: the mid's MXFP8 scales (times the route weight) or
-                the route weight, in its sample's column only."""
-                if const_expr(use_mxfp8_block32):
-                    coefficients = []
-                    for sp in range_constexpr(4):
-
-                        def coefficient(sp=sp, q=q, s_q=s_q):
-                            return (lane % 16 == s_q).select(_uniform_f32(lds_ld(misc, q * 4 + sp)), fx.Float32(0.0))
-
-                        coefficients.append(coefficient)
-                    return coefficients
+                """A unit's factor: its route weight, in its sample's column only (an
+                MXFP8 mid's scale is folded into the staged mid). A plain VGPR read of
+                the one LDS word -- every lane reads the same address, a broadcast --
+                not a readfirstlane: an SGPR copy of it per unit forced lgkmcnt(0) waits
+                and pushed the kernel, already at its VGPR / SGPR ceilings, into more
+                spills (measured: ~12 us of the S = 8 stage)."""
 
                 def coefficient():
-                    return (lane % 16 == s_q).select(
-                        _uniform_f32(lds_ld(dnw, s_q * MOE_SLOTS + slot_q)), fx.Float32(0.0)
-                    )
+                    return (lane % 16 == s_q).select(lds_ld(dnw, s_q * MOE_SLOTS + slot_q), fx.Float32(0.0))
 
                 return coefficient
 
@@ -3987,10 +3950,9 @@ def build_dsv4_kernel(
                             lds_st(misc, blk, qs * lds_ld(dnw, blk // (INTER // 128)))
                     elif const_expr(use_mxfp8_block32):
                         d0, d1, qs = quant_mxfp8(mids[b][0], mids[b][1])
-                        lds_st(xs, blk * 64 + lane, bf16_pair(d0, d1))
-                        if lane % 16 == 0:
-                            scale_group = blk * 4 + lane // 16
-                            lds_st(misc, scale_group, qs * lds_ld(dnw, blk // (INTER // 128)))
+                        # the power-of-two scale folds in exactly (an FP8 value times
+                        # 2**k is a bf16), so the MFMAs need no per-block factor
+                        lds_st(xs, blk * 64 + lane, bf16_pair(d0 * qs, d1 * qs))
                     else:
                         lds_st(xs, blk * 64 + lane, bf16_pair(mids[b][0], mids[b][1]))
             gpu.barrier()
