@@ -1998,49 +1998,52 @@ def build_dsv4_kernel(
                             tot = tot + lds_ld(red, (w_ * NBLK + blk) * 64 + lane)
                         lds_st(red, idx, tot)
                 gpu.barrier()
-                if wave == 0:
-                    for s_ in range_constexpr(S):
-                        rstd = _rsq(lds_ld(red, s_ * HC_VALS + HC_ROWS) * (1.0 / (HC * HIDDEN)) + EPS)
+                # one wave per sample (S <= WAVES): the Sinkhorn is a long dependent chain,
+                # and running every sample's on wave 0 in turn cost S chains per hcc_a and
+                # router task -- 8 of them back to back at S=8
+                if wave < S:
+                    s_ = wave
+                    rstd = _rsq(lds_ld(red, s_ * HC_VALS + HC_ROWS) * (1.0 / (HC * HIDDEN)) + EPS)
 
-                        def coef(i, s_=s_, rstd=rstd):
-                            return lds_ld(red, s_ * HC_VALS + i) * rstd
+                    def coef(i, s_=s_, rstd=rstd):
+                        return lds_ld(red, s_ * HC_VALS + i) * rstd
 
-                        if lane < 2 * HC:  # pre then post share these lanes
-                            m = coef(fx.min(lane, fx.Int32(HC_MIX - 1)))
-                            b = ld_f32(r_sb, 3 + lane)
-                            v = (lane < HC).select(
-                                _rcp(1.0 + _exp(-(m * sc0 + b))) + hc_eps,
-                                2.0 * _rcp(1.0 + _exp(-(m * sc1 + b))),
-                            )
-                            lds_st(misc, HC_MISC + s_ * HC_COEF + lane, v)
-                            if publish:
-                                put(mb("hc_c"), (s_ * 2 + sd) * HC_COEF + lane, v)
-                        if lane < HC * HC:
-                            cb = coef(2 * HC + lane) * sc2 + ld_f32(r_sb, 3 + 2 * HC + lane)
-                            rmax = cb
-                            for off in HC_ROW_OFFS:
-                                rmax = _xred(rmax, off, fx.max)
-                            c = _exp(cb - rmax)
+                    if lane < 2 * HC:  # pre then post share these lanes
+                        m = coef(fx.min(lane, fx.Int32(HC_MIX - 1)))
+                        b = ld_f32(r_sb, 3 + lane)
+                        v = (lane < HC).select(
+                            _rcp(1.0 + _exp(-(m * sc0 + b))) + hc_eps,
+                            2.0 * _rcp(1.0 + _exp(-(m * sc1 + b))),
+                        )
+                        lds_st(misc, HC_MISC + s_ * HC_COEF + lane, v)
+                        if publish:
+                            put(mb("hc_c"), (s_ * 2 + sd) * HC_COEF + lane, v)
+                    if lane < HC * HC:
+                        cb = coef(2 * HC + lane) * sc2 + ld_f32(r_sb, 3 + 2 * HC + lane)
+                        rmax = cb
+                        for off in HC_ROW_OFFS:
+                            rmax = _xred(rmax, off, fx.max)
+                        c = _exp(cb - rmax)
+                        rsum = c
+                        for off in HC_ROW_OFFS:
+                            rsum = _xred(rsum, off, lambda a, b: a + b)
+                        c = c * _rcp(rsum) + hc_eps
+                        csum = c
+                        for off in HC_COL_OFFS:
+                            csum = _xred(csum, off, lambda a, b: a + b)
+                        c = c * _rcp(csum + hc_eps)
+                        for _ in range_constexpr(hc_sinkhorn_iters - 1):
                             rsum = c
                             for off in HC_ROW_OFFS:
                                 rsum = _xred(rsum, off, lambda a, b: a + b)
-                            c = c * _rcp(rsum) + hc_eps
+                            c = c * _rcp(rsum + hc_eps)
                             csum = c
                             for off in HC_COL_OFFS:
                                 csum = _xred(csum, off, lambda a, b: a + b)
                             c = c * _rcp(csum + hc_eps)
-                            for _ in range_constexpr(hc_sinkhorn_iters - 1):
-                                rsum = c
-                                for off in HC_ROW_OFFS:
-                                    rsum = _xred(rsum, off, lambda a, b: a + b)
-                                c = c * _rcp(rsum + hc_eps)
-                                csum = c
-                                for off in HC_COL_OFFS:
-                                    csum = _xred(csum, off, lambda a, b: a + b)
-                                c = c * _rcp(csum + hc_eps)
-                            lds_st(misc, HC_MISC + s_ * HC_COEF + 2 * HC + lane, c)
-                            if publish:
-                                put(mb("hc_c"), (s_ * 2 + sd) * HC_COEF + 2 * HC + lane, c)
+                        lds_st(misc, HC_MISC + s_ * HC_COEF + 2 * HC + lane, c)
+                        if publish:
+                            put(mb("hc_c"), (s_ * 2 + sd) * HC_COEF + 2 * HC + lane, c)
                 gpu.barrier()
 
             if const_expr(not contract):
@@ -3647,23 +3650,19 @@ def build_dsv4_kernel(
             # One eight-intermediate tile per CTA and sample. Shared weights use
             # the sample columns of one MFMA; routed tiles pipeline over samples.
             #
-            # REP tiles per CTA, unrolled at BUILD time rather than walked with a
-            # runtime `range(start("ug"), N_UG_TASKS, G)` the way S == 1 does: the
-            # unit lists below are Python lists of traced operands that mma_units
-            # consumes while tracing, so they cannot be carried by an scf.for.
-            # N_UG_TASKS need not divide BLOCKS -- V4-Pro's top-6 over INTER 384
-            # gives 288 tiles for 256 CTAs -- so a rep past the end is MASKED by
-            # `live` rather than skipped, which keeps every barrier below reached
-            # by the whole workgroup. `live` zeroes that rep's buffer descriptors'
-            # num_records so its weight loads are killed in the texture unit, and
-            # suppresses its publishes. The mask is redundant-work suppression, not
-            # a correctness guard: `uu` clamps a dead rep onto a real tile, so
-            # removing the publish mask alone changes no output (measured). What IS
-            # load-bearing is the loop itself -- capping REP at 1 leaves tiles
-            # 256..287 uncomputed and `down` then polls their `mid` slots forever.
+            # UG_ITEMS (tile, sample) items per CTA, unrolled at BUILD time rather than
+            # walked with a runtime `range(...)` the way S == 1 does: the unit lists
+            # below are Python lists of traced operands that mma_units consumes while
+            # tracing, so they cannot be carried by an scf.for. The item count need
+            # not divide BLOCKS, so an item past the end is MASKED by `live` rather
+            # than skipped, which keeps every barrier below reached by the whole
+            # workgroup. `live` zeroes that item's buffer descriptors' num_records so
+            # its weight loads are killed in the texture unit, and suppresses its
+            # publishes; its index is clamped onto a real item. What IS load-bearing
+            # is covering every item -- one left out leaves its `mid` slots unwritten
+            # and `down` polls them forever.
             UG8_UNITS = (HIDDEN // UG_UNIT_K) // WAVES
             XW = HIDDEN // (4 if use_fp8_block128 else 2)
-            REP = (N_UG_TASKS + G - 1) // G
             u0 = fx.Int32(start("ug"))
 
             def ug8_units(c, w_rg, w_ln, s_rg, e, sample, live=None):
@@ -3791,46 +3790,53 @@ def build_dsv4_kernel(
                 s_rg = (lane // 32) * (INTER // 16) + c // 2
                 return live, uu, c, slot, has_sh, w_rg, w_ln, s_rg
 
-            # Rep 0's weights are prefetched ahead of the routing wait and the input
-            # staging, as the single-tile version did; dn_route and stage_moe_input
-            # are CTA-global, so they stay out of the rep loop and every rep reads
-            # the one staged input.
+            # The shared expert's tiles (uu < UG_PER_SLOT) are computed once each, for
+            # every sample at once, by the CTA whose first tile it is. The routed work is
+            # S * N_UG_TASKS (tile, sample) items spread evenly over the CTAs: as whole
+            # tiles (each carrying all S samples) the 288 tiles left 32 CTAs with two,
+            # 2 * S items, while the rest had S -- the stage's tail. Its weights are
+            # prefetched ahead of the routing wait and the input staging, as the
+            # single-tile version did; dn_route and stage_moe_input are CTA-global.
+            N_UG_ITEMS = S * N_UG_TASKS
+            UG_ITEMS = (N_UG_ITEMS + G - 1) // G
+
+            def ug8_item(k):
+                """This CTA's k-th routed item: (live, uu, sample, c, slot, w_rg, w_ln, s_rg).
+                The index is clamped so a dead item's LDS and descriptor indices stay in
+                range; `live` is what suppresses its effects."""
+                w = u0 + k * G
+                live = w < N_UG_ITEMS
+                ww = fx.min(w, fx.Int32(N_UG_ITEMS - 1))
+                uu = ww % N_UG_TASKS
+                sample = ww // N_UG_TASKS
+                _l, _u, c, slot, _h, w_rg, w_ln, s_rg = ug8_tile(uu)
+                return live, uu, sample, c, slot, w_rg, w_ln, s_rg
+
             live0, uu0, c0, slot0, has_sh0, wr0, wl0, sr0 = ug8_tile(u0)
             shared_pre = shared_units(c0, wr0, wl0, sr0, has_sh0 & live0)
             dn_route(load_bias())
             gpu.barrier()
-            cur = ug8_units(c0, wr0, wl0, sr0, _uniform(lds_ld(keys, slot0)), 0, live0)
+            items = [ug8_item(0)]
+            lv, uu_, sm, c_, sl, wr, wl, sr = items[0]
+            cur = ug8_units(c_, wr, wl, sr, _uniform(lds_ld(keys, sm * MOE_SLOTS + sl)), sm, lv)
             stage_moe_input(list(range(S)))
             gpu.barrier()
-            for rep in range_constexpr(REP):
-                if const_expr(rep == 0):
-                    live, uu, c, slot, has_sh = live0, uu0, c0, slot0, has_sh0
-                    w_rg, w_ln, s_rg = wr0, wl0, sr0
-                else:
-                    live, uu, c, slot, has_sh, w_rg, w_ln, s_rg = ug8_tile(u0 + rep * G)
-                    shared_pre = shared_units(c, w_rg, w_ln, s_rg, has_sh & live)
-                    cur = ug8_units(c, w_rg, w_ln, s_rg, _uniform(lds_ld(keys, slot)), 0, live)
-                if has_sh:
-                    reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre), emit_out(16))
-                    gpu.barrier()
-                    ug8_emit(c, slot, 0, True, live)
-                for sample in range_constexpr(S):
-                    stamp("ug", sample * N_UG_TASKS + uu, 0, pred=live)
-                    pre = cur
-                    if const_expr(sample + 1 < S):
-                        cur = ug8_units(
-                            c,
-                            w_rg,
-                            w_ln,
-                            s_rg,
-                            _uniform(lds_ld(keys, (sample + 1) * MOE_SLOTS + slot)),
-                            sample + 1,
-                            live,
-                        )
-                    reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16))
-                    gpu.barrier()
-                    ug8_emit(c, slot, sample, False, live)
-                    stamp("ug", sample * N_UG_TASKS + uu, 4, pred=live)
+            if has_sh0 & live0:
+                reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre), emit_out(16))
+                gpu.barrier()
+                ug8_emit(c0, slot0, 0, True, live0)
+            for k in range_constexpr(UG_ITEMS):
+                live, uu, sample, c, slot, w_rg, w_ln, s_rg = items[k]
+                stamp("ug", sample * N_UG_TASKS + uu, 0, pred=live)
+                pre = cur
+                if const_expr(k + 1 < UG_ITEMS):
+                    items.append(ug8_item(k + 1))
+                    lv, uu_, sm, c_, sl, wr, wl, sr = items[k + 1]
+                    cur = ug8_units(c_, wr, wl, sr, _uniform(lds_ld(keys, sm * MOE_SLOTS + sl)), sm, lv)
+                reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16))
+                gpu.barrier()
+                ug8_emit(c, slot, sample, False, live)
+                stamp("ug", sample * N_UG_TASKS + uu, 4, pred=live)
 
         # =============== 10. expert down + route weighting + MoE TP reduce
         DN_NKC = INTER // 64
