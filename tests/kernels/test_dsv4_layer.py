@@ -338,6 +338,80 @@ def test_dsv4_bounded_poll_flags_instead_of_hanging():
         variant.close()
 
 
+def _i32(x):
+    """``x`` wrapped to int32, as the kernel's tag arithmetic wraps."""
+    return (x + 2**31) % 2**32 - 2**31
+
+
+@pytest.mark.parametrize("s0", [5, 2**25 - 3, 2**31 - 3])
+def test_dsv4_step_advance_scrubs_stale_mailboxes(s0):
+    """Tags wrap after 2**32 / LAYER_SLOTS steps, so the step advance clears stale
+    pairs: over one scrub period every pair tagged before the step just done is
+    zeroed, and newer tags (that step's, a peer one launch ahead), untagged pairs
+    and the values beside newer tags are left alone. s0 puts the tags across their 2**32
+    wrap and the step itself across the int32 wrap."""
+    from kernels.dsv4_moe_layer.dsv4_kernel import LAYER_SLOTS, scrub_period
+    from kernels.dsv4_moe_layer.layer import Dsv4Variant
+
+    cfg = _cfg(hc_mult=1)
+    variant = Dsv4Variant(cfg, 1, rank=0, npes=1, moe_mode=MoeMode.A8W4)
+    bufs = [variant.scratch[: variant.scr_pairs * 8], variant.sym_storage[: variant.sym_pairs * 8]]
+    pairs = [b.view(torch.int32).view(-1, 2) for b in bufs]
+    period = scrub_period(variant.scr_pairs + variant.sym_pairs)
+    # stale from the first advance on (steps before s0), and never stale within the
+    # period's advances (steps s0 + period - 1 on: the last one done, and later)
+    old = [_i32((s0 - 1) * LAYER_SLOTS + 1), _i32(s0 * LAYER_SLOTS), _i32((s0 - 7) * LAYER_SLOTS + 4)]
+    new = [_i32((s0 + period - 1) * LAYER_SLOTS + 1), _i32((s0 + period) * LAYER_SLOTS + 9)]
+    kinds = torch.tensor(old + new + [0], dtype=torch.int32, device="cuda")
+    for pr in pairs:
+        pr[:, 0] = torch.arange(pr.shape[0], dtype=torch.int32, device="cuda") + 1
+        pr[:, 1] = kinds[torch.arange(pr.shape[0], device="cuda") % len(kinds)]
+    want = [pr.clone() for pr in pairs]
+    for w in want:
+        stale = (w[:, 1].unsqueeze(1) == kinds[: len(old)]).any(1)
+        w[stale] = 0
+    variant.step.fill_(_i32(s0))
+    for _ in range(period):
+        variant.advance_step()
+    torch.cuda.synchronize()
+    assert variant.step.item() == _i32(s0 + period)
+    for name, pr, w in zip(["scratch", "sym"], pairs, want):
+        bad = (pr != w).any(1).nonzero()
+        assert bad.numel() == 0, f"{name}: {bad.numel()} pairs wrong, first {pr[bad[0, 0]].tolist()} want {w[bad[0, 0]].tolist()}"
+    variant.close()
+
+
+def test_dsv4_layer_output_is_the_same_across_the_tag_wrap():
+    """Two launches from identical state, once at steps 0 and 1 and once at the
+    steps whose tags straddle the 2**32 wrap, give bit-identical outputs."""
+    from kernels.dsv4_moe_layer.dsv4_kernel import LAYER_SLOTS
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    torch.manual_seed(0)
+    cfg = _cfg(hc_mult=1)
+    dev = "cuda"
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=MoeMode.A8W4)
+    h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
+    idx, dest = contiguous_pool([cfg.window], cfg, dev)
+    cos, sin = rope_table(4096, theta=cfg.rope_theta, device=dev)
+    kv0 = (0.3 * torch.randn(cfg.window, cfg.head_dim, device=dev)).bfloat16()
+
+    outs = []
+    for s0 in [0, 2**32 // LAYER_SLOTS - 1]:
+        layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=MoeMode.A8W4)
+        layer.variant.step.fill_(_i32(s0))
+        kv = kv0.clone()
+        got = []
+        for p in range(2):
+            cur = torch.tensor([cfg.window + p], dtype=torch.int32, device=dev)
+            got.append(layer.forward(h, cur, kv, dest, idx, cos, sin).clone())
+        torch.cuda.synchronize()
+        outs.append(got)
+        layer.variant.close()
+    for p in range(2):
+        assert torch.equal(outs[0][p], outs[1][p]), f"step {p}: output differs across the tag wrap"
+
+
 # ---------------------------------------------------------------- multi-rank TP
 #   python3 tests/kernels/test_dsv4_layer.py --npes 8
 # Routing must agree bit-identically across ranks: every rank sums the peer

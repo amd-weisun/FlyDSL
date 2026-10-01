@@ -17,6 +17,7 @@ from kernels.dsv4_moe_layer.config import (
 )
 from kernels.dsv4_moe_layer.dsv4_kernel import (
     TL_COLS,
+    build_advance_step,
     build_dsv4_kernel,
     layout,
     stage_tasks,
@@ -105,6 +106,7 @@ class Dsv4Variant:
     """
 
     _cache: dict = {}
+    _adv_cache: dict = {}
 
     def __init__(
         self,
@@ -158,6 +160,14 @@ class Dsv4Variant:
             )
             Dsv4Variant._cache[self.key] = built
         self.launch = built
+        # the step advance clears stale mailbox pairs (see build_advance_step);
+        # the debug-only plain-f32 "xqd" region sits last and is left alone
+        self.scr_pairs = self.scr_layout["xqd"] // 8
+        self.sym_pairs = self.sym_layout["_bytes"] // 8
+        adv_key = (self.scr_pairs, self.sym_pairs)
+        if adv_key not in Dsv4Variant._adv_cache:
+            Dsv4Variant._adv_cache[adv_key] = build_advance_step(*adv_key)
+        self._advance = Dsv4Variant._adv_cache[adv_key]
         self.stages = stage_tasks(samples, cfg.heads, window=cfg.window, top_k=cfg.top_k, inter=cfg.inter, **dims)
 
     def hang_detected(self) -> bool:
@@ -166,8 +176,12 @@ class Dsv4Variant:
         return bool(self.hang.item())
 
     def advance_step(self):
-        """One decode step done on this scratch. Stream-ordered, so graph-capturable."""
-        self.step.add_(1)
+        """One decode step done on this scratch: ``step += 1``, and a slice of the
+        stale mailbox pairs cleared so tags can wrap. Stream-ordered, so
+        graph-capturable."""
+        self._advance(
+            self.step.data_ptr(), self.scratch.data_ptr(), self.sym, stream=torch.cuda.current_stream()
+        )
 
     def close(self):
         self.peer_buffer.close()

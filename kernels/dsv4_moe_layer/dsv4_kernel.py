@@ -4245,3 +4245,71 @@ def build_dsv4_kernel(
     # up/gate's FP8 shared-expert units: a real-dims compile went from ~6 s to >24 min,
     # past the 600 s compile lock other ranks wait on.
     return flyc.compile[{"llvm_options": {"disable-vector-combine": True}}](launch_dsv4)
+
+
+# ---------------------------------------------------------------- step advance
+SCRUB_PAIRS = THREADS  # mailbox pairs each step advance checks: one per thread, one round trip
+
+
+def scrub_period(n_pairs: int) -> int:
+    """Steps for the step advance to visit every one of ``n_pairs`` pairs: a power
+    of two, so ``step % period`` stays continuous through the int32 wrap."""
+    return 1 << max(0, -(-n_pairs // SCRUB_PAIRS) - 1).bit_length()
+
+
+def build_advance_step(scr_pairs: int, sym_pairs: int):
+    """The ``@flyc.jit`` step advance for one scratch: ``step += 1`` plus a scrub.
+
+    Tags are ``step * LAYER_SLOTS + layer + 1`` in int32, so they come round again
+    after 2**32 / LAYER_SLOTS steps (~46 h at 5 ms a step), and a mailbox left
+    unwritten that long would then read as fresh -- many are written only when
+    their data calls for it (``cnew`` on compression steps, the indexer's live
+    tiles, the picked experts' ``mid``). So each advance also zeroes the stale
+    pairs of one slice of the scratch's mailboxes and its symmetric buffer,
+    ``scrub_period`` slices in turn: no pair stays stale for more than a period,
+    far short of the wrap, and a zeroed pair matches no tag (tags are never 0).
+
+    Stale is older than the step just done (which stays readable, for
+    ``Dsv4MoeLayer.debug``): those launches have all completed on this rank, and
+    no consumer accepts an old tag. A peer can be one launch ahead, writing
+    next-step tags into the symmetric buffer meanwhile; those are newer, so kept,
+    and the compare-and-swap leaves a pair alone if one lands between the read
+    and the clear. Traffic is push-only
+    (ranks poll their own memory), so no peer is reading what is cleared."""
+    n = scr_pairs + sym_pairs
+    period = scrub_period(n)
+    chunk = -(-n // period)
+    per_thread = -(-chunk // THREADS)
+
+    @flyc.kernel(known_block_size=[THREADS, 1, 1])
+    def advance_kernel(step: Int64, scratch: Int64, sym: Int64):
+        tid = fx.thread_idx.x
+
+        def scrub(addr, new_base):
+            """Zero the pair at ``addr`` if its tag is nonzero and at most ``new_base``."""
+            ptr = fx.inttoptr(fx.PointerType.get(fx.Int64.ir_type, fx.AddressSpace.Global, 8), addr)
+            old = fx.Int64(fx.generic_load(ptr, memory_order=fx.AtomicOrdering.Monotonic, syncscope="agent"))
+            tg = fx.Int32(old >> 32)  # a pair is (value, tag): the tag is the high word
+            if (tg != 0) & ((new_base - tg) >= 0):
+                fx.atomic_cas(ptr, old, fx.Int64(0))
+
+        s = _uniform(bo.buffer_load(_rsrc(step), 0, vec_width=1, dtype=T.i32))
+        new_base = s * LAYER_SLOTS  # every tag of steps < s is at most this
+        base = (s & (period - 1)) * chunk
+        for j in range_constexpr(per_thread):
+            o = j * THREADS + tid
+            i = base + o
+            if (o < chunk) & (i < n):
+                if i < scr_pairs:
+                    scrub(scratch + fx.Int64(i) * 8, new_base)
+                else:
+                    scrub(sym + fx.Int64(i - scr_pairs) * 8, new_base)
+        gpu.barrier()  # every thread has read the step
+        if tid == 0:
+            bo.buffer_store(s + 1, _rsrc(step), 0)
+
+    @flyc.jit
+    def advance_step(step: Int64, scratch: Int64, sym: Int64, stream: fx.Stream = fx.Stream(None)):
+        advance_kernel(step, scratch, sym).launch(grid=(1,), block=(THREADS,), stream=stream)
+
+    return advance_step
