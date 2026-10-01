@@ -138,6 +138,13 @@ def dn_tile(S: int, hidden: int = HIDDEN) -> int:
 
 
 N_ROUTER = N_EXPERTS // ROUTER_TILE
+
+
+def router_spt(S: int) -> int:
+    """Samples per router task. One per task until S * N_ROUTER outgrows the grid
+    (S = 8: 384 tasks, two rounds of ~13 us on the FFN's critical path); then two
+    share a task, in the two B columns of each K-fold half that held copies."""
+    return 2 if S * N_ROUTER > BLOCKS else 1
 N_UG_PER_SLOT = INTER // UG_TILE
 
 
@@ -557,7 +564,7 @@ def stage_tasks(
         ("hcd_f", S * hc_tasks),
         # none: the router contracts the FFN side's streams itself
         ("hcc_f", 0),
-        ("router", S * N_ROUTER),
+        ("router", S * N_ROUTER // router_spt(S)),
         # one tile per (routed slot, 8 intermediates); tasks below INTER / UG8 also
         # carry the shared expert.  GLM-5/V3 happened to make this exactly BLOCKS
         # (8 slots x 32 tiles); V4's top-6 over INTER 384 does not.
@@ -3366,20 +3373,23 @@ def build_dsv4_kernel(
         # One sample per CTA: 1 row group x 96 chunks (bf16), 8 waves split K
         r_wr = _rsrc(w_r)
         R_NKC = HIDDEN // 64
-        for tt in range(start("router"), S * N_ROUTER, G):
+        SPT = router_spt(S)
+        assert SPT <= ROUTER_TILE
+        for tt in range(start("router"), S * N_ROUTER // SPT, G):
             tt = fx.Int32(tt)
             t = tt % N_ROUTER
-            router_sample = tt // N_ROUTER
+            rs0 = (tt // N_ROUTER) * SPT  # this task's first sample; it takes SPT of them
             stamp("router", tt, 0)
 
             # K-fold: MFMA rows / B columns 0..7 take this wave's first K half, rows /
             # columns 8..15 the second, so every loaded weight row is distinct and the
-            # whole K slice is prefetched; logit = C[r][n] + C[8 + r][8 + n]
+            # whole K slice is prefetched; logit = C[r][n] + C[8 + r][8 + n], where
+            # column n of each half is local sample min(n, SPT - 1)
             r_sub = t * ROUTER_TILE % 16  # this task's rows of the 16-row group
             r_ln = (lane & -16) | (r_sub + lane % ROUTER_TILE)
             R_CPW = R_NKC // WAVES // 2
             r_fold = (lane % 16) // ROUTER_TILE
-            r_ns = fx.Int32(0)
+            r_ns = fx.min(lane % 8, fx.Int32(SPT - 1))
 
             def u_r(c):
                 kc = wave * (R_NKC // WAVES) + r_fold * R_CPW + c
@@ -3396,31 +3406,36 @@ def build_dsv4_kernel(
             else:
                 x_blk = wave * N_ROUTER + t
                 xk = fx.min(x_blk, PUBLISH_BLOCKS - 1) * 128 + lane * 2
-            x_s = router_sample
             x_ok = (wave < XQ_WAVES) & (x_blk < PUBLISH_BLOCKS)
             xg = (ld_bf16(r_gp, xk), ld_bf16(r_gp, xk + 1))
             xa = []
 
             def ld_a(sks):
+                # sks = (local sample s, k) pairs; local sample s is sample rs0 + s
+                n4 = len(sks)
                 if const_expr(HC == 1):
-                    specs = [(mb("a"), (router_sample * HIDDEN + k) // 2, 2) for s, k in sks]
-                    specs.append((mb("a"), (x_s * HIDDEN + xk) // 2, 1))
+                    specs = [(mb("a"), ((rs0 + s) * HIDDEN + k) // 2, 2) for s, k in sks]
+                    specs += [(mb("a"), ((rs0 + s) * HIDDEN + xk) // 2, 1) for s in range(SPT)]
                     v = poll(specs, batch=len(specs))
                     stamp("router", tt, 5, lead=THREADS - 64)
-                    xa.append(bf2_f32(v[-1][0]))
-                    return [list(bf2_f32(w[0])) + list(bf2_f32(w[1])) for w in v[:-1]]
+                    for s in range_constexpr(SPT):
+                        xa.append(bf2_f32(v[n4 + s][0]))
+                    return [list(bf2_f32(w[0])) + list(bf2_f32(w[1])) for w in v[:n4]]
                 # x = sum_j pre[j] * stream j, contracted here from the streams and
                 # the hcd partials rather than polled from an hcc stage. Same order
                 # and the same bf16 rounding hcc used, so x is bit-identical.
-                sb = router_sample * HC * HIDDEN
-                specs = [(mb("a"), (sb + j * HIDDEN + k) // 2, 2) for s, k in sks for j in range(HC)]
-                specs += [(mb("a"), (x_s * HC * HIDDEN + j * HIDDEN + xk) // 2, 1) for j in range(HC)]
+                specs = [
+                    (mb("a"), ((rs0 + s) * HC * HIDDEN + j * HIDDEN + k) // 2, 2) for s, k in sks for j in range(HC)
+                ]
+                specs += [
+                    (mb("a"), ((rs0 + s) * HC * HIDDEN + j * HIDDEN + xk) // 2, 1) for s in range(SPT) for j in range(HC)
+                ]
                 v = poll(specs)  # the streams land before the partials do
                 stamp("router", tt, 5, lead=THREADS - 64)
                 hc_coef_f(1, tt == 0)  # task 0 also publishes post / comb for down
-                pj = [lds_ld(misc, HC_MISC + router_sample * HC_COEF + j) for j in range(HC)]
+                pjs = [[lds_ld(misc, HC_MISC + (rs0 + s) * HC_COEF + j) for j in range(HC)] for s in range(SPT)]
 
-                def mix(words):
+                def mix(words, pj):
                     """bf16(sum_j pre[j] * x_j) for each element of the words' streams."""
                     xs_ = [list(bf2_f32(w[0])) + (list(bf2_f32(w[1])) if len(w) > 1 else []) for w in words]
                     out = []
@@ -3431,54 +3446,56 @@ def build_dsv4_kernel(
                         out.append(bf16_round(acc))
                     return out
 
-                n4 = len(sks)
-                xa.append(tuple(mix(v[n4 * HC :])))
-                return [mix(v[i * HC : (i + 1) * HC]) for i in range(n4)]
+                for s in range_constexpr(SPT):
+                    xa.append(tuple(mix(v[(n4 + s) * HC : (n4 + s + 1) * HC], pjs[s])))
+                return [mix(v[i * HC : (i + 1) * HC], pjs[sks[i][0]]) for i in range(n4)]
 
-            rstds = stage_x_rmsnorm(ld_a, HIDDEN, g_post, mark=("router", tt), count=1)
+            rstds = stage_x_rmsnorm(ld_a, HIDDEN, g_post, mark=("router", tt), count=SPT)
             stamp("router", tt, 2)
-            # This task's normalized expert input goes out ahead of the gate GEMV.
-            if x_ok:
-                x_rstd = rstds[0]
-                a0, a1 = xa[0]
-                v0, v1 = a0 * x_rstd * xg[0], a1 * x_rstd * xg[1]
-                if const_expr(use_fp8_block128):
-                    q0, q1, qs = quant_scaled(v0, v1)
-                    w8 = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)) & 0xFFFF
-                    w8n = _xshfl(w8, 1)
-                    if lane % 2 == 0:  # FP8 bytes k .. k + 3 in one tagged word
-                        put(mb("xq"), (x_s * HIDDEN + xk) // 4, w8 | (w8n << 16))
-                    d0, d1 = _fp8_roundtrip(q0, q1)
-                    d0, d1 = d0 * qs, d1 * qs
-                    if lane == 0:
-                        put(mb("xqs"), x_s * XQ_BLOCKS + x_blk, qs)
-                elif const_expr(use_mxfp8_block32):
-                    d0, d1, qs = quant_mxfp8(v0, v1)
-                    w8 = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, d0, d1, fx.Int32(0), False)) & 0xFFFF
-                    w8n = _xshfl(w8, 1)
-                    if lane % 2 == 0:
-                        put(mb("xq"), (x_s * HIDDEN + xk) // 4, w8 | (w8n << 16))
-                    if lane % 16 == 0:
-                        put(mb("xqs"), x_s * XQ_BLOCKS + x_blk, qs)
-                    d0, d1 = d0 * qs, d1 * qs
-                else:
-                    d0, d1 = bf16_round(v0), bf16_round(v1)
-                    put(mb("xq"), (x_s * HIDDEN + xk) // 2, bf16_pair(d0, d1))
-                bo.buffer_store(fx.Vector.from_elements([d0, d1], fx.Float32), _rsrc(mb("xqd")), x_s * HIDDEN + xk)
+            # This task's normalized expert inputs go out ahead of the gate GEMV.
+            for s_l in range_constexpr(SPT):
+                if x_ok:
+                    x_s = rs0 + s_l
+                    x_rstd = rstds[s_l]
+                    a0, a1 = xa[s_l]
+                    v0, v1 = a0 * x_rstd * xg[0], a1 * x_rstd * xg[1]
+                    if const_expr(use_fp8_block128):
+                        q0, q1, qs = quant_scaled(v0, v1)
+                        w8 = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)) & 0xFFFF
+                        w8n = _xshfl(w8, 1)
+                        if lane % 2 == 0:  # FP8 bytes k .. k + 3 in one tagged word
+                            put(mb("xq"), (x_s * HIDDEN + xk) // 4, w8 | (w8n << 16))
+                        d0, d1 = _fp8_roundtrip(q0, q1)
+                        d0, d1 = d0 * qs, d1 * qs
+                        if lane == 0:
+                            put(mb("xqs"), x_s * XQ_BLOCKS + x_blk, qs)
+                    elif const_expr(use_mxfp8_block32):
+                        d0, d1, qs = quant_mxfp8(v0, v1)
+                        w8 = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, d0, d1, fx.Int32(0), False)) & 0xFFFF
+                        w8n = _xshfl(w8, 1)
+                        if lane % 2 == 0:
+                            put(mb("xq"), (x_s * HIDDEN + xk) // 4, w8 | (w8n << 16))
+                        if lane % 16 == 0:
+                            put(mb("xqs"), x_s * XQ_BLOCKS + x_blk, qs)
+                        d0, d1 = d0 * qs, d1 * qs
+                    else:
+                        d0, d1 = bf16_round(v0), bf16_round(v1)
+                        put(mb("xq"), (x_s * HIDDEN + xk) // 2, bf16_pair(d0, d1))
+                    bo.buffer_store(fx.Vector.from_elements([d0, d1], fx.Float32), _rsrc(mb("xqd")), x_s * HIDDEN + xk)
             gpu.barrier()
             acc = run_units(u_r, R_CPW, R_CPW, pre)
             fx.ptr_store(fx.Vector.from_elements(acc, fx.Float32), red + (wave * 64 + lane) * 4)
             gpu.barrier()
             stamp("router", tt, 3)
-            if tid < ROUTER_TILE:
+            if tid < ROUTER_TILE * SPT:
                 r = tid % ROUTER_TILE
-                n = fx.Int32(0)
+                n = tid // ROUTER_TILE  # local sample = B column n of each K-fold half
                 logit = fx.Float32(0.0)
                 for w in range_constexpr(WAVES):
                     for f in range_constexpr(2):
                         m = f * ROUTER_TILE + r
                         logit = logit + lds_ld(red, (w * 64 + f * ROUTER_TILE + n + 16 * (m // 4)) * 4 + m % 4)
-                put(mb("scores"), router_sample * N_EXPERTS + t * ROUTER_TILE + r, _sqrt_softplus(bf16_round(logit)))  # the gate's logits are bf16, as ATOM's
+                put(mb("scores"), (rs0 + n) * N_EXPERTS + t * ROUTER_TILE + r, _sqrt_softplus(bf16_round(logit)))  # the gate's logits are bf16, as ATOM's
             stamp("router", tt, 4)
 
         def dn_route(bs):
