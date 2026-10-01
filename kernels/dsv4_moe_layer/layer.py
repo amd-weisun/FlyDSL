@@ -16,7 +16,6 @@ from kernels.dsv4_moe_layer.config import (
     validate_shard,
 )
 from kernels.dsv4_moe_layer.dsv4_kernel import (
-    POLL_TIMEOUT_US,
     TL_COLS,
     build_dsv4_kernel,
     layout,
@@ -117,7 +116,7 @@ class Dsv4Variant:
         timeline: bool = False,
         moe_mode: MoeMode | str = MoeMode.A8W4,
         allow_unindexed_csa: bool = False,
-        poll_timeout_us: int = POLL_TIMEOUT_US,
+        poll_timeout_us: int | None = None,
     ):
         moe_mode = as_moe_mode(moe_mode)
         validate_shard(samples, cfg.heads, rank, npes, cfg.window, cfg.compress_ratio, allow_unindexed_csa)
@@ -162,7 +161,8 @@ class Dsv4Variant:
         self.stages = stage_tasks(samples, cfg.heads, window=cfg.window, top_k=cfg.top_k, inter=cfg.inter, **dims)
 
     def hang_detected(self) -> bool:
-        """Whether a launch on this scratch timed out a poll. Synchronizes."""
+        """Whether a launch on this scratch timed out a poll (only a variant built
+        with ``poll_timeout_us`` ever does). Synchronizes."""
         return bool(self.hang.item())
 
     def advance_step(self):

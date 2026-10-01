@@ -162,10 +162,11 @@ N_UG_PER_SLOT = INTER // UG_TILE
 CM_DEV = 16
 CM_SYS = 17
 POLL_MAX = 12  # mailbox specs polled per batch
-# A poll that has not seen its producer for this long gives up instead of spinning
-# forever: it flags the launch (see `hang` below) and returns. Far past any real
-# wait -- a whole layer is well under a millisecond, and TP ranks launch within
-# milliseconds of each other -- so it fires only on a hang, never on a slow peer.
+# Opt-in (build_dsv4_kernel's poll_timeout_us; off by default -- the bound costs ~3%
+# of a layer and no hang has been seen in serving): a poll that has not seen its
+# producer for this long gives up instead of spinning forever, flagging the launch
+# (see `hang` below). 10 s is far past any real wait -- a whole layer is well under
+# a millisecond, and TP ranks launch within milliseconds of each other.
 POLL_TIMEOUT_US = 10_000_000
 TL_COLS = 8  # timeline stamps per task: 5 phases + 3 free debug marks
 
@@ -594,7 +595,7 @@ def build_dsv4_kernel(
     scale: float = SOFTMAX_SCALE,
     timeline: bool = False,
     moe_mode: MoeMode | str = MoeMode.A8W4,
-    poll_timeout_us: int = POLL_TIMEOUT_US,
+    poll_timeout_us: int | None = None,
     hidden: int = HIDDEN,
     q_lora: int = Q_LORA,
     head_dim: int = HEAD_DIM,
@@ -631,8 +632,9 @@ def build_dsv4_kernel(
     int64 ``[sum(task counts), TL_COLS]`` (start, hint seen, inputs staged, compute
     done, end, then free debug marks) in ``stage_tasks`` order.
 
-    ``hang`` is one int32: a poll that waits longer than ``poll_timeout_us`` stores
-    the launch's tag there and the launch winds down (see ``poll``).
+    ``hang`` is one int32: with ``poll_timeout_us`` set, a poll that waits longer
+    stores the launch's tag there and the launch winds down (see ``poll``); left
+    None, polls spin unbounded and ``hang`` is never written.
     """
     # The split-attention score MFMA's N width is the hardware 16 (hn clamps to
     # heads - 1 below it); heads > 16 would need a wider MFMA tiling, not just more
@@ -720,7 +722,8 @@ def build_dsv4_kernel(
     # FP8 bytes, then each 64-wide group's E8M0 byte twice, then padding) and a
     # bf16 RoPE plane [rows, ROPE_DIM]. Otherwise one bf16 plane [rows, HEAD_DIM].
     KV_FP8 = kv_fp8
-    POLL_TIMEOUT_TICKS = poll_timeout_us * 100  # s_memrealtime runs at 100 MHz
+    BOUNDED_POLL = poll_timeout_us is not None
+    POLL_TIMEOUT_TICKS = (poll_timeout_us or 0) * 100  # s_memrealtime runs at 100 MHz
     INDEXER_HADAMARD = indexer_hadamard
     if CR:
         assert BLOCK_TOKENS % CR == 0, "a block holds a whole number of compressed entries"
@@ -1220,22 +1223,47 @@ def build_dsv4_kernel(
 
             nw = sum(2 * n for _, _, n in specs)
 
+            def unpack(v):
+                outs_, e = [], 0
+                for _, _, n in specs:
+                    outs_.append([v[e + 2 * q] for q in range(n)])
+                    e += 2 * n
+                return outs_
+
             def pending(v):
                 bad = v[1] != tag
                 for e in range_constexpr(3, nw, 2):
                     bad = bad | (v[e] != tag)
                 return bad
 
-            # Bounded: past POLL_TIMEOUT_US the poll stores this launch's tag into
-            # ``hang`` and gives up on garbage, and every other poll of the launch
-            # that sees that word gives up at once -- a CTA facing a dead peer
-            # would otherwise wait out the timeout on each of its polls in turn.
-            # The launch then runs to its end and the host reads ``hang``
-            # (Dsv4Variant.hang_detected). stop: 0 waiting, 1 flagged, 2 timed out.
-            # The bound costs ~3% of an S=8 layer (HCA 149 -> 153 us, CSA 166 ->
-            # 171), the same without the flag read or with a spin count for the
-            # clock: it is the exit itself, at every inlined poll site.
+            # Unbounded by default, as the GLM kernel this grew from. Bounded
+            # (poll_timeout_us set): past the timeout the poll stores this
+            # launch's tag into ``hang`` and gives up on garbage, and every other
+            # poll of the launch that sees that word gives up at once -- a CTA
+            # facing a dead peer would otherwise wait out the timeout on each of
+            # its polls in turn. The launch then runs to its end and the host
+            # reads ``hang`` (Dsv4Variant.hang_detected). stop: 0 waiting, 1
+            # flagged, 2 timed out. The bound costs ~3% of an S=8 layer (HCA 149
+            # -> 153 us, CSA 166 -> 171), the same without the flag read or with
+            # a spin count for the clock: it is the exit itself, at every inlined
+            # poll site.
             v = load_all()
+            if const_expr(BOUNDED_POLL):
+                t0 = now_ticks()
+                stop = fx.Int32(0)
+                while pending(v) & (stop == 0):
+                    rocdl.s_nop(0)
+                    v = load_all()
+                    flagged = _uniform(bo.buffer_load(_rsrc(hang), 0, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)) == tag
+                    late = (now_ticks() - t0) > fx.Int64(POLL_TIMEOUT_TICKS)
+                    stop = late.select(fx.Int32(2), flagged.select(fx.Int32(1), fx.Int32(0)))
+                if stop == 2:
+                    bo.buffer_store(tag, _rsrc(hang), 0, cache_modifier=CM_DEV)
+            else:
+                while pending(v):
+                    rocdl.s_nop(0)
+                    v = load_all()
+            return unpack(v)
             t0 = now_ticks()
             stop = fx.Int32(0)
             while pending(v) & (stop == 0):
@@ -1246,11 +1274,7 @@ def build_dsv4_kernel(
                 stop = late.select(fx.Int32(2), flagged.select(fx.Int32(1), fx.Int32(0)))
             if stop == 2:
                 bo.buffer_store(tag, _rsrc(hang), 0, cache_modifier=CM_DEV)
-            outs_, e = [], 0
-            for _, _, n in specs:
-                outs_.append([v[e + 2 * q] for q in range(n)])
-                e += 2 * n
-            return outs_
+            return unpack(v)
 
         def hint_wait(n, addr_of, mark=None):
             """Consumers poll their payload directly (tight per-wave spins); a wave-0

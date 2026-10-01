@@ -326,9 +326,10 @@ def test_dsv4_bounded_poll_flags_instead_of_hanging():
     cos, sin = rope_table(4096, theta=cfg.rope_theta, device=dev)
     kv = (0.3 * torch.randn(cfg.window, cfg.head_dim, device=dev)).bfloat16()
 
-    for timeout, expect in [(None, False), (0, True)]:
-        kw = {} if timeout is None else {"poll_timeout_us": timeout}
-        variant = Dsv4Variant(cfg, 1, rank=0, npes=1, moe_mode=MoeMode.A8W4, **kw)
+    from kernels.dsv4_moe_layer.dsv4_kernel import POLL_TIMEOUT_US
+
+    for timeout, expect in [(POLL_TIMEOUT_US, False), (0, True)]:
+        variant = Dsv4Variant(cfg, 1, rank=0, npes=1, moe_mode=MoeMode.A8W4, poll_timeout_us=timeout)
         layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=MoeMode.A8W4, variant=variant)
         for _ in range(2):  # a second launch must still terminate after a flagged one
             layer.forward(h, cur, kv.clone(), dest, idx, cos, sin)
