@@ -56,6 +56,7 @@ def shape_dims(cfg) -> dict:
         index_heads_total=cfg.index_heads_total if cfg.indexed else 0,
         index_topk=cfg.index_topk if cfg.indexed else 0,
         kv_fp8=cfg.kv_fp8,
+        indexer_hadamard=cfg.indexer_hadamard,
     )
 
 
@@ -185,15 +186,23 @@ class Dsv4MoeLayer:
         moe_mode: MoeMode | str = MoeMode.A8W4,
         allow_unindexed_csa: bool = False,
         variant: "Dsv4Variant | None" = None,
+        packed: dict | None = None,
     ):
+        """``packed``: another layer object's ``packed`` weights to share -- one set
+        of weights serving several sample counts (one object, and one compiled
+        variant, per count)."""
         cfg = W.cfg
         validate_shard(samples, cfg.heads, rank, npes, cfg.window, cfg.compress_ratio, allow_unindexed_csa)
         if cfg.hc_mult > 1 and cfg.hc_mult & (cfg.hc_mult - 1):
             raise ValueError(f"hc_mult must be 1 or a power of two, got {cfg.hc_mult}")
         self.moe_mode = as_moe_mode(moe_mode)
+        # the kernel reads the router bias as N_EXPERTS f32: a bf16 one (torch's default
+        # dtype in a serving process) is half that, and the read runs off its end
+        if W.t["bias"].dtype != torch.float32:
+            raise ValueError(f"the router bias must be float32, got {W.t['bias'].dtype}")
         self.W, self.S, self.rank, self.npes = W, samples, rank, npes
         self.window = cfg.window
-        self.packed = pack_layer_weights(W.t, self.moe_mode)
+        self.packed = pack_layer_weights(W.t, self.moe_mode) if packed is None else packed
         # [3 scales | hc_mix bases] per side, as one f32 vector the kernel indexes
         dev0 = torch.device("cuda", torch.cuda.current_device())
         self.hc_sb = {}
@@ -203,7 +212,7 @@ class Dsv4MoeLayer:
                     [W.t[f"hc_{side}_scale"].float(), W.t[f"hc_{side}_base"].float()]
                 ).contiguous()
             else:
-                self.hc_sb[side] = torch.zeros(1, device=dev0)
+                self.hc_sb[side] = torch.zeros(1, dtype=torch.float32, device=dev0)
         dims = shape_dims(cfg)
         # layout() and build_dsv4_kernel() MUST see identical shape arguments: the
         # host derives scratch offsets and its size from one and the kernel from the
@@ -254,7 +263,7 @@ class Dsv4MoeLayer:
             self.i_cache = torch.zeros(*dshape, dtype=torch.uint8, device=dev)
             self.i_cache_s = torch.zeros(*sshape, dtype=torch.uint8, device=dev)
         else:
-            self.i_kv_state = self.i_score_state = self.i_cache = self.i_cache_s = torch.zeros(1, device=dev)
+            self.i_kv_state = self.i_score_state = self.i_cache = self.i_cache_s = torch.zeros(1, dtype=torch.float32, device=dev)
         if cfg.compress_ratio:
             shape = (samples, cfg.c_rows, cfg.c_coff * cfg.head_dim)
             self.kv_state = torch.zeros(*shape, dtype=torch.float32, device=dev)
@@ -263,7 +272,7 @@ class Dsv4MoeLayer:
             # softmax. Harmless for the non-overlapping case, which fills them all.
             self.score_state = torch.full(shape, float("-inf"), dtype=torch.float32, device=dev)
         else:
-            self.kv_state = self.score_state = torch.zeros(1, device=dev)
+            self.kv_state = self.score_state = torch.zeros(1, dtype=torch.float32, device=dev)
         # The trivial state pool: slot s is sample s and each field is contiguous,
         # so the strides are just the per-sample sizes. A serving pool hands out
         # slots per sequence and interleaves these fields inside one entry, which
@@ -315,6 +324,7 @@ class Dsv4MoeLayer:
         tokens=None,
         block_tables=None,
         env_rows=None,
+        state=None,
     ):
         """One layer.  Mailbox epochs are ``step * 128 + layer + 1``: layers sharing
         this scratch within a decode step need distinct ``layer``; call
@@ -356,6 +366,30 @@ class Dsv4MoeLayer:
             )
         t = dict(self.W.t, **self.packed)
         bt = self.block_tables if block_tables is None else block_tables
+        # `state` hands the layer someone else's per-sequence state in place of its
+        # own -- a serving engine's views, slots and strides (keys: kv_state,
+        # score_state, i_kv_state, i_score_state, i_cache, i_cache_s, state_slots,
+        # st_kv, st_i, st_ic). What is not given stays the layer's.
+        st = {
+            k: getattr(self, k)
+            for k in (
+                "kv_state",
+                "score_state",
+                "i_kv_state",
+                "i_score_state",
+                "i_cache",
+                "i_cache_s",
+                "state_slots",
+                "st_kv",
+                "st_i",
+                "st_ic",
+            )
+        }
+        if state:
+            unknown = set(state) - set(st)
+            if unknown:
+                raise ValueError(f"unknown state keys {sorted(unknown)}")
+            st.update(state)
         # A hash-routed layer picks its experts by token id: tid2eid [vocab, top_k].
         use_hash = "tid2eid" in t
         if use_hash and (tokens is None or tokens.numel() != self.S or tokens.dtype != torch.int32):
@@ -380,13 +414,13 @@ class Dsv4MoeLayer:
             p(t["attn_sink"]),
             p(t["ape"]) if "ape" in t else 0,
             p(t["g_ckv"]) if "g_ckv" in t else 0,
-            p(self.kv_state),
-            p(self.score_state),
+            p(st["kv_state"]),
+            p(st["score_state"]),
             p(t["i_ape"]) if "i_ape" in t else 0,
             p(t["g_ickv"]) if "g_ickv" in t else 0,
-            p(self.i_kv_state),
-            p(self.i_score_state),
-            p(self.i_cache),
+            p(st["i_kv_state"]),
+            p(st["i_score_state"]),
+            p(st["i_cache"]),
             p(t["hc_attn_fn"]) if "hc_attn_fn" in t else 0,
             p(self.hc_sb["attn"]),
             p(t["hc_ffn_fn"]) if "hc_ffn_fn" in t else 0,
@@ -408,21 +442,25 @@ class Dsv4MoeLayer:
             p(t["s_ug"]),
             p(t["w_dn"]),
             p(t["s_dn"]),
+            p(t["w_sug"]) if "w_sug" in t else 0,
+            p(t["s_sug"]) if "s_sug" in t else 0,
+            p(t["w_sdn"]) if "w_sdn" in t else 0,
+            p(t["s_sdn"]) if "s_sdn" in t else 0,
             p(self.scratch),
             self.sym,
             p(self.peers),
             0 if self.timeline is None else p(self.timeline),
             p(self.step),
-            p(self.state_slots),
+            p(st["state_slots"]),
             p(tokens) if use_hash else 0,
             p(t["tid2eid"]) if use_hash else 0,
             p(bt),
-            p(self.i_cache_s),
+            p(st["i_cache_s"]),
             self.rank,
             layer,
-            self.st_kv,
-            self.st_i,
-            self.st_ic,
+            st["st_kv"],
+            st["st_i"],
+            st["st_ic"],
             int(use_hash),
             bt.stride(0),
             self.env_rows if env_rows is None else env_rows,

@@ -9,15 +9,15 @@ Each rank takes its tensor-parallel shard: heads, output groups, index heads, th
 intermediate and ``wo_b``'s K are split; everything else is replicated.
 
 Most tensors map across unchanged -- FP8 E4M3 with E8M0 128x128 block scales, and the
-routed experts' packed FP4 with E8M0 per-32 scales, are the kernel's own formats. Three
+routed experts' packed FP4 with E8M0 per-32 scales, are the kernel's own formats. Two
 are converted, and each conversion loses information the checkpoint has:
 
 - the compressors' ``wkv`` / ``wgate`` are BF16 in the checkpoint, and are requantized
   to FP8 128x128 blocks here because the kernel fuses them into the ``qkv_a`` GEMV;
 - the hyper-connection mixers (``hc_*_fn``) are FP32, and are stored as bf16 because
-  the kernel consumes them as a packed MFMA operand;
-- the shared expert is FP8 128x128, and in A8W4 it is requantized to MXFP4 because the
-  kernel keeps it as the last entry of the routed experts' bank.
+  the kernel consumes them as a packed MFMA operand.
+
+The shared expert stays FP8 128x128, beside the routed experts' MXFP4 bank.
 """
 
 from __future__ import annotations
@@ -29,10 +29,8 @@ from dataclasses import replace
 import torch
 from safetensors import safe_open
 
-from kernels.common.mx_formats import quantize_mxfp4
 from kernels.dsv4_moe_layer.config import ExpertWeight, MoeMode, moe_format
 from kernels.dsv4_moe_layer.reference import LayerWeights, V4Config, fp8_mats
-from kernels.mla_moe_layer.reference import dequant
 
 FP8_MAX = 448.0
 
@@ -175,7 +173,7 @@ def load_layer(
 
     if cfg.hc_mult > 1:
         for side in ("attn", "ffn"):
-            fn = torch.zeros(cfg.hc_rows, cfg.hc_mult * cfg.hidden, device=device)
+            fn = torch.zeros(cfg.hc_rows, cfg.hc_mult * cfg.hidden, dtype=torch.float32, device=device)
             fn[: cfg.hc_mix] = ck.get(p + f"hc_{side}_fn").float().to(device)
             t[f"hc_{side}_fn"] = fn.to(torch.bfloat16)
             t[f"hc_{side}_base"] = ck.get(p + f"hc_{side}_base").float().to(device)
@@ -183,14 +181,20 @@ def load_layer(
 
     t["w_r"] = ck.get(p + "ffn.gate.weight").to(device)
     bias = p + "ffn.gate.bias"
-    t["bias"] = ck.get(bias).float().to(device) if ck.has(bias) else torch.zeros(cfg.n_experts, device=device)
+    # explicit dtypes throughout: a serving process (ATOM) sets torch's default dtype
+    # to bf16, and a bf16 bias is half the bytes the kernel reads
+    t["bias"] = (
+        ck.get(bias).float().to(device)
+        if ck.has(bias)
+        else torch.zeros(cfg.n_experts, dtype=torch.float32, device=device)
+    )
     if ck.has(p + "ffn.gate.tid2eid"):
         t["tid2eid"] = ck.get(p + "ffn.gate.tid2eid").to(torch.int32).to(device)
 
     if moe_format(moe_mode).weight is not ExpertWeight.MXFP4_BLOCK32:
         raise NotImplementedError("the checkpoint's routed experts are MXFP4: load them with MoeMode.A8W4")
     inter, hidden = cfg.inter, cfg.hidden
-    n_bank = cfg.n_experts + 1
+    n_bank = cfg.n_experts  # the shared expert stays FP8, beside the bank
     ug_q = torch.empty(n_bank, 2 * inter, hidden // 2, dtype=torch.uint8, device=device)
     ug_s = torch.empty(n_bank, 2 * inter, hidden // 32, dtype=torch.uint8, device=device)
     dn_q = torch.empty(n_bank, hidden, inter // 2, dtype=torch.uint8, device=device)
@@ -203,12 +207,12 @@ def load_layer(
             ug_s[e, h * inter : (h + 1) * inter] = ck.get(x + w + ".scale", rows).view(torch.uint8).to(device)
         dn_q[e] = ck.get(x + "w2.weight", cols=shard(inter // 2)).view(torch.uint8).to(device)
         dn_s[e] = ck.get(x + "w2.scale", cols=shard(inter // 32)).view(torch.uint8).to(device)
-    # the shared expert: FP8 in the checkpoint, requantized into the bank's MXFP4
+    # the shared expert: FP8 128x128 in the checkpoint, kept so (as ATOM runs it)
     sh = p + "ffn.shared_experts."
-    gate = dequant(*fp8(sh + "w1", rows=rows), 128)
-    up = dequant(*fp8(sh + "w3", rows=rows), 128)
-    ug_q[cfg.n_experts], ug_s[cfg.n_experts] = quantize_mxfp4(torch.cat([gate, up]))
-    dn_q[cfg.n_experts], dn_s[cfg.n_experts] = quantize_mxfp4(dequant(*fp8(sh + "w2", cols=rows), 128))
+    (gq, gs), (uq, us) = fp8(sh + "w1", rows=rows), fp8(sh + "w3", rows=rows)
+    t["w_sug"], t["s_sug"] = torch.cat([gq, uq]), torch.cat([gs, us])
+    # a column slice: the kernel reads both as dense row-major
+    t["w_sdn"], t["s_sdn"] = (v.contiguous() for v in fp8(sh + "w2", cols=rows))
     t["w_ug"], t["s_ug"], t["w_dn"], t["s_dn"] = ug_q, ug_s, dn_q, dn_s
 
     for name, (r, k, _bk) in fp8_mats(cfg).items():

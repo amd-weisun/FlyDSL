@@ -22,6 +22,8 @@ ATTENTION_NAMES = ("w_qkv_a", "w_q_b", "w_o_a", "w_o_b")
 # the indexer's query projection, present only on a CSA layer
 OPTIONAL_ATTENTION_NAMES = ("w_i_q_b",)
 EXPERT_NAMES = ("w_ug", "w_dn")
+# an MXFP4 bank's shared expert, kept FP8 beside it
+SHARED_EXPERT_NAMES = ("w_sug", "w_sdn")
 # hyper-connection mixers: bf16, K = hc_mult * hidden, rows already padded
 HC_NAMES = ("hc_attn_fn", "hc_ffn_fn")
 
@@ -39,6 +41,7 @@ def pack_layer_weights(
     weight = moe_format(moe_mode).weight
     pack_expert = pack_mxfp4 if weight is ExpertWeight.MXFP4_BLOCK32 else pack_fp8
     packed.update({name: pack_expert(tensors[name]) for name in EXPERT_NAMES})
+    packed.update({name: pack_fp8(tensors[name]) for name in SHARED_EXPERT_NAMES if name in tensors})
     packed["w_r"] = pack_bf16(tensors["w_r"])
     for name in HC_NAMES:
         if name in tensors:

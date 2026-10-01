@@ -194,6 +194,7 @@ def layout(
     index_topk: int = 0,
     max_seq: int = 0,
     kv_fp8: bool = False,
+    indexer_hadamard: bool = True,
 ):
     """Byte offsets of the per-rank scratch and of the symmetric buffer.
 
@@ -518,6 +519,7 @@ def stage_tasks(
     index_topk: int = 0,
     max_seq: int = 0,
     kv_fp8: bool = False,
+    indexer_hadamard: bool = True,
 ):
     """[(stage name, task count)] in execution order.
 
@@ -593,6 +595,7 @@ def build_dsv4_kernel(
     index_topk: int = 0,
     max_seq: int = 0,
     kv_fp8: bool = False,
+    indexer_hadamard: bool = True,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole V4 layer.
 
@@ -667,6 +670,10 @@ def build_dsv4_kernel(
     use_fp8_block128 = fmt.activation is ExpertActivation.FP8_BLOCK128
     use_mxfp8_block32 = fmt.activation is ExpertActivation.MXFP8_BLOCK32
     use_mxfp4_weight = fmt.weight is ExpertWeight.MXFP4_BLOCK32
+    # An MXFP4 bank holds only the routed experts; the shared expert stays FP8 128x128
+    # beside it (w_sug / w_sdn), as the checkpoint stores it and ATOM runs it. Its
+    # activation is the routed experts' (MXFP8 or bf16).
+    SHARED_FP8 = use_mxfp4_weight
     XQ_BLOCKS = 0 if fmt.activation_group is None else HIDDEN // fmt.activation_group
     PUBLISH_BLOCKS = HIDDEN // (32 if use_mxfp8_block32 else 128)
     XQ_WAVES = (
@@ -688,6 +695,7 @@ def build_dsv4_kernel(
     # FP8 bytes, then each 64-wide group's E8M0 byte twice, then padding) and a
     # bf16 RoPE plane [rows, ROPE_DIM]. Otherwise one bf16 plane [rows, HEAD_DIM].
     KV_FP8 = kv_fp8
+    INDEXER_HADAMARD = indexer_hadamard
     if CR:
         assert BLOCK_TOKENS % CR == 0, "a block holds a whole number of compressed entries"
     KV_ROW_BYTES = 512
@@ -990,6 +998,10 @@ def build_dsv4_kernel(
         s_ug: Int64,
         w_dn: Int64,
         s_dn: Int64,
+        w_sug: Int64,
+        s_sug: Int64,
+        w_sdn: Int64,
+        s_sdn: Int64,
         scratch: Int64,
         sym: Int64,
         peers: Int64,
@@ -1073,6 +1085,22 @@ def build_dsv4_kernel(
             one slot, so a kernel that assumed contiguity walks into its neighbour.
             """
             return _uniform(bo.buffer_load(r_slot, s, vec_width=1, dtype=T.i32)) * stride
+
+        # A serving pool is one plane of hundreds of millions of rows, with the
+        # per-request slots at its top: ATOM's V4 pool puts a row 115 GB past a
+        # layer's view and a slot's state tens of GB past slot 0. Any 32-bit offset
+        # from the pool base wraps there, and a buffer resource cannot reach past
+        # 4 GB of its base anyway. So the large part of every such address is
+        # 64-bit and becomes the resource's base; offsets inside a row or a slot
+        # stay small. (Every test pool fits in 4 GB, which is how this hid.)
+        def slot_rsrc(ptr, s, stride):
+            """A resource at sample ``s``'s slot of an f32 rolling-state pool."""
+            slot = _uniform(bo.buffer_load(r_slot, s, vec_width=1, dtype=T.i32))
+            return _rsrc(ptr + fx.Int64(slot) * fx.Int64(stride) * 4)
+
+        def row_rsrc(ptr, row, row_bytes):
+            """A resource at plane row ``row`` (wave-uniform) of rows ``row_bytes`` wide."""
+            return _rsrc(ptr + fx.Int64(_uniform(row)) * row_bytes)
 
         r_peers = _rsrc(peers)
         # Each wave sends to one peer, so retain only that wave's destination.
@@ -1368,6 +1396,21 @@ def build_dsv4_kernel(
             s = ld_f32(s_rsrc, (rg * 16 // SCALE_BM) * (K // 128) + kc // 2)
             return ("f8f8", wv, lambda: s * coef(), b_word + (lane // 16) * 4)
 
+        def unit_fp8mx(w_rsrc, s_rsrc, rg, s_rg, kc, K, b_word, coef=None, ln=None):
+            """One 128-K chunk ``kc`` of row group ``rg`` of a packed FP8 matrix (128x128
+            block scales; ``s_rg`` = the row group of this lane's OUTPUT rows) against the
+            bf16 activation at LDS word ``b_word``, whose per-32 factors are ``coef``
+            (a list of four, as unit_mxfp4's) or one factor (None = 1)."""
+            ln = lane if ln is None else ln
+            wv = [
+                fx.Vector(
+                    bo.buffer_load(w_rsrc, ((rg * (K // 64) + kc * 2 + h) * 64 + ln) * 4, vec_width=4, dtype=T.i32)
+                )
+                for h in range(2)
+            ]
+            s = ld_f32(s_rsrc, (s_rg * 16 // SCALE_BM) * (K // 128) + kc)
+            return ("fp8mx", wv, (s, coef), b_word + (lane // 16) * 4)
+
         def unit_mxfp4(w_rsrc, s_rsrc, rg, kc, K, b_word, coef=None, ln=None):
             """Issue one packed 128-K MXFP4 tile and its four per-row E8M0 scales."""
 
@@ -1392,6 +1435,17 @@ def build_dsv4_kernel(
         def mma_units(acc, units):
             """acc[4] += coef * (W_chunk @ X_chunk) for every issued unit."""
             for unit_format, wv, coef, bw in units:
+                if const_expr(unit_format == "fp8mx"):
+                    ws, coefs = coef
+                    for sp in range_constexpr(4):
+                        a = _fp8_to_bf16x8(wv[sp // 2][(sp % 2) * 2], wv[sp // 2][(sp % 2) * 2 + 1])
+                        b = fx.ptr_load(xs + (bw + sp * 16), result_type=v4f).bitcast(fx.BFloat16)
+                        c = fx.Vector.filled(4, 0.0, fx.Float32)
+                        c = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
+                        f = coefs[sp] if const_expr(isinstance(coefs, list)) else coefs
+                        f = ws if const_expr(f is None) else ws * (f() if const_expr(callable(f)) else f)
+                        acc = [acc[e] + c[e] * f for e in range(4)]
+                    continue
                 if const_expr(callable(coef) and unit_format != "mxfp4"):
                     coef = coef()
                 if const_expr(unit_format == "mxfp4"):
@@ -1568,18 +1622,15 @@ def build_dsv4_kernel(
             return d0, d1, qs
 
         def quant_mxfp8(a0, a1):
-            """Per-16-lane/32-value MXFP8 quantization with an E8M0 scale."""
+            """Per-16-lane/32-value MXFP8 quantization with an E8M0 scale.
+
+            The scale is rounded UP to a power of two, so the block max never clips:
+            rounding it to nearest let amax / scale reach 672 and clamp to 448, which on
+            real activations (outlier-heavy blocks) cost 7-9% of the input's norm."""
 
             amax = subgroup16_max(fx.max(fmath.absf(a0), fmath.absf(a1)))
             nz = amax > 0.0
-            raw_scale = amax * (1.0 / FP8_MAX)
-            bits = raw_scale.bitcast(fx.Int32)
-            exponent = (bits.shrui(fx.Int32(23))) & fx.Int32(0xFF)
-            round_up = ((bits & fx.Int32(0x400000)) != 0) & (
-                ((bits & fx.Int32(0x200000)) != 0) | ((bits & fx.Int32(0x1FFFFF)) != 0) | (exponent > 0)
-            )
-            exponent = exponent + round_up.select(fx.Int32(1), fx.Int32(0))
-            scale = nz.select((exponent << fx.Int32(23)).bitcast(fx.Float32), fx.Float32(1.0))
+            scale = nz.select(_pow2_ceil(amax * (1.0 / FP8_MAX)), fx.Float32(1.0))
             inv = nz.select(_rcp(scale), fx.Float32(1.0))
             q0 = fx.min(fx.max(a0 * inv, -FP8_MAX), FP8_MAX)
             q1 = fx.min(fx.max(a1 * inv, -FP8_MAX), FP8_MAX)
@@ -2103,15 +2154,15 @@ def build_dsv4_kernel(
             """Write one KV row (thread = channel; ``kvn`` its value, ``byte`` / ``e8``
             from kv_quant). CTA-uniform: the fp8 layout trades scale bytes through LDS."""
             if const_expr(KV_FP8):
-                r_nope, r_rope = _rsrc(kv_cache), _rsrc(kv_rope)
+                r_nope, r_rope = row_rsrc(kv_cache, row, KV_ROW_BYTES), row_rsrc(kv_rope, row, ROPE_DIM * 2)
                 # four lanes' FP8 bytes to one dword, channel tid in byte tid % 4
                 wb = byte << ((tid % 4) * 8)
                 for off in (1, 2):
                     wb = _xred(wb, off, lambda a, b: a | b)
                 if (tid < NOPE_DIM) & (tid % 4 == 0):
-                    bo.buffer_store(wb, r_nope, row * (KV_ROW_BYTES // 4) + tid // 4)
+                    bo.buffer_store(wb, r_nope, tid // 4)
                 if tid >= NOPE_DIM:
-                    bo.buffer_store(kvn.to(fx.BFloat16), r_rope, row * ROPE_DIM + tid - NOPE_DIM)
+                    bo.buffer_store(kvn.to(fx.BFloat16), r_rope, tid - NOPE_DIM)
                 if (lane == 0) & (tid < NOPE_DIM):
                     lds_st(misc, wave, e8.bitcast(fx.Float32))
                 gpu.barrier()
@@ -2124,11 +2175,11 @@ def build_dsv4_kernel(
                         lds_ld(misc, fx.min(2 * tid + 1, fx.Int32(NG - 1))).bitcast(fx.Int32), fx.Int32(0)
                     )
                     sw = lo | (lo << 8) | (hi << 16) | (hi << 24)
-                    bo.buffer_store(sw, r_nope, row * (KV_ROW_BYTES // 4) + NOPE_DIM // 4 + tid)
+                    bo.buffer_store(sw, r_nope, NOPE_DIM // 4 + tid)
                 gpu.barrier()
             else:
                 if tid < HEAD_DIM:
-                    bo.buffer_store(kvn.to(fx.BFloat16), _rsrc(kv_cache), row * HEAD_DIM + tid)
+                    bo.buffer_store(kvn.to(fx.BFloat16), row_rsrc(kv_cache, row, HEAD_DIM * 2), tid)
 
         # ====== 2. KV RMSNorm + RoPE + FP8 round trip -> sliding-window ring cache
         # V4's K and V are the same HEAD_DIM row: RoPE occupies its last ROPE_DIM
@@ -2173,8 +2224,6 @@ def build_dsv4_kernel(
         # the window KV does, rotated at the window's FIRST position, and lands in
         # the compressed half of the same cache.
         if const_expr(CR):
-            r_kvst = _rsrc(kv_state)
-            r_scst = _rsrc(score_state)
             for tt in range(start("cmp"), S, G):
                 tt = fx.Int32(tt)
                 stamp("cmp", tt, 0)
@@ -2184,7 +2233,8 @@ def build_dsv4_kernel(
                 # its own rolling state. That per-sample state is also what keeps
                 # these S tasks -- one per CTA, nothing ordering them -- from racing.
                 p = ld_pos(tt)
-                sb = ld_slot(tt, st_kv)  # this sequence's slice of the rolling state
+                # this sequence's slice of the rolling state (64-bit: see slot_rsrc)
+                rs_kv, rs_sc, sb = slot_rsrc(kv_state, tt, st_kv), slot_rsrc(score_state, tt, st_kv), 0
                 slot = p % CR
                 ap0 = [ld_f32(_rsrc(ape), slot * CW + j * HEAD_DIM + ch) for j in range(C_COFF)]
                 g = ld_bf16(_rsrc(g_ckv), ch)
@@ -2203,8 +2253,8 @@ def build_dsv4_kernel(
                 if live:
                     for j in range_constexpr(C_COFF):
                         w = sb + (p % C_ROWS) * CW + j * HEAD_DIM + ch
-                        bo.buffer_store(kvv[j], r_kvst, w)
-                        bo.buffer_store(gtv[j] + ap0[j], r_scst, w)
+                        bo.buffer_store(kvv[j], rs_kv, w)
+                        bo.buffer_store(gtv[j] + ap0[j], rs_sc, w)
                 if (p + 1) % CR == 0:  # uniform across the CTA
                     # Online softmax over the window, one channel per thread, so the
                     # CR positions are a loop rather than CR unrolled copies -- a
@@ -2227,8 +2277,8 @@ def build_dsv4_kernel(
                             i = ib + e
                             coff = (i >= CR).select(fx.Int32(HEAD_DIM), fx.Int32(0)) if OVERLAP else 0
                             wi = sb + ((p + 1 + i) % C_ROWS) * CW + coff + ch
-                            svs.append(ld_f32(r_scst, wi))
-                            kvs.append(ld_f32(r_kvst, wi))
+                            svs.append(ld_f32(rs_sc, wi))
+                            kvs.append(ld_f32(rs_kv, wi))
                         m = fx.Float32(acc[0])
                         den = fx.Float32(acc[1])
                         num = fx.Float32(acc[2])
@@ -2262,7 +2312,12 @@ def build_dsv4_kernel(
             Lane ln owns channels ln and ln + 64, so every butterfly below stride 64
             is an xor shuffle inside the wave and the stride-64 one is the pair
             this lane already holds -- no LDS, no barrier.
+
+            Without INDEXER_HADAMARD (ATOM's indexer: neither side rotated) it is the
+            identity, on queries and keys alike.
             """
+            if const_expr(not INDEXER_HADAMARD):
+                return v0, v1
             # an explicit sequence, NOT `while h < 64`: a Python while over a
             # value the tracer can see becomes a device scf.while, and the
             # shuffle offset then stops being a compile-time constant
@@ -2296,9 +2351,6 @@ def build_dsv4_kernel(
         # amax stops being set by one coordinate, and being orthonormal it leaves the
         # scores the indexer ranks unchanged.
         if const_expr(IHD):
-            r_ikvst = _rsrc(i_kv_state)
-            r_iscst = _rsrc(i_score_state)
-
             for tt in range(start("i_cmp"), S, G):
                 tt = fx.Int32(tt)
                 stamp("i_cmp", tt, 0)
@@ -2306,7 +2358,8 @@ def build_dsv4_kernel(
                 ln = lane
                 ilive = wave == 0
                 p = ld_pos(tt)  # tt is the sample: its own sequence, its own position
-                isb = ld_slot(tt, st_i)  # this sequence's slice of the rolling state
+                # this sequence's slice of the rolling state (64-bit: see slot_rsrc)
+                rs_ikv, rs_isc, isb = slot_rsrc(i_kv_state, tt, st_i), slot_rsrc(i_score_state, tt, st_i), 0
                 icb = ld_slot(tt, st_ic)  # ... and of the indexer's key cache (bytes)
                 slot = p % CR
                 chs = [ln, ln + 64]
@@ -2320,8 +2373,8 @@ def build_dsv4_kernel(
                     for e in range_constexpr(2):
                         for j in range_constexpr(C_COFF):
                             w = isb + (p % C_ROWS) * IW + j * IHD + chs[e]
-                            bo.buffer_store(kvv[e][j], r_ikvst, w)
-                            bo.buffer_store(gtv[e][j] + ap0[e][j], r_iscst, w)
+                            bo.buffer_store(kvv[e][j], rs_ikv, w)
+                            bo.buffer_store(gtv[e][j] + ap0[e][j], rs_isc, w)
                 if (p + 1) % CR == 0:  # uniform across the CTA
                     pooled = []
                     for e in range_constexpr(2):
@@ -2339,8 +2392,8 @@ def build_dsv4_kernel(
                                 i = ib + z
                                 coff = (i >= CR).select(fx.Int32(IHD), fx.Int32(0)) if OVERLAP else 0
                                 wi = isb + ((p + 1 + i) % C_ROWS) * IW + coff + chs[e]
-                                svs.append(ld_f32(r_iscst, wi))
-                                kvs.append(ld_f32(r_ikvst, wi))
+                                svs.append(ld_f32(rs_isc, wi))
+                                kvs.append(ld_f32(rs_ikv, wi))
                             m = fx.Float32(acc[0])
                             den = fx.Float32(acc[1])
                             num = fx.Float32(acc[2])
@@ -2887,6 +2940,10 @@ def build_dsv4_kernel(
             partner = _xshfl(nv, 1)
             even = tid % 2 == 0
             rot = even.select(nv * c - partner * sn, partner * sn + nv * c)
+            if const_expr(KV_FP8):
+                # ATOM's fp8 attention takes the NoPE query as FP8 too: the KV's 64-wide
+                # power-of-two groups (one per wave), from the fp32 normed value
+                nv = kv_quant(nv)[0]
             qn = (tid < NOPE_DIM).select(nv, rot)
             # repack as bf16 pairs for the split stage's MFMA operand
             other = _xshfl(qn, 1)
@@ -2895,7 +2952,6 @@ def build_dsv4_kernel(
             stamp("q_norm", tt, 4)
 
         # ============== 5. gather-sparse sliding-window split: 64 keys x H heads
-        r_kv = _rsrc(kv_cache)
         r_idx = _rsrc(indices)
         KPW = SPLIT_KEYS // WAVES
         EPL = HEAD_DIM // 64  # KV elements one lane owns of a key's row
@@ -2942,20 +2998,18 @@ def build_dsv4_kernel(
                     # their group's E8M0 byte; the rest read the bf16 RoPE plane.
                     # FP8 times a power of two is exact in bf16, so the tile holds
                     # the very values the model would.
-                    rb = krows[jj] * (KV_ROW_BYTES // 4)
+                    r_row = row_rsrc(kv_cache, krows[jj], KV_ROW_BYTES)
                     q8 = fx.Vector(
-                        bo.buffer_load(
-                            r_kv, rb + fx.min(lane, fx.Int32(NOPE_DIM // EPL - 1)) * 2, vec_width=2, dtype=T.i32
-                        )
+                        bo.buffer_load(r_row, fx.min(lane, fx.Int32(NOPE_DIM // EPL - 1)) * 2, vec_width=2, dtype=T.i32)
                     )
                     g = fx.min(lane, fx.Int32(NOPE_DIM // EPL - 1)) // (64 // EPL)  # this lane's 64-group
-                    sw = fx.Int32(bo.buffer_load(r_kv, rb + NOPE_DIM // 4 + g // 2, vec_width=1, dtype=T.i32))
+                    sw = fx.Int32(bo.buffer_load(r_row, NOPE_DIM // 4 + g // 2, vec_width=1, dtype=T.i32))
                     sc = (((sw >> ((g % 2) * 16)) & 0xFF) << 23).bitcast(fx.Float32)
                     nope = (_fp8_to_bf16x8(q8[0], q8[1]).to(fx.Float32) * sc).to(fx.BFloat16)
                     rope = fx.Vector(
                         bo.buffer_load(
-                            _rsrc(kv_rope),
-                            krows[jj] * (ROPE_DIM // 2) + fx.max(lane - NOPE_DIM // EPL, fx.Int32(0)) * WPL,
+                            row_rsrc(kv_rope, krows[jj], ROPE_DIM * 2),
+                            fx.max(lane - NOPE_DIM // EPL, fx.Int32(0)) * WPL,
                             vec_width=WPL,
                             dtype=T.i32,
                         )
@@ -2965,7 +3019,9 @@ def build_dsv4_kernel(
                     kv8 = fx.Vector.from_elements([is_n.select(nw[m], rope[m]) for m in range(WPL)], fx.Int32)
                 else:
                     kv8 = fx.Vector(
-                        bo.buffer_load(r_kv, krows[jj] * (HEAD_DIM // 2) + lane * WPL, vec_width=WPL, dtype=T.i32)
+                        bo.buffer_load(
+                            row_rsrc(kv_cache, krows[jj], HEAD_DIM * 2), lane * WPL, vec_width=WPL, dtype=T.i32
+                        )
                     )
                 fx.ptr_store(kv8.bitcast(fx.Float32), ktile + (j * KS + lane * WPL))
 
@@ -3417,7 +3473,7 @@ def build_dsv4_kernel(
                     for f in range_constexpr(2):
                         m = f * ROUTER_TILE + r
                         logit = logit + lds_ld(red, (w * 64 + f * ROUTER_TILE + n + 16 * (m // 4)) * 4 + m % 4)
-                put(mb("scores"), router_sample * N_EXPERTS + t * ROUTER_TILE + r, _sqrt_softplus(logit))
+                put(mb("scores"), router_sample * N_EXPERTS + t * ROUTER_TILE + r, _sqrt_softplus(bf16_round(logit)))  # the gate's logits are bf16, as ATOM's
             stamp("router", tt, 4)
 
         def dn_route(bs):
@@ -3436,6 +3492,7 @@ def build_dsv4_kernel(
         UG_UNIT_K = 128 if (use_fp8_block128 or use_mxfp4_weight) else 64
         UG_W_BYTES = 2 * INTER * HIDDEN // (2 if use_mxfp4_weight else 1)
         UG_S_BYTES = 2 * INTER * (HIDDEN // 32) if use_mxfp4_weight else 2 * INTER // SCALE_BM * (HIDDEN // 128) * 4
+        SUG_S_BYTES = 2 * INTER // SCALE_BM * (HIDDEN // 128) * 4  # the FP8 shared expert's scales
 
         if const_expr(S == 1):
             # task u takes intermediates (u % UG_PER_SLOT) * UG8 of routed slot
@@ -3505,7 +3562,38 @@ def build_dsv4_kernel(
 
                 # the shared expert's weights do not depend on routing: prefetch them (the
                 # later zero-weight MMAs of the other tasks are cheaper than a branch)
-                pre = [u_ug8(cc, fx.Int32(SHARED_EXPERT), has_sh) for cc in range(UG8_UNITS)]
+                if const_expr(SHARED_FP8):
+
+                    def u_ug8_sh(cc, live):
+                        unit = wave * UG8_UNITS + cc
+                        coefficients = None
+                        if const_expr(use_mxfp8_block32):
+                            coefficients = []
+                            for sp in range_constexpr(4):
+
+                                def coefficient(sp=sp, unit=unit):
+                                    return _uniform_f32(lds_ld(misc, 8 + unit * 4 + sp))
+
+                                coefficients.append(coefficient)
+                        return unit_fp8mx(
+                            bo.create_buffer_resource_from_addr(
+                                w_sug, num_records_bytes=live.select(fx.Int32(2 * INTER * HIDDEN), fx.Int32(0))
+                            ),
+                            bo.create_buffer_resource_from_addr(
+                                s_sug, num_records_bytes=live.select(fx.Int32(SUG_S_BYTES), fx.Int32(0))
+                            ),
+                            w_rg,
+                            s_rg,
+                            unit,
+                            HIDDEN,
+                            unit * 64,
+                            coefficients,
+                            w_ln,
+                        )
+
+                    pre = [u_ug8_sh(cc, has_sh) for cc in range(UG8_UNITS)]
+                else:
+                    pre = [u_ug8(cc, fx.Int32(SHARED_EXPERT), has_sh) for cc in range(UG8_UNITS)]
                 # The normed, quantized input and the routing are the SAME for every
                 # task of the sample, and S == 1 has one sample, so only a CTA's first
                 # task stages them; the ones after it find them in LDS (xs, the
@@ -3635,6 +3723,37 @@ def build_dsv4_kernel(
                         units.append(("fp8", wv, sc, sn * XW + kc * 32 + (lane // 16) * 4))
                 return units
 
+            def ug8_units_sh(c, w_rg, w_ln, s_rg, live):
+                """The FP8 shared expert's units: every sample at once (lane column = sample)."""
+                rw = bo.create_buffer_resource_from_addr(
+                    w_sug, num_records_bytes=live.select(fx.Int32(2 * INTER * HIDDEN), fx.Int32(0))
+                )
+                rs = bo.create_buffer_resource_from_addr(
+                    s_sug, num_records_bytes=live.select(fx.Int32(SUG_S_BYTES), fx.Int32(0))
+                )
+                sn = n_sel()
+                units = []
+                for cc in range_constexpr(UG8_UNITS):
+                    unit = wave * UG8_UNITS + cc
+                    coefficients = None
+                    if const_expr(use_mxfp8_block32):
+                        coefficients = []
+                        for sp in range_constexpr(4):
+
+                            def coefficient(sp=sp, unit=unit, sn=sn):
+                                return lds_ld(misc, 8 + sn * XQ_BLOCKS + unit * 4 + sp)
+
+                            coefficients.append(coefficient)
+                    units.append(
+                        unit_fp8mx(rw, rs, w_rg, s_rg, unit, HIDDEN, sn * XW + unit * 64, coefficients, w_ln)
+                    )
+                return units
+
+            def shared_units(c, w_rg, w_ln, s_rg, live):
+                if const_expr(SHARED_FP8):
+                    return ug8_units_sh(c, w_rg, w_ln, s_rg, live)
+                return ug8_units(c, w_rg, w_ln, s_rg, fx.Int32(SHARED_EXPERT), None, live)
+
             def ug8_emit(c, slot, sample, shared, live):
                 if tid < (S if shared else 1) * UG8 // 2:
                     n = tid // (UG8 // 2)
@@ -3677,7 +3796,7 @@ def build_dsv4_kernel(
             # are CTA-global, so they stay out of the rep loop and every rep reads
             # the one staged input.
             live0, uu0, c0, slot0, has_sh0, wr0, wl0, sr0 = ug8_tile(u0)
-            shared_pre = ug8_units(c0, wr0, wl0, sr0, fx.Int32(SHARED_EXPERT), None, has_sh0 & live0)
+            shared_pre = shared_units(c0, wr0, wl0, sr0, has_sh0 & live0)
             dn_route(load_bias())
             gpu.barrier()
             cur = ug8_units(c0, wr0, wl0, sr0, _uniform(lds_ld(keys, slot0)), 0, live0)
@@ -3689,7 +3808,7 @@ def build_dsv4_kernel(
                     w_rg, w_ln, s_rg = wr0, wl0, sr0
                 else:
                     live, uu, c, slot, has_sh, w_rg, w_ln, s_rg = ug8_tile(u0 + rep * G)
-                    shared_pre = ug8_units(c, w_rg, w_ln, s_rg, fx.Int32(SHARED_EXPERT), None, has_sh & live)
+                    shared_pre = shared_units(c, w_rg, w_ln, s_rg, has_sh & live)
                     cur = ug8_units(c, w_rg, w_ln, s_rg, _uniform(lds_ld(keys, slot)), 0, live)
                 if has_sh:
                     reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre), emit_out(16))
@@ -3722,11 +3841,18 @@ def build_dsv4_kernel(
         DN_WPR = WAVES // DN_R
         DN_UNIT_K = 128 if (use_fp8_block128 or use_mxfp4_weight) else 64
         DN_UNITS_PER_SLOT = INTER // DN_UNIT_K
-        DN_NU = S * MOE_SLOTS * DN_UNITS_PER_SLOT
+        # routed units over (sample, slot, K chunk); with SHARED_FP8 the shared slot 0 is
+        # its own group of FP8 units after them (a unit's format is compile-time)
+        DN_SLOTS = TOP_K if SHARED_FP8 else MOE_SLOTS
+        DN_NU = S * DN_SLOTS * DN_UNITS_PER_SLOT
         DN_UPW = (DN_NU + DN_WPR - 1) // DN_WPR
+        DN_SH_NU = S * DN_UNITS_PER_SLOT if SHARED_FP8 else 0
+        DN_SH_UPW = (DN_SH_NU + DN_WPR - 1) // DN_WPR
+        DN_CPW = DN_UPW + DN_SH_UPW
         DN_BLK = S * MOE_SLOTS * INTER // 128
         DN_W_BYTES = HIDDEN * INTER // (2 if use_mxfp4_weight else 1)
         DN_S_BYTES = HIDDEN * (INTER // 32) if use_mxfp4_weight else HIDDEN // SCALE_BM * (INTER // 128) * 4
+        SDN_S_BYTES = HIDDEN // SCALE_BM * (INTER // 128) * 4  # the FP8 shared expert's scales
         DN_BATCH = 9  # 128-k chunks per wave in flight / prefetched before the mid wait
         for t in range(start("down"), N_DN_TILES, G):
             t = fx.Int32(t)
@@ -3742,13 +3868,52 @@ def build_dsv4_kernel(
             dn_lr = gu * 16 + lane % 16 - dn_off
             dn_ln = ((dn_lr >= 0) & (dn_lr < DN_TILE)).select(lane, lane ^ 8)
 
+            def dn_coefficients(q, s_q, slot_q):
+                """A unit's factors: the mid's MXFP8 scales (times the route weight) or
+                the route weight, in its sample's column only."""
+                if const_expr(use_mxfp8_block32):
+                    coefficients = []
+                    for sp in range_constexpr(4):
+
+                        def coefficient(sp=sp, q=q, s_q=s_q):
+                            return (lane % 16 == s_q).select(_uniform_f32(lds_ld(misc, q * 4 + sp)), fx.Float32(0.0))
+
+                        coefficients.append(coefficient)
+                    return coefficients
+
+                def coefficient():
+                    return (lane % 16 == s_q).select(
+                        _uniform_f32(lds_ld(dnw, s_q * MOE_SLOTS + slot_q)), fx.Float32(0.0)
+                    )
+
+                return coefficient
+
+            def u_dn_sh(cc):  # cc: this wave's cc-th unit of the FP8 shared expert
+                qs = (wave % DN_WPR) * DN_SH_UPW + cc
+                live = qs < DN_SH_NU
+                r = fx.min(qs, DN_SH_NU - 1)
+                s_q, kc = r // DN_UNITS_PER_SLOT, r % DN_UNITS_PER_SLOT
+                q = s_q * MOE_SLOTS * DN_UNITS_PER_SLOT + kc  # slot 0's mid
+                masked = DN_SH_NU % DN_WPR != 0
+                wb = bo.create_buffer_resource_from_addr(
+                    w_sdn, num_records_bytes=live.select(fx.Int32(HIDDEN * INTER), fx.Int32(0)) if masked else None
+                )
+                sb = bo.create_buffer_resource_from_addr(
+                    s_sdn, num_records_bytes=live.select(fx.Int32(SDN_S_BYTES), fx.Int32(0)) if masked else None
+                )
+                rg = dn_rg + gu
+                return unit_fp8mx(wb, sb, rg, rg, kc, INTER, q * 64, dn_coefficients(q, s_q, fx.Int32(0)), dn_ln)
+
             def u_dn(cc):  # cc: 128-k chunk of this wave
+                if const_expr(cc >= DN_UPW):
+                    return u_dn_sh(cc - DN_UPW)
                 qu = (wave % DN_WPR) * DN_UPW + cc
                 live = qu < DN_NU
-                q = fx.min(qu, DN_NU - 1)  # unit index over (sample, slot, K chunk)
-                s_q = q // (MOE_SLOTS * DN_UNITS_PER_SLOT)
-                slot_q = (q // DN_UNITS_PER_SLOT) % MOE_SLOTS
-                kc = q % DN_UNITS_PER_SLOT
+                r = fx.min(qu, DN_NU - 1)
+                s_q = r // (DN_SLOTS * DN_UNITS_PER_SLOT)
+                slot_q = (r // DN_UNITS_PER_SLOT) % DN_SLOTS + (MOE_SLOTS - DN_SLOTS)
+                kc = r % DN_UNITS_PER_SLOT
+                q = (s_q * MOE_SLOTS + slot_q) * DN_UNITS_PER_SLOT + kc  # unit over (sample, slot, K chunk)
                 e = _uniform(lds_ld(keys, s_q * MOE_SLOTS + slot_q))
                 wb = bo.create_buffer_resource_from_addr(
                     w_dn + fx.Int64(e) * fx.Int64(DN_W_BYTES),
@@ -3760,24 +3925,7 @@ def build_dsv4_kernel(
                 )
 
                 if const_expr(use_mxfp4_weight):
-                    coefficients = []
-                    if const_expr(use_mxfp8_block32):
-                        for sp in range_constexpr(4):
-
-                            def coefficient(sp=sp, q=q, s_q=s_q):
-                                return (lane % 16 == s_q).select(
-                                    _uniform_f32(lds_ld(misc, q * 4 + sp)), fx.Float32(0.0)
-                                )
-
-                            coefficients.append(coefficient)
-                    else:
-
-                        def coefficient():
-                            return (lane % 16 == s_q).select(
-                                _uniform_f32(lds_ld(dnw, s_q * MOE_SLOTS + slot_q)), fx.Float32(0.0)
-                            )
-
-                        coefficients = coefficient
+                    coefficients = dn_coefficients(q, s_q, slot_q)
                     return unit_mxfp4(
                         wb,
                         sb,
@@ -3803,7 +3951,7 @@ def build_dsv4_kernel(
                 return unit_fp8(wb, sb, dn_rg + gu, kc64, DN_NKC, INTER, 128, q * 32, coef, dn_ln)
 
             # the experts are known: stream their down weights while up/gate finishes
-            pre = [u_dn(cc) for cc in range(min(DN_BATCH, DN_UPW))]
+            pre = [u_dn(cc) for cc in range(min(DN_BATCH, DN_CPW))]
             hint_wait(
                 N_UG,
                 lambda k: (
@@ -3840,7 +3988,7 @@ def build_dsv4_kernel(
                     else:
                         lds_st(xs, blk * 64 + lane, bf16_pair(mids[b][0], mids[b][1]))
             gpu.barrier()
-            acc = run_units(u_dn, DN_UPW, DN_BATCH, pre)
+            acc = run_units(u_dn, DN_CPW, DN_BATCH, pre)
 
             def emit_dn(rl, n, v):
                 if (rl >= dn_off) & (rl < dn_off + DN_TILE):
@@ -3926,6 +4074,10 @@ def build_dsv4_kernel(
         s_ug: Int64,
         w_dn: Int64,
         s_dn: Int64,
+        w_sug: Int64,
+        s_sug: Int64,
+        w_sdn: Int64,
+        s_sdn: Int64,
         scratch: Int64,
         sym: Int64,
         peers: Int64,
@@ -3991,6 +4143,10 @@ def build_dsv4_kernel(
             s_ug,
             w_dn,
             s_dn,
+            w_sug,
+            s_sug,
+            w_sdn,
+            s_sdn,
             scratch,
             sym,
             peers,
@@ -4011,4 +4167,7 @@ def build_dsv4_kernel(
             env_rows,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
-    return launch_dsv4
+    # LLVM's VectorCombine (foldShuffleToIdentity) goes exponential on the S == 1
+    # up/gate's FP8 shared-expert units: a real-dims compile went from ~6 s to >24 min,
+    # past the 600 s compile lock other ranks wait on.
+    return flyc.compile[{"llvm_options": {"disable-vector-combine": True}}](launch_dsv4)

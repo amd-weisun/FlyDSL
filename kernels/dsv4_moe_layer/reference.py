@@ -27,7 +27,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
-from kernels.common.mx_formats import quant_dequant_mxfp8, quantize_mxfp4
+from kernels.common.mx_formats import quantize_mxfp4
 from kernels.dsv4_moe_layer.config import (
     BLOCK_TOKENS,
     COMPRESS_CSA,
@@ -104,6 +104,11 @@ class V4Config:
     # KV rows in ATOM's fp8 layout (packed NoPE + E8M0 plane, bf16 RoPE plane)
     # rather than one bf16 plane. A storage format: the values are the same.
     kv_fp8: bool = False
+    # The indexer's queries and compressed keys in the Hadamard basis, as the model's
+    # reference does. ATOM skips the rotation on both sides (its prefill writes the
+    # indexer cache unrotated), so a kernel serving ATOM's state must skip it too:
+    # q . k is the same either way, only the FP4 rounding differs.
+    indexer_hadamard: bool = True
 
     @property
     def hc_mix(self) -> int:
@@ -201,7 +206,9 @@ class V4Config:
 
     @property
     def shared_expert(self) -> int:
-        """The shared expert sits last in the bank, as in the GLM-5/V3 layout."""
+        """The shared expert's expert id: last in an FP8 bank, as in the GLM-5/V3 layout.
+        An MXFP4 bank holds only the routed experts, and the shared one is kept in
+        FP8 beside it (``w_sug`` / ``w_sdn``), as the checkpoint and ATOM keep it."""
         return self.n_experts
 
     @property
@@ -265,6 +272,28 @@ def fp8_mats(cfg: V4Config):
 class LayerWeights:
     cfg: V4Config
     t: dict  # name -> tensor
+
+
+def quant_dequant_mxfp8(x: torch.Tensor) -> torch.Tensor:
+    """Per-1x32 MXFP8 E4M3 quantization, returned dequantized in FP32.
+
+    The E8M0 scale is rounded UP (2**ceil(log2(amax / 448))), so no block maximum
+    clips. Rounding it to nearest let amax / scale reach 672 and clamp to 448, which
+    on real V4 activations (outlier-heavy blocks) cost 7-9% of the MoE input."""
+    shape = x.shape
+    blocks = x.float().reshape(*shape[:-1], shape[-1] // 32, 32)
+    amax = blocks.abs().amax(dim=-1, keepdim=True)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0))).clamp_min(torch.finfo(torch.float32).tiny)
+    q = (blocks / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float()
+    return (q * scale).reshape(shape)
+
+
+def expert_matrix(t: dict, name: str, e: int, cfg: V4Config, weight: ExpertWeight) -> torch.Tensor:
+    """Expert ``e``'s dequantized ``ug`` ([gate; up] rows) or ``dn`` matrix, wherever it
+    is kept: the shared expert of an MXFP4 bank is the FP8 ``w_s<name>`` beside it."""
+    if e == cfg.shared_expert and f"w_s{name}" in t:
+        return dequant(t[f"w_s{name}"], t[f"s_s{name}"], 128)
+    return dequant_expert(t[f"w_{name}"][e], t[f"s_{name}"][e], weight)
 
 
 def make_weights(
@@ -342,6 +371,7 @@ def make_weights(
             ug_q[e], ug_s[e] = _rand_fp8(2 * cfg.inter, cfg.hidden, 128, shd, device)
             dn_q[e], dn_s[e] = _rand_fp8(cfg.hidden, cfg.inter, 128, shd, device)
     else:
+        n_bank = cfg.n_experts  # the shared expert is FP8, beside the bank
         ug_q = torch.empty(n_bank, 2 * cfg.inter, cfg.hidden // 2, dtype=torch.uint8, device=device)
         ug_s = torch.empty(n_bank, 2 * cfg.inter, cfg.hidden // 32, dtype=torch.uint8, device=device)
         dn_q = torch.empty(n_bank, cfg.hidden, cfg.inter // 2, dtype=torch.uint8, device=device)
@@ -351,6 +381,8 @@ def make_weights(
             dn = torch.randn(cfg.hidden, cfg.inter, generator=shd, device=device) / cfg.inter**0.5
             ug_q[e], ug_s[e] = quantize_mxfp4(ug)
             dn_q[e], dn_s[e] = quantize_mxfp4(dn)
+        t["w_sug"], t["s_sug"] = _rand_fp8(2 * cfg.inter, cfg.hidden, 128, shd, device)
+        t["w_sdn"], t["s_sdn"] = _rand_fp8(cfg.hidden, cfg.inter, 128, shd, device)
     t["w_ug"], t["s_ug"], t["w_dn"], t["s_dn"] = ug_q, ug_s, dn_q, dn_s
     return LayerWeights(cfg, t)
 
@@ -655,7 +687,8 @@ def compress_step(
     row = cur_pos // r if dest_row is None else dest_row
     if rotate:
         # the indexer's cache holds the FP4 codes themselves, not their values
-        v = bf(hadamard(v))
+        if cfg.indexer_hadamard:
+            v = bf(hadamard(v))
         cache[row] = pack_fp4(v)
         return quant_dequant_fp4(v)
     v = torch.cat([kv_quant_dequant(v[:-rd]), v[-rd:]])
@@ -697,7 +730,7 @@ def indexer_step(x, q_a_n, i_kv, i_gate, cur_pos, cfg, t, i_state, i_score_state
     q = (q_a_n.float() @ dq.T).view(ih, ihd)
     q = torch.stack([torch.cat([q[h, :-rd], rope(q[h, -rd:], cos[cur_pos], sin[cur_pos])]) for h in range(ih)])
     # the queries take the same rotation and FP4 round trip the keys do
-    q = quant_dequant_fp4(bf(hadamard(q)))
+    q = quant_dequant_fp4(bf(hadamard(q)) if cfg.indexer_hadamard else bf(q))
     # scaled by the GLOBAL head count: the sum below is completed by the all-reduce
     w = bf(x.float() @ t["i_w"].float().T) * (ihd**-0.5 * cfg.index_heads_total**-0.5)
 
@@ -908,6 +941,10 @@ def golden_layer(
             for s in range(S)
         ]
     )
+    if cfg.kv_fp8:
+        # ATOM's fp8 attention takes the query's NoPE part as FP8 too, with the KV's
+        # 64-wide power-of-two groups, quantized from the fp32 normed value
+        q = torch.cat([kv_quant_dequant(q[..., :-rd]), q[..., -rd:]], dim=-1)
 
     # shared KV: one row per token, rope in the tail, nope part FP8 round-tripped.
     # Each sample is its own sequence at its own position, writing its own slice.
@@ -1033,7 +1070,8 @@ def golden_moe(
         ain, post_f, comb_f = a, None, None
     x2 = rmsnorm(ain, t["g_post"], cfg.eps)
     # V4 scores with sqrt(softplus(.)) instead of V3/GLM-5's sigmoid
-    scores = torch.nn.functional.softplus(bf(x2) @ t["w_r"].float().T).sqrt()
+    # the gate's logits are bf16 (ATOM's gate GEMM writes bf16) before sqrt(softplus)
+    scores = torch.nn.functional.softplus(bf(bf(x2) @ t["w_r"].float().T)).sqrt()
 
     if fmt.activation is ExpertActivation.FP8_BLOCK128:
         xq_ref = quant_dequant(x2)
@@ -1056,7 +1094,7 @@ def golden_moe(
         weights = [1.0] + p.tolist()
         mids = []
         for e in experts:
-            ug = dequant_expert(t["w_ug"][e], t["s_ug"][e], fmt.weight) @ xq[s]
+            ug = expert_matrix(t, "ug", e, cfg, fmt.weight) @ xq[s]
             gate, up = ug[: cfg.inter], ug[cfg.inter :]
             if lim > 0:
                 # note the asymmetry: up is clamped both sides, gate only above
@@ -1079,7 +1117,7 @@ def golden_moe(
                 activation = quant_dequant_mxfp8(m)
             else:
                 activation = bf(m)
-            y[s] += wgt * (dequant_expert(t["w_dn"][e], t["s_dn"][e], fmt.weight) @ activation)
+            y[s] += wgt * (expert_matrix(t, "dn", e, cfg, fmt.weight) @ activation)
 
     ffn_out = allreduce(y)
     if cfg.hc_mult > 1:

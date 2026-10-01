@@ -192,6 +192,10 @@ def test_dsv4_layer_matches_golden(S, moe_mode, hc_mult):
     if _routing_flipped(got, ref, W, cfg, S):
         ref = _rebase_on_own_routing(got, ref, W, moe_mode)
     _compare_stages(got, ref, cfg, 1)
+    # the quantized expert input, by relative L2: a lone FP8 rounding flip is one
+    # element, but a clipped block maximum (an E8M0 scale rounded down) is ~5%
+    xq_rel = ((got["xq"].float() - ref["xq"].float()).norm() / ref["xq"].float().norm()).item()
+    assert xq_rel < 0.01, f"quantized expert input diverged: rel_l2 {xq_rel:.5f}"
     assert out.shape == h.shape, f"the layer must preserve its input shape, got {out.shape}"
 
     # end to end, judge by relative L2: one FP8/bf16 rounding flip upstream moves a
@@ -204,7 +208,7 @@ def test_dsv4_layer_matches_golden(S, moe_mode, hc_mult):
 
 
 @pytest.mark.large_shape
-@pytest.mark.parametrize("S,hc_mult", [(1, 1), (8, 1), (1, 4)])
+@pytest.mark.parametrize("S,hc_mult", [(1, 1), (8, 1), (1, 4), (8, 4)])
 def test_dsv4_layer_matches_golden_at_real_dims(S, hc_mult):
     """The reduced shard above cannot catch mappings that only break at V4's own
     numbers -- 384 experts overflowed the selection key's id field, which 256 (and
@@ -281,6 +285,19 @@ def test_dsv4_csa_shape_is_the_selected_one():
     assert far.n_compressed > far.index_topk
     assert far.n_index == far.index_topk, "the gather must stay bounded by index_topk"
     assert far.cache_rows > far.n_keys, "the cache still holds every compressed entry"
+
+
+def test_dsv4_rejects_a_bf16_router_bias():
+    """A serving process sets torch's default dtype to bf16, so a loader's undtyped
+    torch.zeros bias came out bf16: half the bytes the kernel reads, and the read ran
+    off the tensor's end into an unmapped page (a memory fault in ATOM's warmup)."""
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    cfg = _cfg(hc_mult=1)
+    W = make_weights(rank=0, cfg=cfg, device="cuda", seed=3, moe_mode=MoeMode.A8W4)
+    W.t["bias"] = W.t["bias"].bfloat16()
+    with pytest.raises(ValueError, match="router bias must be float32"):
+        Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=MoeMode.A8W4)
 
 
 def test_dsv4_rejects_head_dim_that_would_deadlock():
@@ -962,7 +979,8 @@ def test_dsv4_csa_compressor_in_kernel():
     assert emitted >= 4, f"expected several compressed entries, got {emitted}"
 
 
-def test_dsv4_indexer_compressor_in_kernel():
+@pytest.mark.parametrize("indexer_hadamard", [True, False])
+def test_dsv4_indexer_compressor_in_kernel(indexer_hadamard):
     """The INDEXER's compressor in the kernel, against ``compress_step(rotate=True)``.
 
     Same pooling as the attention compressor, different tail: half the head_dim,
@@ -978,6 +996,7 @@ def test_dsv4_indexer_compressor_in_kernel():
     torch.manual_seed(0)
     ratio = COMPRESS_CSA
     cfg = _cfg(hc_mult=1)
+    cfg.indexer_hadamard = indexer_hadamard  # ATOM's indexer rotates neither side
     cfg.compress_ratio, cfg.max_seq = ratio, 256
     assert cfg.indexed, "only CSA runs an indexer"
     ihd, dev, mode = cfg.index_head_dim, "cuda", MoeMode.W8A8
@@ -1036,7 +1055,8 @@ def test_dsv4_indexer_compressor_in_kernel():
     assert emitted >= 4, f"expected several compressed entries, got {emitted}"
 
 
-def test_dsv4_indexer_query_in_kernel():
+@pytest.mark.parametrize("indexer_hadamard", [True, False])
+def test_dsv4_indexer_query_in_kernel(indexer_hadamard):
     """The indexer's QUERY path in the kernel: projection, RoPE, Hadamard, FP4.
 
     Unlike the main query there is no per-head RMS -- the indexer's query is
@@ -1054,6 +1074,7 @@ def test_dsv4_indexer_query_in_kernel():
 
     torch.manual_seed(0)
     cfg = _cfg(hc_mult=1)
+    cfg.indexer_hadamard = indexer_hadamard  # ATOM's indexer rotates neither side
     cfg.compress_ratio, cfg.max_seq = COMPRESS_CSA, 256
     ih, ihd, rd = cfg.index_heads, cfg.index_head_dim, cfg.rope_dim
     dev, mode = "cuda", MoeMode.W8A8
@@ -1078,7 +1099,7 @@ def test_dsv4_indexer_query_in_kernel():
         q_an = bf(rmsnorm(q_a, t["g_q"], cfg.eps))
         q = (q_an @ dq_iqb.T).view(ih, ihd)
         q = torch.stack([torch.cat([q[j, :-rd], bf(rope(q[j, -rd:], cos[pos], sin[pos]))]) for j in range(ih)])
-        ref = quant_dequant_fp4(bf(hadamard(bf(q))))
+        ref = quant_dequant_fp4(bf(hadamard(bf(q))) if cfg.indexer_hadamard else bf(q))
 
         got = layer.debug("i_q", (1, ih, ihd))[0]
         # FP4's levels are coarse -- one step is ~0.5 at these magnitudes -- so a
@@ -1092,7 +1113,8 @@ def test_dsv4_indexer_query_in_kernel():
         assert rel_l2 < 6e-2, f"pos={pos} indexer query rel_l2 {rel_l2:.5f}"
 
 
-def test_dsv4_indexer_scoring_in_kernel():
+@pytest.mark.parametrize("indexer_hadamard", [True, False])
+def test_dsv4_indexer_scoring_in_kernel(indexer_hadamard):
     """The indexer's SCORE for every compressed entry, against the golden.
 
     score[c] = sum_h relu(q[h] . k[c]) * w[h], over entries the compressor has
@@ -1115,6 +1137,7 @@ def test_dsv4_indexer_scoring_in_kernel():
     torch.manual_seed(0)
     ratio = COMPRESS_CSA
     cfg = _cfg(hc_mult=1)
+    cfg.indexer_hadamard = indexer_hadamard  # ATOM's indexer rotates neither side
     cfg.compress_ratio, cfg.max_seq = ratio, 256
     ih, ihd, rd = cfg.index_heads, cfg.index_head_dim, cfg.rope_dim
     dev, mode = "cuda", MoeMode.W8A8
@@ -1161,7 +1184,7 @@ def test_dsv4_indexer_scoring_in_kernel():
         q_an = bf(rmsnorm(proj[:, : cfg.q_lora], t["g_q"], cfg.eps))
         q = (q_an @ dq_iqb.T).view(ih, ihd)
         q = torch.stack([torch.cat([q[j, :-rd], bf(rope(q[j, -rd:], cos[pos], sin[pos]))]) for j in range(ih)])
-        q = quant_dequant_fp4(bf(hadamard(bf(q))))
+        q = quant_dequant_fp4(bf(hadamard(bf(q))) if cfg.indexer_hadamard else bf(q))
         w = bf(x @ t["i_w"].float().T)[0] * scale
 
         n = (pos + 1) // ratio
@@ -1238,7 +1261,7 @@ def _indexer_score_rank(rank, npes, port, results):
             q_an = bf(rmsnorm(proj[:, : cfg.q_lora], t["g_q"], cfg.eps))
             q = (q_an @ dq_iqb.T).view(ih, ihd)
             q = torch.stack([torch.cat([q[j, :-rd], bf(rope(q[j, -rd:], cos[pos], sin[pos]))]) for j in range(ih)])
-            q_ref = quant_dequant_fp4(bf(hadamard(bf(q))))
+            q_ref = quant_dequant_fp4(bf(hadamard(bf(q))) if cfg.indexer_hadamard else bf(q))
             w_ref = bf(x @ t["i_w"].float().T)[0] * scale
             # Both inputs come back from the kernel, and each is checked here on its
             # own bar. They have to: weights_proj rounds to bf16 and the query to
@@ -1881,6 +1904,53 @@ def test_dsv4_paged_blocks_are_pure_addressing(ratio):
             ia = fp4_pool_rows(lay_a.i_cache[s], lay_a.i_cache_s[s], lay_a.block_tables[s], n)
             ib = fp4_pool_rows(lay_b.i_cache, lay_b.i_cache_s, phys[s], n)
             assert torch.equal(ia, ib), f"sample {s}: indexer entries differ at their paged addresses"
+    lay_a.close()
+    lay_b.close()
+
+
+@pytest.mark.large_shape
+def test_dsv4_rows_and_state_past_4gb():
+    """KV rows and a compressor-state slot more than 4 GB into their pools.
+
+    ATOM's V4 pool is one plane of ~225M rows with the per-request slots at its
+    top, so a window row sits ~115 GB past a layer's view and a slot's state tens
+    of GB past slot 0. A 32-bit offset from the pool base wraps there -- and a
+    buffer resource cannot reach past 4 GB of its base anyway -- which read
+    garbage and wrote wrapped addresses in the first e2e run while every test
+    passed: every test pool fits in 4 GB. Here the same steps run in small pools
+    and with the window rows and the state slot 4.4 GB in; bit-identical outputs.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    torch.manual_seed(0)
+    dev, mode, S = "cuda", MoeMode.W8A8, 1
+    cfg = _cfg(hc_mult=1)
+    cfg.compress_ratio, cfg.max_seq = COMPRESS_HCA, 512
+    cfg.validate()
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
+    lay_a = Dsv4MoeLayer(W, samples=S, rank=0, npes=1, moe_mode=mode)
+    lay_b = Dsv4MoeLayer(W, samples=S, rank=0, npes=1, moe_mode=mode)
+    far_rows = (4400 << 20) // (cfg.head_dim * 2)  # 4.4 GB of bf16 rows
+    kv_a = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    kv_b = torch.zeros(far_rows + cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    width = cfg.c_coff * cfg.head_dim
+    st = (4400 << 20) // 4  # f32 elements: slot 1 starts 4.4 GB in
+    kst = torch.zeros(st + cfg.c_rows * width, device=dev)
+    sst = torch.zeros_like(kst)
+    sst[st:] = float("-inf")
+    far = dict(kv_state=kst, score_state=sst, st_kv=st, state_slots=torch.ones(S, dtype=torch.int32, device=dev))
+    for pos in range(2 * cfg.compress_ratio + 3):
+        h = (0.5 * torch.randn(S, cfg.hidden, device=dev)).bfloat16()
+        cur = torch.tensor([pos] * S, dtype=torch.int32, device=dev)
+        idx, dest = contiguous_pool([pos] * S, cfg, dev)
+        a = lay_a.forward(h, cur, kv_a, dest, idx, cos, sin)
+        b = lay_b.forward(
+            h, cur, kv_b, dest + far_rows, torch.where(idx >= 0, idx + far_rows, idx), cos, sin, state=far
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(a, b), f"pos={pos}: rows / state past 4 GB changed the output"
+    assert torch.equal(kv_a, kv_b[far_rows:]), "the rows past 4 GB do not hold what the small pool does"
     lay_a.close()
     lay_b.close()
 

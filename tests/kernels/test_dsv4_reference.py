@@ -26,6 +26,7 @@ from kernels.dsv4_moe_layer.reference import (
     V4Config,
     compress_step,
     contiguous_pool,
+    expert_matrix,
     fp4_row_bytes,
     fp8_mats,
     golden_layer,
@@ -39,7 +40,7 @@ from kernels.dsv4_moe_layer.reference import (
     unpack_fp4,
     window_idxs,
 )
-from kernels.mla_moe_layer.reference import bf, dequant, dequant_expert, rope_table
+from kernels.mla_moe_layer.reference import bf, dequant, rope_table
 
 ORACLE_DIR = os.environ.get("DSV4_ORACLE_DIR", "/home/weisu/dsv4_oracle")
 # top-k margin below which the two implementations may legitimately pick different
@@ -140,8 +141,8 @@ def _load_oracle_weights(attn, moe, W, cfg, weight_fmt):
     moe.gate.weight.copy_(t["w_r"].to(bf16))
     moe.gate.bias.copy_(t["bias"].float())
     for e in range(cfg.n_experts + 1):
-        ug = dequant_expert(t["w_ug"][e], t["s_ug"][e], weight_fmt)
-        dn = dequant_expert(t["w_dn"][e], t["s_dn"][e], weight_fmt)
+        ug = expert_matrix(t, "ug", e, cfg, weight_fmt)
+        dn = expert_matrix(t, "dn", e, cfg, weight_fmt)
         target = moe.shared_experts if e == cfg.shared_expert else moe.experts[e]
         target.w1.weight.copy_(ug[: cfg.inter].to(bf16))
         target.w3.weight.copy_(ug[cfg.inter :].to(bf16))
@@ -517,6 +518,28 @@ def test_v4_indexer_compressor_matches_deepseek():
         assert d < 2e-2 * scale, f"pos={pos} indexer compressed entry differs: {d / scale:.5f}"
 
     assert emitted >= 4, f"expected several compressed entries, got {emitted}"
+
+
+def test_mxfp8_ceil_scale_never_clips():
+    """With the E8M0 scale rounded up, every block's maximum stays in range, so
+    each element is off by at most one E4M3 half-ulp (2**-4 relative).
+
+    Rounding the scale to nearest instead clamps a block maximum whose
+    ``amax / 448`` has mantissa >= 1.5 by up to a third."""
+    from kernels.common.mx_formats import quant_dequant_mxfp8 as nearest_mxfp8
+    from kernels.dsv4_moe_layer.reference import quant_dequant_mxfp8
+
+    torch.manual_seed(0)
+    x = torch.randn(64, 1024) * torch.exp2(torch.randint(-8, 8, (64, 1)).float())
+    x[:, ::32] *= 20.0  # an outlier per block, as real activations have
+    q = quant_dequant_mxfp8(x)
+    blocks = x.reshape(64, -1, 32)
+    amax = blocks.abs().amax(-1, keepdim=True)
+    err = (q.reshape(64, -1, 32) - blocks).abs()
+    assert (err <= 2**-4 * blocks.abs() + amax * 2**-17).all(), "ceil-scaled MXFP8 clipped or over-rounded"
+    assert (q.abs().reshape(64, -1, 32).amax(-1, keepdim=True) >= amax * (1 - 2**-4)).all(), "a block max clipped"
+    # the nearest-rounded scale does clip on this input
+    assert (nearest_mxfp8(x) - x).norm() > 2 * (q - x).norm()
 
 
 def test_v4_indexer_cache_packs_fp4_losslessly():
