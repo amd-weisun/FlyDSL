@@ -140,6 +140,14 @@ def dn_tile(S: int, hidden: int = HIDDEN) -> int:
 N_ROUTER = N_EXPERTS // ROUTER_TILE
 
 
+def qkv_a_groups(n_tiles: int) -> int:
+    """16-row groups per qkv_a task. Each task stages every sample's normalized input,
+    and that staging is most of its time, so when the tiles outnumber the grid (CSA's
+    compressor rows make 288) a second round would stage it all again: two groups per
+    task instead, four waves each splitting K."""
+    return 2 if n_tiles > BLOCKS and n_tiles % 2 == 0 else 1
+
+
 def router_spt(S: int) -> int:
     """Samples per router task. One per task until S * N_ROUTER outgrows the grid
     (S = 8: 384 tasks, two rounds of ~13 us on the FFN's critical path); then two
@@ -540,7 +548,7 @@ def stage_tasks(
         # the (hc_mult-wide) residual stream
         ("hcd_a", S * hc_tasks),
         ("hcc_a", (hidden // ROW_TILE) if hc_mult > 1 else 0),
-        ("qkv_a", n_qkv_a),
+        ("qkv_a", n_qkv_a // qkv_a_groups(n_qkv_a)),
         ("cache", 1),
         # the compressed entry has to land before the attention gathers it
         ("cmp", S if compress_ratio else 0),
@@ -2093,13 +2101,19 @@ def build_dsv4_kernel(
         # 1 row group x (HIDDEN / 64) chunks: 8 waves split K (all prefetched)
         r_wqa, r_sqa = _rsrc(w_qkv_a), _rsrc(s_qkv_a)
         QA_NKC = HIDDEN // 64
-        for t in range(start("qkv_a"), N_QKV_A, G):
+        QA_R = qkv_a_groups(N_QKV_A)  # row groups per task; WAVES // QA_R waves split K for each
+        QA_WPR = WAVES // QA_R
+        QA_UPW = QA_NKC // QA_WPR  # K chunks per wave
+        QA_BATCH = QA_NKC // WAVES
+        QA_ROWS = QKV_A_TILE * QA_R
+        for t in range(start("qkv_a"), N_QKV_A // QA_R, G):
             t = fx.Int32(t)
             stamp("qkv_a", t, 0)
+            qa_rg = t * QA_R + wave // QA_WPR
 
             def u_qa(c):
-                kc = wave * (QA_NKC // WAVES) + c
-                return unit_fp8(r_wqa, r_sqa, t, kc, QA_NKC, HIDDEN, 128, (n_sel() * HIDDEN + kc * 64) // 2)
+                kc = (wave % QA_WPR) * QA_UPW + c
+                return unit_fp8(r_wqa, r_sqa, qa_rg, kc, QA_NKC, HIDDEN, 128, (n_sel() * HIDDEN + kc * 64) // 2)
 
             def ld_h(sks):
                 if const_expr(HC > 1):  # hc_pre already contracted the streams
@@ -2119,17 +2133,17 @@ def build_dsv4_kernel(
 
             # the (small) input loads go out before the weight stream: loads complete in order
             h_ld = load_x_rmsnorm(ld_h, HIDDEN, g_in)
-            pre = [u_qa(c) for c in range(QA_NKC // WAVES)]
+            pre = [u_qa(c) for c in range(QA_BATCH)]
             stage_x_rmsnorm(ld_h, HIDDEN, g_in, loaded=h_ld)
             gpu.barrier()
             stamp("qkv_a", t, 2)
-            acc = run_units(u_qa, QA_NKC // WAVES, QA_NKC // WAVES, pre)
-            reduce_rows(1, acc, emit_out(QKV_A_TILE))
+            acc = run_units(u_qa, QA_UPW, QA_BATCH, pre)
+            reduce_rows(QA_R, acc, emit_out(QA_ROWS))
             stamp("qkv_a", t, 3)
             gpu.barrier()
-            if tid < S * QKV_A_TILE:
-                s = tid // QKV_A_TILE
-                row = t * QKV_A_TILE + tid % QKV_A_TILE
+            if tid < S * QA_ROWS:
+                s = tid // QA_ROWS
+                row = t * QA_ROWS + tid % QA_ROWS
                 v = lds_ld(outs, tid)
                 # Column ranges of the fused GEMV, in layout order. Must match
                 # reference.qkv_a_split(): the compressor's pair is C_COFF-wide, so
