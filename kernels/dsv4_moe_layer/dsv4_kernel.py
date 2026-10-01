@@ -1282,7 +1282,7 @@ def build_dsv4_kernel(
             make."""
             return [(part + 1 + k) % TK_PARTS for k in range(TK_PARTS - 1)]
 
-        def part_keys(sbase, part):
+        def part_keys(sbase, part, n_live):
             """This thread's candidates in top-k part ``part``, as order-preserving keys.
 
             f32 bits -> a signed int32 whose ORDER matches the float's (flip the low
@@ -1296,11 +1296,15 @@ def build_dsv4_kernel(
             re-walking them per pass was eight serial round trips a pass. Each base
             is clamped so a whole vector stays in range; the caller masks on the
             UNCLAMPED candidate index, which is past the end exactly when it was
-            clamped, so a clamped trip contributes nothing."""
+            clamped, so a clamped trip contributes nothing.
+
+            A trip past ``n_live`` polls candidate 0's vector instead: i_score skips
+            the tiles past the live entries, so their slots are never written this
+            launch, and the caller masks those candidates anyway."""
             cbs = [((fx.Int32(j) * TK_PARTS + part) * THREADS + tid) * TK_PER for j in range(TK_TRIPS)]
             specs = []
             for cb in cbs:
-                a = fx.min(cb, fx.Int32(N_COMP - TK_PER))
+                a = (cb < n_live).select(fx.min(cb, fx.Int32(N_COMP - TK_PER)), fx.Int32(0))
                 specs += [(mb("i_score"), sbase + a + 2 * q, 2) for q in range(TK_PER // 2)]
             ws = [w[e] for w in poll(specs) for e in range(2)]
             return cbs, [(w ^ ((w >> 31) & 0x7FFFFFFF)) ^ MIN_I32 for w in ws]
@@ -2660,8 +2664,11 @@ def build_dsv4_kernel(
                 s = tt // N_ISCORE
                 blk = tt % N_ISCORE
                 # a sequence with no more than N_INDEX live entries keeps all of them:
-                # its scores are never read (see i_topk), so they are not computed
-                if fx.min((ld_pos(s) + 1) // CR, fx.Int32(N_COMP)) > N_INDEX:
+                # its scores are never read (see i_topk), so they are not computed;
+                # nor is a tile past the live entries (the stage is sized for max_seq,
+                # so at ATOM's default 1M that is 512 tiles a sample, nearly all dead)
+                n_live_s = fx.min((ld_pos(s) + 1) // CR, fx.Int32(N_COMP))
+                if (n_live_s > N_INDEX) & (blk * SCORE_TILE < n_live_s):
                     # the query as f32 (words [0, IH * IHD)) and as bf16 pairs after it
                     # (QBF): the bf16 copy is the scoring MFMA's B operand -- exact, the
                     # values are FP4 codes times a power-of-two scale
@@ -2805,7 +2812,7 @@ def build_dsv4_kernel(
                 # does not depend on the scores, and the gather is order-blind -- so a
                 # short sequence skips the select (and i_score skips its scores).
                 if n_live > N_INDEX:
-                    tk_cbs, tk_keys = part_keys(sbase, part)
+                    tk_cbs, tk_keys = part_keys(sbase, part, n_live)
                     stamp("i_topk", tt, 2)
 
                     pfx = fx.Int32(0)  # the digits already fixed, in the unsigned domain
