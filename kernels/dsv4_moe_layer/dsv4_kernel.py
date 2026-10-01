@@ -818,6 +818,9 @@ def build_dsv4_kernel(
     )
     assert N_KEYS % SPLIT_KEYS == 0, "the index list must be a whole number of key tiles"
     N_SPLIT = N_KEYS // SPLIT_KEYS
+    # split/merge sized per launch by the live keys (see live_splits): HCA's list
+    # grows with max_seq, CSA's is the window plus a fixed index_topk
+    LIVE_SPLITS = bool(compress_ratio) and not index_head_dim and N_KEYS > window
     # The flash merge in `uv` gives each split ONE THREAD, which computes that
     # split's exp(m - M)/L into misc[split]; the merge then reads
     # misc[0 .. N_SPLIT). Run it over a single wave while the splits fit in one
@@ -3169,11 +3172,35 @@ def build_dsv4_kernel(
                         w = [bf16_pair(a0, a1) for a0, a1 in cvp]
                         fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * WPL))
 
-        for tt in range(start("split"), S * N_SPLIT, G):
+        def live_splits(s):
+            """Splits of sample ``s`` that can hold a live key: the window's, then
+            the compressed keys that exist so far -- ``(pos + 1) // CR`` of them
+            (ATOM's ``n_hca`` / ``n_csa`` too), capped by the list. Every split past
+            them is all -1. N_SPLIT is sized for max_seq: at 1M an HCA list is 130
+            splits, of which an 8K context fills 3.
+
+            HCA only (LIVE_SPLITS): a CSA list is the window plus index_topk picks,
+            18 splits that any context past 4K fills, so it would pay the
+            bookkeeping (~3 us at S=8, measured) for nothing; it keeps N_SPLIT."""
+            n = N_SPLIT
+            if const_expr(LIVE_SPLITS):
+                nc = fx.min((ld_pos(s) + 1) // CR, fx.Int32(N_KEYS - window))
+                n = (window + nc + SPLIT_KEYS - 1) // SPLIT_KEYS
+            return n
+
+        # (sample, split) over the batch's LARGEST live-split count, so a long
+        # max-len does not cost its empty splits; a shorter sample's extra tasks
+        # just score all -1 keys, and the merge reads only its own live ones.
+        SPL_L = N_SPLIT
+        if const_expr(LIVE_SPLITS):
+            SPL_L = fx.Int32(0)
+            for s_ in range_constexpr(S):
+                SPL_L = fx.max(SPL_L, live_splits(s_))
+        for tt in range(start("split"), S * SPL_L, G):
             tt = fx.Int32(tt)
             stamp("split", tt, 0)
-            s = tt // N_SPLIT  # sample
-            t = tt % N_SPLIT  # 64-key chunk
+            s = tt // SPL_L  # sample
+            t = tt % SPL_L  # 64-key chunk
             split_keys(t, s)
             gpu.barrier()
             gather_old_kv()  # before waiting for q: these rows are from earlier launches
@@ -3280,18 +3307,19 @@ def build_dsv4_kernel(
             head = t // UV_PER_HEAD
             doff = (t % UV_PER_HEAD) * UV_TILE
             sink = ld_f32(_rsrc(attn_sink), head)
-            hint_wait(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head), mark=("uv", tt))
-            pre_poll(N_SPLIT, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head))
+            n_sp = live_splits(s)  # only these were written: see the split stage
+            hint_wait(n_sp, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head), mark=("uv", tt))
+            pre_poll(n_sp, lambda k: (mb("sp_l"), (s * N_SPLIT + k) * H + head))
             stamp("uv", tt, 5)
             dp = fx.min(tid, UV_PAIRS - 1)  # dim pair within this tile
             # which thread owns a split: a lane of wave 0 while they fit in one
             # wave, otherwise one thread of the whole block
             sp_id = tid if UV_WIDE else lane
-            spi = fx.min(sp_id, N_SPLIT - 1)  # clamped so the spare threads read a real slot
+            spi = fx.min(sp_id, n_sp - 1)  # clamped so the spare threads read a live slot
             ml = (s * N_SPLIT + spi) * H + head
             got = poll([(mb("sp_m"), ml, 1), (mb("sp_l"), ml, 1)], batch=2)
             # per-split weights exp(m - M) / L for this head -> misc[split]
-            ok_sp = sp_id < N_SPLIT
+            ok_sp = sp_id < n_sp
             m_sp = ok_sp.select(got[0][0].bitcast(fx.Float32), fx.Float32(NEG))
             l_sp = ok_sp.select(got[1][0].bitcast(fx.Float32), fx.Float32(0.0))
             if UV_WIDE:  # trace-time: a plain Python bool, not a traced value
@@ -3317,15 +3345,18 @@ def build_dsv4_kernel(
             # The chunk keeps one iteration live while still issuing UV_CHUNK
             # loads at a time, so the waits do not serialise. Same shape of fix
             # as the i_score loop above.
+            # Over the live splits only; a chunk's entries past them re-read the last
+            # live split (never poll one nobody wrote this launch) at weight 0.
+            # (With N_SPLIT -- CSA -- this folds to the full, unmasked loop.)
             for _c, acc in range(
-                0, N_SPLIT // UV_CHUNK, fx.Int32(1), init=[fx.Float32(0.0), fx.Float32(0.0)]
+                0, (n_sp + UV_CHUNK - 1) // UV_CHUNK, fx.Int32(1), init=[fx.Float32(0.0), fx.Float32(0.0)]
             ):
                 cb = fx.Int32(_c) * UV_CHUNK
                 gc = poll(
                     [
                         (
                             mb("sp_acc"),
-                            ((s * N_SPLIT + cb + e) * H + head) * (HEAD_DIM // 2) + doff // 2 + dp,
+                            ((s * N_SPLIT + (fx.min(cb + e, n_sp - 1) if const_expr(LIVE_SPLITS) else cb + e)) * H + head) * (HEAD_DIM // 2) + doff // 2 + dp,
                             1,
                         )
                         for e in range(UV_CHUNK)
@@ -3336,6 +3367,8 @@ def build_dsv4_kernel(
                 o1 = fx.Float32(acc[1])
                 for e in range_constexpr(UV_CHUNK):
                     wj = lds_ld(misc, cb + e)
+                    if const_expr(LIVE_SPLITS):
+                        wj = (cb + e < n_sp).select(wj, fx.Float32(0.0))
                     a0, a1 = bf2_f32(gc[e][0])
                     o0 = o0 + a0 * wj
                     o1 = o1 + a1 * wj

@@ -897,6 +897,53 @@ def test_dsv4_hca_layer_matches_golden(moe_mode):
     assert boundaries >= 3, "must cross several compression boundaries"
 
 
+def test_dsv4_hca_merges_only_each_samples_live_splits():
+    """The split stage is sized for max_seq but runs only the batch's largest
+    live-split count, and the merge reads only each sample's OWN live splits.
+
+    Two samples far apart: the short one gets split tasks past its live keys
+    (all -1, scored but never merged) and must not merge them, nor the long
+    one's; the long one needs every split up to its own count. A merge over the
+    wrong count shows up as the attention output `o` -- too few splits drops
+    keys, a stale split adds them. The cache is filled directly, so one launch
+    at each depth suffices.
+    """
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    torch.manual_seed(0)
+    ratio, S = 16, 2
+    cfg = _cfg(hc_mult=1)
+    cfg.compress_ratio, cfg.max_seq = ratio, 4096
+    cfg.validate()
+    dev, mode = "cuda", MoeMode.W8A8
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    layer = Dsv4MoeLayer(W, samples=S, rank=0, npes=1, moe_mode=mode)
+    cos, sin = rope_table(cfg.max_seq, theta=cfg.rope_base, device=dev)
+    pos = [300 + ratio // 2, 3000 + ratio // 2]  # off the compression boundaries
+    n_split = cfg.n_keys // 64
+    live = [(cfg.window + (p + 1) // ratio + 63) // 64 for p in pos]
+    assert live[0] < live[1] < n_split, f"live splits {live} of {n_split}: the shape no longer has dead ones"
+    kv0 = (0.3 * torch.randn(S * cfg.cache_rows, cfg.head_dim, device=dev)).bfloat16()
+    h = (0.5 * torch.randn(S, cfg.hidden, device=dev)).bfloat16()
+    cur = torch.tensor(pos, dtype=torch.int32, device=dev)
+    idx, dest = contiguous_pool(pos, cfg, dev)
+    ks = torch.zeros(S, cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev)
+    ss = torch.full((S, cfg.c_rows, cfg.c_coff * cfg.head_dim), float("-inf"), device=dev)
+
+    layer.forward(h, cur, kv0.clone(), dest, idx, cos, sin)
+    torch.cuda.synchronize()
+    got = layer.intermediates()
+    ref = golden_layer(
+        W, h, pos, kv0.clone(), dest, idx, cos, sin, lambda z: z,
+        moe_mode=mode, kv_state=ks, score_state=ss, cos_c=cos, sin_c=sin,
+    )
+    for s_ in range(S):
+        a, b = got["o"][s_].float(), ref["o"][s_].float()
+        rel = (a - b).abs().max().item() / max(b.abs().max().item(), 1e-6)
+        assert rel < STAGE_TOL["o"], f"sample {s_} (pos {pos[s_]}, {live[s_]} live splits): o rel {rel:.5f}"
+    layer.close()
+
+
 @pytest.mark.large_shape
 def test_dsv4_hca_layer_at_real_dims():
     """HCA at V4-Pro's own numbers, which the reduced shard above cannot reach.
