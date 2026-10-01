@@ -2659,10 +2659,18 @@ def build_dsv4_kernel(
                 stamp("i_score", tt, 0)
                 s = tt // N_ISCORE
                 blk = tt % N_ISCORE
-                for i in range_constexpr((IH * IHD + THREADS - 1) // THREADS):
-                    w4 = tid + i * THREADS
-                    if w4 < IH * IHD:
-                        lds_st(xs, w4, getf(mb("i_q"), s * IH * IHD + w4))
+                # the query as f32 (words [0, IH * IHD)) and as bf16 pairs after it
+                # (QBF): the bf16 copy is the scoring MFMA's B operand -- exact, the
+                # values are FP4 codes times a power-of-two scale
+                QBF = IH * IHD
+                for i in range_constexpr((IH * IHD // 2 + THREADS - 1) // THREADS):
+                    w2 = tid + i * THREADS
+                    if w2 < IH * IHD // 2:
+                        q0 = getf(mb("i_q"), s * IH * IHD + 2 * w2)
+                        q1 = getf(mb("i_q"), s * IH * IHD + 2 * w2 + 1)
+                        lds_st(xs, 2 * w2, q0)
+                        lds_st(xs, 2 * w2 + 1, q1)
+                        lds_st(xs, QBF + w2, bf16_pair(q0, q1))
                 wv = [getf(mb("i_wp"), s * IH + hh) for hh in range(IH)]
                 gpu.barrier()
                 stamp("i_score", tt, 2)
@@ -2671,71 +2679,60 @@ def build_dsv4_kernel(
                 sp = ld_pos(s)
                 n_live = (sp + 1) // CR
                 r_ic2 = _rsrc(i_cache)
-                # This sequence's slice of the key cache. Folded into the row base
-                # ONCE, outside the loop below -- `s` is loop-invariant, and adding
-                # it per iteration would put another live value in the body that
-                # was just trimmed to stop it spilling.
-                icb = ld_slot(s, st_ic)  # bytes; the scale pool's base is 1/16 of it
-                # the entry this launch just wrote is not reliably visible in the
-                # cache yet, so take it from the mailbox instead. Only the task whose
-                # tile holds it polls: the test is CTA-uniform, so all of that task's
-                # threads reach the poll and only the one holding the entry uses it.
-                # Polling in every task cost 128 coherent round trips per thread and
-                # was two thirds of this stage at 1M (23.3 -> 8.6 us a task).
-                is_new = c == sp // CR
-                has_new = ((sp + 1) % CR == 0) & (blk == (sp // CR) // SCORE_TILE)
-                # ATOM's FP4 pool (see K_PB): this candidate's 16 bytes of each group,
-                # and the dword holding its scale byte of each group
-                cc = fx.min(c, N_COMP - 1)
-                blk_c = bt_block(s, cc)
-                sl = cc % K_PB
-                dbase = icb // 4 + blk_c * IC_BLK_WORDS + sl * 4
-                sdbase = icb // 64 + blk_c * (IC_S_BLK // 4) + sl % 16
                 r_ics = _rsrc(i_cache_s)
-                # A RUNTIME loop, not range_constexpr, one 32-element scale block
-                # per trip. Unrolled, the compiler hoists every key load and query
-                # read to the top of the stage; that is ~130 values more than the
-                # budget, so it spilled them and then fed the FMAs back one scratch
-                # load and one full vmcnt wait at a time -- 274 us of stall to do
-                # 1024 FMAs. Carrying the accumulators keeps one trip live.
-                f32_one = as_ir_value(fx.Float32(1.0))
-                f32x2 = fx.Vector.make_type(2, fx.Float32)
-                for _b, acc in range(
-                    0,
-                    IHD // 32,
-                    fx.Int32(1),
-                    init=[fx.Float32(0.0) for _ in range(IH)],
-                ):
-                    kb = fx.Int32(_b)
-                    kwords = fx.Vector(bo.buffer_load(r_ic2, dbase + kb * IC_GRP_WORDS, vec_width=4, dtype=T.i32))
-                    sdw = fx.Int32(bo.buffer_load(r_ics, sdbase + kb * (K_PB // 4), vec_width=1, dtype=T.i32))
-                    kw = []
-                    for wi in range_constexpr(4):
-                        for sel in range_constexpr(4):
-                            pr = fx.Vector(
-                                rocdl.cvt_scalef32_pk_f32_fp4(
-                                    res=f32x2, src=as_ir_value(kwords[wi]), scale=f32_one, src_sel_index=sel
-                                )
-                            )
-                            kw += [pr[0], pr[1]]
-                    # the scale goes on the block's partial sums, not on every code
-                    bsc = (((sdw >> ((sl // 16) * 8)) & 0xFF) << 23).bitcast(fx.Float32)
-                    if has_new:
-                        nv = getf_many([(mb("i_cnew"), s * IHD + kb * 32 + e) for e in range(32)])
-                        kw = [is_new.select(nv[e], kw[e]) for e in range(32)]
-                        bsc = is_new.select(fx.Float32(1.0), bsc)
-                    # the query four floats per LDS read: every lane reads the same
-                    # address, so a read is a broadcast and width is all it costs
-                    kpart = [fx.Float32(0.0) for _ in range(IH)]
-                    for g in range_constexpr(8):
-                        for hh in range_constexpr(IH):
-                            qv = fx.Vector(fx.ptr_load(xs + (hh * IHD + kb * 32 + g * 4), result_type=v4f))
-                            for e in range_constexpr(4):
-                                kpart[hh] = kpart[hh] + kw[g * 4 + e] * qv[e]
-                    res = yield [fx.Float32(acc[hh]) + kpart[hh] * bsc for hh in range(IH)]
-                sc_t = fx.Float32(0.0)
-                for hh in range_constexpr(IH):
-                    sc_t = sc_t + fx.max(fx.Float32(res[hh]), fx.Float32(0.0)) * wv[hh]
+                icb = ld_slot(s, st_ic)  # bytes; the scale pool's base is 1/16 of it
+                ne = sp // CR  # the entry this launch wrote, if (sp + 1) % CR == 0
+                has_new = ((sp + 1) % CR == 0) & (blk == ne // SCORE_TILE)
+                # Scores on MFMA: a wave takes 64 entries, 4 groups of 16 as the A rows
+                # (K = IHD, one 32-wide block per MFMA), the IH heads as the B columns.
+                # A lane's 8 key codes of a block are one dword of ATOM's FP4 pool (the
+                # entry's 16 bytes of that block, dword lane // 16), converted to bf16
+                # with the block's E8M0 scale -- exact, as is the bf16 query. The scalar
+                # version (one entry per thread, 8 heads x 128 FMAs, a query broadcast
+                # per 4) was ~14 us of the CSA layer at S = 8.
+                hn = lane % 16
+                wcol = wv[0]
+                for hh in range_constexpr(1, IH):
+                    wcol = (hn == hh).select(wv[hh], wcol)
+                wcol = (hn < IH).select(wcol, fx.Float32(0.0))
+                qb = QBF + (fx.min(hn, fx.Int32(IH - 1)) * IHD + (lane // 16) * 8) // 2
+                for g in range_constexpr(4):
+                    ec = fx.min(blk * SCORE_TILE + wave * 64 + g * 16 + hn, fx.Int32(N_COMP - 1))
+                    blk_e = bt_block(s, ec)
+                    sl_e = ec % K_PB
+                    db = icb // 4 + blk_e * IC_BLK_WORDS + sl_e * 4 + lane // 16
+                    sdb = icb // 64 + blk_e * (IC_S_BLK // 4) + sl_e % 16
+                    kds = [bo.buffer_load(r_ic2, db + kb * IC_GRP_WORDS, vec_width=1, dtype=T.i32) for kb in range(IHD // 32)]
+                    sds = [bo.buffer_load(r_ics, sdb + kb * (K_PB // 4), vec_width=1, dtype=T.i32) for kb in range(IHD // 32)]
+                    acc = fx.Vector.filled(4, 0.0, fx.Float32)
+                    for kb in range_constexpr(IHD // 32):
+                        bsc = (((fx.Int32(sds[kb]) >> ((sl_e // 16) * 8)) & 0xFF) << 23).bitcast(fx.Float32)
+                        a = _mxfp4_to_bf16x8(fx.Int32(kds[kb]), bsc)
+                        b = fx.ptr_load(xs + (qb + kb * 16), result_type=v4f).bitcast(fx.BFloat16)
+                        acc = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, acc]))
+                    # C[entry 4 * (lane // 16) + i][head lane % 16]: relu, weight, sum heads
+                    for i in range_constexpr(4):
+                        v = fx.max(acc[i], fx.Float32(0.0)) * wcol
+                        for off in (1, 2, 4, 8):
+                            v = _xred(v, off, lambda x, y: x + y)
+                        if hn == i:
+                            lds_st(red, wave * 64 + g * 16 + 4 * (lane // 16) + i, v)
+                gpu.barrier()
+                # the entry this launch just wrote is not reliably visible in the cache
+                # yet: its owning wave rescores it from the mailbox copy, lane j taking
+                # dims j and j + 64
+                if has_new & (wave == (ne - blk * SCORE_TILE) // 64):
+                    nv = getf_many([(mb("i_cnew"), s * IHD + lane + 64 * hf) for hf in range(IHD // 64)])
+                    sc_n = fx.Float32(0.0)
+                    for hh in range_constexpr(IH):
+                        part = fx.Float32(0.0)
+                        for hf in range_constexpr(IHD // 64):
+                            part = part + nv[hf] * lds_ld(xs, hh * IHD + lane + 64 * hf)
+                        sc_n = sc_n + fx.max(wave_sum(part), fx.Float32(0.0)) * wv[hh]
+                    if lane == 0:
+                        lds_st(red, ne - blk * SCORE_TILE, sc_n)
+                gpu.barrier()
+                sc_t = lds_ld(red, tid)
                 live = (c < n_live) & (c < N_COMP)
                 # Splits `compute` (the scoring loop) from `epi` (the exchange), and
                 # it is stamped whether or not there IS an exchange: inside the
