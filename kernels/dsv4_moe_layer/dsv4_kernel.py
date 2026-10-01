@@ -162,6 +162,11 @@ N_UG_PER_SLOT = INTER // UG_TILE
 CM_DEV = 16
 CM_SYS = 17
 POLL_MAX = 12  # mailbox specs polled per batch
+# A poll that has not seen its producer for this long gives up instead of spinning
+# forever: it flags the launch (see `hang` below) and returns. Far past any real
+# wait -- a whole layer is well under a millisecond, and TP ranks launch within
+# milliseconds of each other -- so it fires only on a hang, never on a slow peer.
+POLL_TIMEOUT_US = 10_000_000
 TL_COLS = 8  # timeline stamps per task: 5 phases + 3 free debug marks
 
 
@@ -589,6 +594,7 @@ def build_dsv4_kernel(
     scale: float = SOFTMAX_SCALE,
     timeline: bool = False,
     moe_mode: MoeMode | str = MoeMode.A8W4,
+    poll_timeout_us: int = POLL_TIMEOUT_US,
     hidden: int = HIDDEN,
     q_lora: int = Q_LORA,
     head_dim: int = HEAD_DIM,
@@ -624,6 +630,9 @@ def build_dsv4_kernel(
     every task, and once its inputs have arrived, into the ``timeline`` buffer:
     int64 ``[sum(task counts), TL_COLS]`` (start, hint seen, inputs staged, compute
     done, end, then free debug marks) in ``stage_tasks`` order.
+
+    ``hang`` is one int32: a poll that waits longer than ``poll_timeout_us`` stores
+    the launch's tag there and the launch winds down (see ``poll``).
     """
     # The split-attention score MFMA's N width is the hardware 16 (hn clamps to
     # heads - 1 below it); heads > 16 would need a wider MFMA tiling, not just more
@@ -711,6 +720,7 @@ def build_dsv4_kernel(
     # FP8 bytes, then each 64-wide group's E8M0 byte twice, then padding) and a
     # bf16 RoPE plane [rows, ROPE_DIM]. Otherwise one bf16 plane [rows, HEAD_DIM].
     KV_FP8 = kv_fp8
+    POLL_TIMEOUT_TICKS = poll_timeout_us * 100  # s_memrealtime runs at 100 MHz
     INDEXER_HADAMARD = indexer_hadamard
     if CR:
         assert BLOCK_TOKENS % CR == 0, "a block holds a whole number of compressed entries"
@@ -1023,6 +1033,7 @@ def build_dsv4_kernel(
         peers: Int64,
         timeline_buf: Int64,
         step: Int64,
+        hang: Int64,
         state_slots: Int64,
         tok_ids: Int64,
         tid2eid: Int64,
@@ -1179,6 +1190,10 @@ def build_dsv4_kernel(
             coherent at ``scope`` (agent -> sc1, system -> sc0 sc1)."""
             return fx.generic_load(_qptr(addr), memory_order=fx.AtomicOrdering.Monotonic, syncscope=scope)
 
+        def now_ticks():
+            """``s_memrealtime``: a 100 MHz clock, the same on every CU."""
+            return fx.Int64(llvm.call_intrinsic(T.i64, "llvm.amdgcn.s.memrealtime", [], [], []))
+
         def poll(specs, scope="agent", batch=POLL_MAX):
             """Batched poll of mailbox pairs: ``specs`` = [(base_addr, pair index, npairs in {1, 2})].
 
@@ -1211,10 +1226,26 @@ def build_dsv4_kernel(
                     bad = bad | (v[e] != tag)
                 return bad
 
+            # Bounded: past POLL_TIMEOUT_US the poll stores this launch's tag into
+            # ``hang`` and gives up on garbage, and every other poll of the launch
+            # that sees that word gives up at once -- a CTA facing a dead peer
+            # would otherwise wait out the timeout on each of its polls in turn.
+            # The launch then runs to its end and the host reads ``hang``
+            # (Dsv4Variant.hang_detected). stop: 0 waiting, 1 flagged, 2 timed out.
+            # The bound costs ~3% of an S=8 layer (HCA 149 -> 153 us, CSA 166 ->
+            # 171), the same without the flag read or with a spin count for the
+            # clock: it is the exit itself, at every inlined poll site.
             v = load_all()
-            while pending(v):
+            t0 = now_ticks()
+            stop = fx.Int32(0)
+            while pending(v) & (stop == 0):
                 rocdl.s_nop(0)
                 v = load_all()
+                flagged = _uniform(bo.buffer_load(_rsrc(hang), 0, vec_width=1, dtype=T.i32, cache_modifier=CM_DEV)) == tag
+                late = (now_ticks() - t0) > fx.Int64(POLL_TIMEOUT_TICKS)
+                stop = late.select(fx.Int32(2), flagged.select(fx.Int32(1), fx.Int32(0)))
+            if stop == 2:
+                bo.buffer_store(tag, _rsrc(hang), 0, cache_modifier=CM_DEV)
             outs_, e = [], 0
             for _, _, n in specs:
                 outs_.append([v[e + 2 * q] for q in range(n)])
@@ -4100,6 +4131,7 @@ def build_dsv4_kernel(
         peers: Int64,
         timeline_buf: Int64,
         step: Int64,
+        hang: Int64,
         state_slots: Int64,
         tok_ids: Int64,
         tid2eid: Int64,
@@ -4169,6 +4201,7 @@ def build_dsv4_kernel(
             peers,
             timeline_buf,
             step,
+            hang,
             state_slots,
             tok_ids,
             tid2eid,

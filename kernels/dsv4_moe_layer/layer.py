@@ -16,6 +16,7 @@ from kernels.dsv4_moe_layer.config import (
     validate_shard,
 )
 from kernels.dsv4_moe_layer.dsv4_kernel import (
+    POLL_TIMEOUT_US,
     TL_COLS,
     build_dsv4_kernel,
     layout,
@@ -60,9 +61,10 @@ def shape_dims(cfg) -> dict:
     )
 
 
-def _variant_key(cfg, samples, npes, moe_mode, timeline):
+def _variant_key(cfg, samples, npes, moe_mode, timeline, poll_timeout_us):
     """Everything the compiled kernel and the scratch layout depend on."""
     return (
+        poll_timeout_us,
         tuple(sorted(shape_dims(cfg).items())),
         samples,
         cfg.heads,
@@ -115,10 +117,12 @@ class Dsv4Variant:
         timeline: bool = False,
         moe_mode: MoeMode | str = MoeMode.A8W4,
         allow_unindexed_csa: bool = False,
+        poll_timeout_us: int = POLL_TIMEOUT_US,
     ):
         moe_mode = as_moe_mode(moe_mode)
         validate_shard(samples, cfg.heads, rank, npes, cfg.window, cfg.compress_ratio, allow_unindexed_csa)
-        self.key = _variant_key(cfg, samples, npes, moe_mode, timeline)
+        self.poll_timeout_us = poll_timeout_us
+        self.key = _variant_key(cfg, samples, npes, moe_mode, timeline, poll_timeout_us)
         dims = shape_dims(cfg)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.scr_layout, self.sym_layout = layout(samples, cfg.heads, npes, cfg.window, moe_mode, **dims)
@@ -128,6 +132,9 @@ class Dsv4Variant:
         self.sym = self.peer_buffer.local_address
         self.peers = self.peer_buffer.addresses
         self.step = torch.zeros(1, dtype=torch.int32, device=dev)  # decode-step counter
+        # Nonzero once any launch on this scratch gave up a poll (the kernel's
+        # bounded wait): its outputs, and every later one, are garbage.
+        self.hang = torch.zeros(1, dtype=torch.int32, device=dev)
         # Tracing is the expensive part and depends only on the key, so two variants
         # of the same shape (or a stack built one layer at a time) reuse it.
         built = Dsv4Variant._cache.get(self.key)
@@ -140,6 +147,7 @@ class Dsv4Variant:
                 scale=cfg.softmax_scale,
                 timeline=timeline,
                 moe_mode=moe_mode,
+                poll_timeout_us=poll_timeout_us,
                 n_experts=cfg.n_experts,
                 top_k=cfg.top_k,
                 inter=cfg.inter,
@@ -152,6 +160,10 @@ class Dsv4Variant:
             Dsv4Variant._cache[self.key] = built
         self.launch = built
         self.stages = stage_tasks(samples, cfg.heads, window=cfg.window, top_k=cfg.top_k, inter=cfg.inter, **dims)
+
+    def hang_detected(self) -> bool:
+        """Whether a launch on this scratch timed out a poll. Synchronizes."""
+        return bool(self.hang.item())
 
     def advance_step(self):
         """One decode step done on this scratch. Stream-ordered, so graph-capturable."""
@@ -239,7 +251,7 @@ class Dsv4MoeLayer:
                 moe_mode=self.moe_mode,
                 allow_unindexed_csa=allow_unindexed_csa,
             )
-        elif variant.key != _variant_key(cfg, samples, npes, self.moe_mode, timeline):
+        elif variant.key != _variant_key(cfg, samples, npes, self.moe_mode, timeline, variant.poll_timeout_us):
             raise ValueError(
                 "this layer's shape is not the one the variant was compiled for; a variant is shared "
                 "only by layers of the SAME attention variant (compress_ratio, n_keys, max_seq, ...)"
@@ -451,6 +463,7 @@ class Dsv4MoeLayer:
             p(self.peers),
             0 if self.timeline is None else p(self.timeline),
             p(self.step),
+            p(self.variant.hang),
             p(st["state_slots"]),
             p(tokens) if use_hash else 0,
             p(t["tid2eid"]) if use_hash else 0,

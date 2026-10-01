@@ -309,6 +309,34 @@ def test_dsv4_rejects_head_dim_that_would_deadlock():
         build_dsv4_kernel(S=1, heads=8, npes=1, head_dim=128)
 
 
+def test_dsv4_bounded_poll_flags_instead_of_hanging():
+    """A poll that outwaits its timeout flags the launch and gives up, and the launch
+    still runs to its end. Timeout 0 makes every not-yet-ready poll expire, the same
+    exit a producer that never publishes would take; the default timeout must never
+    fire on a healthy launch."""
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer, Dsv4Variant
+
+    torch.manual_seed(0)
+    cfg = _cfg(hc_mult=1)
+    dev = "cuda"
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=MoeMode.A8W4)
+    h = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
+    cur = torch.tensor([cfg.window], dtype=torch.int32, device=dev)
+    idx, dest = contiguous_pool([cfg.window], cfg, dev)
+    cos, sin = rope_table(4096, theta=cfg.rope_theta, device=dev)
+    kv = (0.3 * torch.randn(cfg.window, cfg.head_dim, device=dev)).bfloat16()
+
+    for timeout, expect in [(None, False), (0, True)]:
+        kw = {} if timeout is None else {"poll_timeout_us": timeout}
+        variant = Dsv4Variant(cfg, 1, rank=0, npes=1, moe_mode=MoeMode.A8W4, **kw)
+        layer = Dsv4MoeLayer(W, samples=1, rank=0, npes=1, moe_mode=MoeMode.A8W4, variant=variant)
+        for _ in range(2):  # a second launch must still terminate after a flagged one
+            layer.forward(h, cur, kv.clone(), dest, idx, cos, sin)
+            torch.cuda.synchronize()
+        assert variant.hang_detected() == expect, f"timeout {timeout}: hang flag {variant.hang.item()}"
+        variant.close()
+
+
 # ---------------------------------------------------------------- multi-rank TP
 #   python3 tests/kernels/test_dsv4_layer.py --npes 8
 # Routing must agree bit-identically across ranks: every rank sums the peer
