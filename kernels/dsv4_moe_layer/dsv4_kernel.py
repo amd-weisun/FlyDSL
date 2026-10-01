@@ -1337,7 +1337,7 @@ def build_dsv4_kernel(
             make."""
             return [(part + 1 + k) % TK_PARTS for k in range(TK_PARTS - 1)]
 
-        def part_keys(sbase, part, n_live):
+        def part_keys(sbase, part, n_live, n_parts):
             """This thread's candidates in top-k part ``part``, as order-preserving keys.
 
             f32 bits -> a signed int32 whose ORDER matches the float's (flip the low
@@ -1355,8 +1355,11 @@ def build_dsv4_kernel(
 
             A trip past ``n_live`` polls candidate 0's vector instead: i_score skips
             the tiles past the live entries, so their slots are never written this
-            launch, and the caller masks those candidates anyway."""
-            cbs = [((fx.Int32(j) * TK_PARTS + part) * THREADS + tid) * TK_PER for j in range(TK_TRIPS)]
+            launch, and the caller masks those candidates anyway.
+
+            ``n_parts`` is how many parts share the candidates this launch: TK_PARTS,
+            or 1 when part 0 holds them all (see i_topk's ``solo``)."""
+            cbs = [((fx.Int32(j) * n_parts + part) * THREADS + tid) * TK_PER for j in range(TK_TRIPS)]
             specs = []
             for cb in cbs:
                 a = (cb < n_live).select(fx.min(cb, fx.Int32(N_COMP - TK_PER)), fx.Int32(0))
@@ -2713,15 +2716,25 @@ def build_dsv4_kernel(
             # score[c] = sum_h relu(q[h] . k[c]) * w[h]. One candidate per thread;
             # the queries go to LDS once, where every thread reads the SAME element
             # at a time, so those reads broadcast rather than conflict.
-            for tt in range(start("i_score"), S * N_ISCORE, G):
+            #
+            # The stage is sized for max_seq -- at ATOM's default 1M, 512 tiles a
+            # sample -- but only the tiles holding live entries are walked: the
+            # tasks are (sample, tile) over the batch's LARGEST live-tile count, so
+            # an 8K context at 1M is 4 tiles a sample, not 512 rounds of skipped
+            # tasks on every CTA (~50 us that held up everything behind them).
+            # Every CTA computes the same count from the same positions.
+            ISC_L = fx.Int32(0)
+            for s_ in range_constexpr(S):
+                nl = fx.min((ld_pos(s_) + 1) // CR, fx.Int32(N_COMP))
+                ISC_L = fx.max(ISC_L, (nl > N_INDEX).select((nl + SCORE_TILE - 1) // SCORE_TILE, fx.Int32(0)))
+            for tt in range(start("i_score"), S * ISC_L, G):
                 tt = fx.Int32(tt)
                 stamp("i_score", tt, 0)
-                s = tt // N_ISCORE
-                blk = tt % N_ISCORE
+                s = tt // ISC_L
+                blk = tt % ISC_L
                 # a sequence with no more than N_INDEX live entries keeps all of them:
                 # its scores are never read (see i_topk), so they are not computed;
-                # nor is a tile past the live entries (the stage is sized for max_seq,
-                # so at ATOM's default 1M that is 512 tiles a sample, nearly all dead)
+                # nor is a tile past its own live entries (another sample's may be longer)
                 n_live_s = fx.min((ld_pos(s) + 1) // CR, fx.Int32(N_COMP))
                 if (n_live_s > N_INDEX) & (blk * SCORE_TILE < n_live_s):
                     # the query as f32 (words [0, IH * IHD)) and as bf16 pairs after it
@@ -2866,8 +2879,13 @@ def build_dsv4_kernel(
                 # Up to N_INDEX live entries the pick is every one of them -- the set
                 # does not depend on the scores, and the gather is order-blind -- so a
                 # short sequence skips the select (and i_score skips its scores).
-                if n_live > N_INDEX:
-                    tk_cbs, tk_keys = part_keys(sbase, part, n_live)
+                # One part holds TK_TRIPS * THREADS * TK_PER candidates, so while the
+                # live ones fit it, part 0 selects alone and the others sit out: no
+                # bins traded. At 1M max-len that is any context up to 64K tokens,
+                # where 16 parts were trading bins four times over 2K candidates.
+                n_parts = (n_live <= TK_TRIPS * THREADS * TK_PER).select(fx.Int32(1), fx.Int32(TK_PARTS))
+                if (n_live > N_INDEX) & (part < n_parts):
+                    tk_cbs, tk_keys = part_keys(sbase, part, n_live, n_parts)
                     stamp("i_topk", tt, 2)
 
                     pfx = fx.Int32(0)  # the digits already fixed, in the unsigned domain
@@ -2920,11 +2938,11 @@ def build_dsv4_kernel(
                             # the register it already holds -- walking from part + 1
                             # means no part ever polls a slot it wrote itself, which
                             # would be a bet on seeing your own global store.
-                            if tid < TK_BINS:
+                            if (tid < TK_BINS) & (n_parts > 1):
                                 put(mb("tk_hist"), ((s * 4 + d) * TK_PARTS + part) * TK_BINS + bn, cnt)
                             tot = cnt
                             before = fx.Int32(0)  # this bin's count in the parts before this one
-                            if tid < TK_BINS:
+                            if (tid < TK_BINS) & (n_parts > 1):
                                 # ONE batch: polled one at a time these are TK_PARTS - 1
                                 # dependent round trips, since each tag has to be
                                 # compared before the next load can issue
