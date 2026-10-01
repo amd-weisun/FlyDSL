@@ -1138,7 +1138,10 @@ def test_dsv4_indexer_scoring_in_kernel(indexer_hadamard):
     ratio = COMPRESS_CSA
     cfg = _cfg(hc_mult=1)
     cfg.indexer_hadamard = indexer_hadamard  # ATOM's indexer rotates neither side
-    cfg.compress_ratio, cfg.max_seq = ratio, 256
+    # Up to index_topk live entries every one is kept and none is scored (the
+    # selection cannot depend on the scores), so a small index_topk puts the
+    # scorer to work from the third entry on.
+    cfg.compress_ratio, cfg.max_seq, cfg.index_topk = ratio, 256, 2
     ih, ihd, rd = cfg.index_heads, cfg.index_head_dim, cfg.rope_dim
     dev, mode = "cuda", MoeMode.W8A8
     W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
@@ -1189,8 +1192,7 @@ def test_dsv4_indexer_scoring_in_kernel(indexer_hadamard):
 
         n = (pos + 1) // ratio
         got = layer.debug("i_score", (1, cfg.n_compressed))[0]
-        if not n:
-            assert bool((got < 0).all()), f"pos={pos}: nothing compressed, nothing scorable"
+        if n <= cfg.index_topk:  # every live entry kept, nothing scored
             continue
         scored += 1
         ref = (torch.einsum("hd,td->ht", q, unpack_fp4(i_ref[:n])).relu() * w.view(ih, 1)).sum(0)
@@ -1221,7 +1223,8 @@ def _indexer_score_rank(rank, npes, port, results):
         torch.cuda.set_device(dev)
         ratio = COMPRESS_CSA
         cfg = _cfg(hc_mult=1)
-        cfg.compress_ratio, cfg.max_seq = ratio, 256
+        # a small index_topk so the scorer runs (up to it, every entry is kept unscored)
+        cfg.compress_ratio, cfg.max_seq, cfg.index_topk = ratio, 256, 2
         ih, ihd, rd = cfg.index_heads, cfg.index_head_dim, cfg.rope_dim
         mode = MoeMode.W8A8
         W = make_weights(rank, cfg=cfg, device=dev, seed=TP_SEED, moe_mode=mode)
@@ -1235,7 +1238,7 @@ def _indexer_score_rank(rank, npes, port, results):
         gen = torch.Generator(device=dev).manual_seed(TP_SEED + 99)  # identical everywhere
 
         ok, scored = True, 0
-        for pos in range(3 * ratio):
+        for pos in range(4 * ratio):  # entries 3 and 4 pass index_topk and are scored
             h = torch.randn(1, cfg.hidden, generator=gen, device=dev).to(torch.bfloat16)
             cur = torch.tensor([pos], dtype=torch.int32, device=dev)
             idx, dest = contiguous_pool([pos], cfg, dev)
@@ -1284,7 +1287,7 @@ def _indexer_score_rank(rank, npes, port, results):
                 )
                 ok = False
             n = (pos + 1) // ratio
-            if not n:
+            if n <= cfg.index_topk:  # every live entry kept, nothing scored
                 continue
             scored += 1
             kcache = unpack_fp4(_icache_rows(layer, 0, n))
@@ -1340,7 +1343,8 @@ def test_dsv4_indexer_scores_the_new_entry_past_the_first_tile():
     torch.manual_seed(0)
     ratio = COMPRESS_CSA
     cfg = _cfg(hc_mult=1)
-    cfg.compress_ratio, cfg.max_seq = ratio, 4096
+    # index_topk below the live count, or the entries would all be kept unscored
+    cfg.compress_ratio, cfg.max_seq, cfg.index_topk = ratio, 4096, 64
     ih, ihd = cfg.index_heads, cfg.index_head_dim
     assert cfg.n_compressed > SCORE_TILE + 4, "the shape must reach the second score tile"
     dev, mode = "cuda", MoeMode.W8A8
