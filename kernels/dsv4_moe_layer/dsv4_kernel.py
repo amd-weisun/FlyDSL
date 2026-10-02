@@ -173,6 +173,16 @@ def o_a_spt(S: int, o_groups: int, o_lora: int) -> int:
     return 2 if S % 2 == 0 and S * o_groups * o_lora // ROW_TILE > BLOCKS else 1
 
 
+def ffn_hcc(S: int, hc_mult: int) -> bool:
+    """Whether the FFN side contracts its hc_mult streams in a stage of its own (hcc_f,
+    publishing ``ain``) rather than in every router task. The router contracting them
+    itself saves a grid-wide handoff, which wins while a router task stages one
+    sample's hc_mult streams; once two samples share a task (router_spt) that staging
+    doubles and the handoff is the cheaper side. Measured, us/layer at 8K context:
+    S = 8 HCA 139.8 -> 127.2, CSA 151.7 -> 141.0; S = 4 +0.5..1.0, S = 2 +2."""
+    return hc_mult > 1 and router_spt(S) > 1
+
+
 def router_spt(S: int) -> int:
     """Samples per router task. One per task until S * N_ROUTER outgrows the grid
     (S = 8: 384 tasks, two rounds of ~13 us on the FFN's critical path); then two
@@ -260,6 +270,7 @@ def layout(
         # explicit mailbox rather than contracting at each consumer -- `a` alone is
         # read in six places and inline contraction would quadruple that traffic.
         ("xin", S * hidden * pr if hc_mult > 1 else pr),
+        ("ain", S * hidden * pr if ffn_hcc(S, hc_mult) else pr),  # ... and the FFN side's, see ffn_hcc
         ("q_a", S * q_lora * pr),
         ("kv_a", S * head_dim * pr),  # the single shared KV row, pre-norm
         # The compressor's own kv / gate, split out of the same fused qkv_a GEMV.
@@ -601,8 +612,8 @@ def stage_tasks(
         ("o_b", hidden // ROW_TILE),
         # ... and for the ffn side, once o_b has produced the new residual stream
         ("hcd_f", S * hc_tasks),
-        # none: the router contracts the FFN side's streams itself
-        ("hcc_f", 0),
+        # at small S none: the router contracts the FFN side's streams itself
+        ("hcc_f", (hidden // ROW_TILE) if ffn_hcc(S, hc_mult) else 0),
         ("router", S * N_ROUTER // router_spt(S)),
         # one tile per (routed slot, 8 intermediates); tasks below INTER / UG8 also
         # carry the shared expert.  GLM-5/V3 happened to make this exactly BLOCKS
@@ -2021,10 +2032,12 @@ def build_dsv4_kernel(
                     o1 = o1 + cjk * rj[j][1]
                 emit(s, k, row, o0, o1)
 
-        def hc_pre_stages(side, sd, fn_ptr, sb_ptr, src_word, out_name, contract=True):
+        def hc_pre_stages(side, sd, fn_ptr, sb_ptr, src_word, out_name, contract=True, src_pair=None):
             """hcd (the mixing projection's partials) and, with ``contract``, hcc (the
             streams contracted into one input). Returns the coefficient routine, for a
-            consumer that contracts the streams itself."""
+            consumer that contracts the streams itself. ``src_pair(s, k)`` -- the
+            source's (mailbox, pair) when it is one -- lets hcc poll a row's hc_mult
+            streams in one batch instead of one round trip each."""
             r_fn = _rsrc(fn_ptr)
             r_sb = _rsrc(sb_ptr)  # [3 scales | HC_MIX bases]
             for tt in range(start(f"hcd_{side}"), S * HC_TASKS, G):
@@ -2169,9 +2182,13 @@ def build_dsv4_kernel(
                     row = t * ROW_TILE + r
                     a0 = fx.Float32(0.0)
                     a1 = fx.Float32(0.0)
+                    if const_expr(src_pair is not None):
+                        ws = [v[0] for v in poll([src_pair(s_, j * HIDDEN + row) + (1,) for j in range(HC)])]
+                    else:
+                        ws = [src_word(s_, j * HIDDEN + row) for j in range(HC)]
                     for j in range_constexpr(HC):
                         pj = lds_ld(misc, HC_MISC + s_ * HC_COEF + j)
-                        x0, x1 = bf2_f32(src_word(s_, j * HIDDEN + row))
+                        x0, x1 = bf2_f32(ws[j])
                         a0 = a0 + pj * x0
                         a1 = a1 + pj * x1
                     put_bf(mb(out_name), s_ * HIDDEN + row, [a0, a1])
@@ -3538,11 +3555,23 @@ def build_dsv4_kernel(
                     lambda s, row, v0, v1: put_bf(mb("a"), s * HIDDEN + row, [v0, v1]),
                 )
             stamp("o_b", t, 4)
-        # The FFN side has no hcc stage: its only consumer, the router, contracts
-        # the streams itself (below), which takes a whole grid-wide handoff off the
-        # FFN's chain -- hcc publishing x and the router then polling it.
+        # At small S the FFN side has no hcc stage: its only consumer, the router,
+        # contracts the streams itself (below), which takes a whole grid-wide handoff
+        # off the FFN's chain -- hcc publishing x and the router then polling it.
+        # At large S the router's staging of every stream costs more (ffn_hcc).
         hc_coef_f = None
-        if const_expr(HC > 1):
+        FFN_HCC = ffn_hcc(S, HC)
+        if const_expr(FFN_HCC):  # ... except at large S: see ffn_hcc
+            hc_pre_stages(
+                "f",
+                1,
+                hc_ffn_fn,
+                hc_ffn_sb,
+                lambda s, k: get(mb("a"), (s * HC * HIDDEN + k) // 2),
+                "ain",
+                src_pair=lambda s, k: (mb("a"), (s * HC * HIDDEN + k) // 2),
+            )
+        elif const_expr(HC > 1):
             hc_coef_f = hc_pre_stages(
                 "f",
                 1,
@@ -3597,9 +3626,10 @@ def build_dsv4_kernel(
             def ld_a(sks):
                 # sks = (local sample s, k) pairs; local sample s is sample rs0 + s
                 n4 = len(sks)
-                if const_expr(HC == 1):
-                    specs = [(mb("a"), ((rs0 + s) * HIDDEN + k) // 2, 2) for s, k in sks]
-                    specs += [(mb("a"), ((rs0 + s) * HIDDEN + xk) // 2, 1) for s in range(SPT)]
+                if const_expr(HC == 1 or FFN_HCC):  # one stream: `a` itself, or hcc_f's `ain`
+                    x_src = "ain" if FFN_HCC else "a"
+                    specs = [(mb(x_src), ((rs0 + s) * HIDDEN + k) // 2, 2) for s, k in sks]
+                    specs += [(mb(x_src), ((rs0 + s) * HIDDEN + xk) // 2, 1) for s in range(SPT)]
                     v = poll(specs, batch=len(specs))
                     stamp("router", tt, 5, lead=THREADS - 64)
                     for s in range_constexpr(SPT):

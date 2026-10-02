@@ -157,13 +157,14 @@ def _compare_stages(got, ref, cfg, npes):
 
 @pytest.mark.parametrize("moe_mode", [MoeMode.A8W4, MoeMode.W8A8])
 @pytest.mark.parametrize("hc_mult", [1, 4])
-@pytest.mark.parametrize("S", [1, 2, 4])
+@pytest.mark.parametrize("S", [1, 2, 4, 8])
 def test_dsv4_layer_matches_golden(S, moe_mode, hc_mult):
     """hc_mult=1 is a plain residual; 4 is V4's hyper-connection stream.
 
     S > 1 is a batch of independent sequences at one shared position, so each
     sample carries its own cache slice. S=2 and 4 also put the ug stage on its
-    multi-sample path, where tiles are masked rather than skipped."""
+    multi-sample path, where tiles are masked rather than skipped. S=8 with
+    hc_mult=4 is the FFN side's own stream-contraction stage (ffn_hcc)."""
     from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
 
     torch.manual_seed(0)
