@@ -61,7 +61,9 @@ SUPPORTED_PEERS = (1, 2, 4, 8)
 # 128 total heads / 8 ranks; the split-attention kernel requires
 # `heads % WAVES == 0 and heads <= 16`.
 SUPPORTED_HEADS = (8, 16)
-MAX_LAYERS_PER_STEP = 128
+# Launches of one step, each needing its own epoch tag: 61 layers, and with MTP
+# (a verify step split into launches of at most 8 tokens) up to 4 per layer.
+MAX_LAYERS_PER_STEP = 256
 
 # Per-layer attention variants. Verified against DeepSeek-V4-Pro's own
 # config.json: `compress_ratios` is [128, 128] + [4, 128] * 29 + [4] + [0], so

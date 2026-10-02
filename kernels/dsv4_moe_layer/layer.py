@@ -61,10 +61,11 @@ def shape_dims(cfg) -> dict:
     )
 
 
-def _variant_key(cfg, samples, npes, moe_mode, timeline, poll_timeout_us):
+def _variant_key(cfg, samples, npes, moe_mode, timeline, poll_timeout_us, tokens_per_seq=1):
     """Everything the compiled kernel and the scratch layout depend on."""
     return (
         poll_timeout_us,
+        tokens_per_seq,
         tuple(sorted(shape_dims(cfg).items())),
         samples,
         cfg.heads,
@@ -119,11 +120,15 @@ class Dsv4Variant:
         moe_mode: MoeMode | str = MoeMode.A8W4,
         allow_unindexed_csa: bool = False,
         poll_timeout_us: int | None = None,
+        tokens_per_seq: int = 1,
     ):
         moe_mode = as_moe_mode(moe_mode)
         validate_shard(samples, cfg.heads, rank, npes, cfg.window, cfg.compress_ratio, allow_unindexed_csa)
+        if samples % tokens_per_seq:
+            raise ValueError(f"{samples} samples are not whole runs of {tokens_per_seq} tokens per sequence")
         self.poll_timeout_us = poll_timeout_us
-        self.key = _variant_key(cfg, samples, npes, moe_mode, timeline, poll_timeout_us)
+        self.tokens_per_seq = tokens_per_seq
+        self.key = _variant_key(cfg, samples, npes, moe_mode, timeline, poll_timeout_us, tokens_per_seq)
         dims = shape_dims(cfg)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.scr_layout, self.sym_layout = layout(samples, cfg.heads, npes, cfg.window, moe_mode, **dims)
@@ -149,6 +154,7 @@ class Dsv4Variant:
                 timeline=timeline,
                 moe_mode=moe_mode,
                 poll_timeout_us=poll_timeout_us,
+                tokens_per_seq=tokens_per_seq,
                 n_experts=cfg.n_experts,
                 top_k=cfg.top_k,
                 inter=cfg.inter,
@@ -213,10 +219,13 @@ class Dsv4MoeLayer:
         allow_unindexed_csa: bool = False,
         variant: "Dsv4Variant | None" = None,
         packed: dict | None = None,
+        tokens_per_seq: int = 1,
     ):
         """``packed``: another layer object's ``packed`` weights to share -- one set
         of weights serving several sample counts (one object, and one compiled
-        variant, per count)."""
+        variant, per count). ``tokens_per_seq`` > 1: an MTP verify step, samples in
+        runs of that many tokens of one sequence (see build_dsv4_kernel); taken
+        from ``variant`` when one is given."""
         cfg = W.cfg
         validate_shard(samples, cfg.heads, rank, npes, cfg.window, cfg.compress_ratio, allow_unindexed_csa)
         if cfg.hc_mult > 1 and cfg.hc_mult & (cfg.hc_mult - 1):
@@ -264,8 +273,11 @@ class Dsv4MoeLayer:
                 timeline=timeline,
                 moe_mode=self.moe_mode,
                 allow_unindexed_csa=allow_unindexed_csa,
+                tokens_per_seq=tokens_per_seq,
             )
-        elif variant.key != _variant_key(cfg, samples, npes, self.moe_mode, timeline, variant.poll_timeout_us):
+        elif variant.key != _variant_key(
+            cfg, samples, npes, self.moe_mode, timeline, variant.poll_timeout_us, variant.tokens_per_seq
+        ):
             raise ValueError(
                 "this layer's shape is not the one the variant was compiled for; a variant is shared "
                 "only by layers of the SAME attention variant (compress_ratio, n_keys, max_seq, ...)"
@@ -274,24 +286,27 @@ class Dsv4MoeLayer:
         self.scr_layout, self.sym_layout = variant.scr_layout, variant.sym_layout
         self.scratch, self.sym, self.peers = variant.scratch, variant.sym, variant.peers
         self.launch, self.stages = variant.launch, variant.stages
+        tok = self.tokens_per_seq = variant.tokens_per_seq
+        n_seq = samples // tok
+        c_ring = cfg.c_rows + tok - 1  # the kernel's C_RING: the window plus a step's drafts
         # the compressor carries a rolling window across decode steps, so its state
         # lives here rather than being rebuilt per call. The leading `samples` is
         # the batch axis: each sample is its own sequence, so it carries its own
         # rolling state -- which is also what keeps the S compressor tasks, one per
         # CTA with nothing ordering them, from racing on a shared one.
         if cfg.indexed:
-            ishape = (samples, cfg.c_rows, cfg.c_coff * cfg.index_head_dim)
+            ishape = (n_seq, c_ring, cfg.c_coff * cfg.index_head_dim)
             self.i_kv_state = torch.zeros(*ishape, dtype=torch.float32, device=dev)
             self.i_score_state = torch.full(ishape, float("-inf"), dtype=torch.float32, device=dev)
             # the indexer's key cache: ATOM's paged FP4 pool (codes, scales), each
             # sample its own run of blocks here (reference.fp4_pool_shapes)
-            dshape, sshape = fp4_pool_shapes(cfg, samples)
+            dshape, sshape = fp4_pool_shapes(cfg, n_seq)
             self.i_cache = torch.zeros(*dshape, dtype=torch.uint8, device=dev)
             self.i_cache_s = torch.zeros(*sshape, dtype=torch.uint8, device=dev)
         else:
             self.i_kv_state = self.i_score_state = self.i_cache = self.i_cache_s = torch.zeros(1, dtype=torch.float32, device=dev)
         if cfg.compress_ratio:
-            shape = (samples, cfg.c_rows, cfg.c_coff * cfg.head_dim)
+            shape = (n_seq, c_ring, cfg.c_coff * cfg.head_dim)
             self.kv_state = torch.zeros(*shape, dtype=torch.float32, device=dev)
             # -inf, not zero: with overlapping windows (CSA) the previous window's
             # rows are unwritten before the first emit and must drop out of the
@@ -304,7 +319,8 @@ class Dsv4MoeLayer:
         # slots per sequence and interleaves these fields inside one entry, which
         # is why both the slot and the stride cross the boundary rather than being
         # derived from the sample index here.
-        self.state_slots = torch.arange(samples, dtype=torch.int32, device=dev)
+        # (a sequence's tokens share its slot)
+        self.state_slots = torch.arange(samples, dtype=torch.int32, device=dev) // tok
         self.st_kv = self.kv_state[0].numel() if cfg.compress_ratio else 0
         self.st_i = self.i_kv_state[0].numel() if cfg.indexed else 0
         self.st_ic = self.i_cache[0].numel() if cfg.indexed else 0  # bytes per sample

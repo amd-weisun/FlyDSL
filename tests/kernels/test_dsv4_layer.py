@@ -1987,6 +1987,119 @@ def test_dsv4_batching_is_independent_sequences(ratio):
             assert rel < 1e-3, f"pos={pos} sample {s}: x_out rel {rel:.3e} when batched"
 
 
+def _mtp_pool(positions, seqs, cfg, k, dev):
+    """``(indices, dest_rows)`` for an MTP pool, one row per token: each sequence
+    owns ``window + k`` window-ring rows (ATOM's ``128 + K``, so a step's draft
+    rows never alias the window of its first token) and then its compressed
+    entries. ``positions[i]`` / ``seqs[i]``: token i's position and sequence."""
+    ring = cfg.window + k
+    tot = ring + cfg.n_compressed
+    rows, d0, d1 = [], [], []
+    for p, q in zip(positions, seqs):
+        base = q * tot
+        n = min(p + 1, cfg.window)
+        r = [base + pp % ring for pp in range(p + 1 - n, p + 1)] + [-1] * (cfg.window - n)
+        if cfg.compress_ratio:
+            nc = 0 if cfg.indexed else (p + 1) // cfg.compress_ratio
+            r += [base + ring + i for i in range(nc)] + [-1] * (cfg.n_index - nc)
+        rows.append(r + [-1] * (cfg.n_keys - len(r)))
+        d0.append(base + p % ring)
+        d1.append(base + ring)
+    idx = torch.tensor(rows, dtype=torch.int32, device=dev)
+    return idx, torch.tensor([d0, d1], dtype=torch.int32, device=dev), max(seqs) + 1, tot
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+@pytest.mark.parametrize("ratio", [COMPRESS_CSA, 16])
+def test_dsv4_mtp_verify_step_is_sequential_decode(ratio, rollback):
+    """An MTP verify launch -- each sequence's K + 1 tokens as consecutive samples --
+    equals decoding the accepted tokens one launch at a time.
+
+    Token j sees tokens 0..j-1 of its run through their mailboxes (window rows,
+    compressed entries, compressor inputs, indexer entries), all written in the
+    SAME launch, and the compressor state is a ring of C_ROWS + K rows. With
+    ``rollback`` each step accepts a random 1..K+1 of its tokens and the next step
+    starts at the first rejected position, as ATOM's does; the rejected drafts get
+    other inputs, so a draft leaking into a later step would change the answer.
+    Two sequences at staggered offsets keep runs apart; ratio 16 stands in for
+    HCA's 128 (the same code path, fewer steps), 4 is CSA with its indexer."""
+    from kernels.dsv4_moe_layer.layer import Dsv4MoeLayer
+
+    torch.manual_seed(0)
+    dev, mode, K = "cuda", MoeMode.W8A8, 3
+    TOK, NSEQ = K + 1, 2
+    cfg = _cfg(hc_mult=1)
+    cfg.compress_ratio, cfg.max_seq = ratio, 512
+    if ratio == COMPRESS_CSA:
+        cfg.index_topk = 4
+    cfg.validate()
+    W = make_weights(rank=0, cfg=cfg, device=dev, seed=3, moe_mode=mode)
+    cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
+    OFFSETS = (0, 3)
+    n_acc = 8 * ratio if ratio == COMPRESS_CSA else 3 * ratio + 2
+    if ratio == COMPRESS_CSA:
+        assert (n_acc - 1) // ratio > cfg.index_topk, "the top-k must discard"
+    h_cache = {}
+
+    def h_acc(r, pos):
+        """The accepted token's input at (sequence, position), fixed once drawn."""
+        if (r, pos) not in h_cache:
+            h_cache[(r, pos)] = (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16()
+        return h_cache[(r, pos)]
+
+    # reference: one launch per accepted position, both sequences per launch
+    ref = {}
+    lay = Dsv4MoeLayer(W, samples=NSEQ, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True)
+    kv = None
+    for k in range(n_acc):
+        ps = [OFFSETS[r] + k for r in range(NSEQ)]
+        idx, dest, nseq, tot = _mtp_pool(ps, list(range(NSEQ)), cfg, K, dev)
+        kv = kv if kv is not None else torch.zeros(nseq * tot, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+        h = torch.cat([h_acc(r, ps[r]) for r in range(NSEQ)])
+        out = lay.forward(h, torch.tensor(ps, dtype=torch.int32, device=dev), kv, dest, idx, cos, sin).clone()
+        torch.cuda.synchronize()
+        got = lay.intermediates()
+        for r in range(NSEQ):
+            ref[(r, ps[r])] = (out[r], {n: got[n][r].clone() for n in ("q_a", "kv", "q", "o", "o_lora", "a", "scores", "sel")})
+    lay.close()
+
+    # MTP: K + 1 tokens per sequence per launch
+    gen = torch.Generator().manual_seed(1)
+    lay = Dsv4MoeLayer(W, samples=NSEQ * TOK, rank=0, npes=1, moe_mode=mode, allow_unindexed_csa=True, tokens_per_seq=TOK)
+    kv = torch.zeros(NSEQ * tot, cfg.head_dim, dtype=torch.bfloat16, device=dev)
+    nxt = list(OFFSETS)
+    checked = 0
+    while min(nxt[r] - OFFSETS[r] for r in range(NSEQ)) < n_acc - TOK:
+        acc = [int(torch.randint(1, TOK + 1, (1,), generator=gen)) if rollback else TOK for _ in range(NSEQ)]
+        ps = [nxt[r] + j for r in range(NSEQ) for j in range(TOK)]
+        sq = [r for r in range(NSEQ) for _ in range(TOK)]
+        hs = []
+        for r in range(NSEQ):
+            for j in range(TOK):
+                ok = j < acc[r]
+                hs.append(h_acc(r, nxt[r] + j) if ok else (0.5 * torch.randn(1, cfg.hidden, device=dev)).bfloat16())
+        idx, dest, _, _ = _mtp_pool(ps, sq, cfg, K, dev)
+        out = lay.forward(torch.cat(hs), torch.tensor(ps, dtype=torch.int32, device=dev), kv, dest, idx, cos, sin).clone()
+        torch.cuda.synchronize()
+        got = lay.intermediates()
+        for r in range(NSEQ):
+            for j in range(acc[r]):
+                i, pos = r * TOK + j, nxt[r] + j
+                if (r, pos) not in ref:  # past the reference's history (the other sequence lagged)
+                    continue
+                r_out, r_st = ref[(r, pos)]
+                for name in ("q_a", "kv", "q", "o", "o_lora", "a", "scores"):
+                    d = (got[name][i].float() - r_st[name].float()).abs().max().item()
+                    assert d == 0.0, f"seq {r} pos {pos} (token {j}): stage {name} moved by {d:.3e} in the MTP launch"
+                assert got["sel"][i].tolist() == r_st["sel"].tolist(), f"seq {r} pos {pos}: routing differs"
+                rel = ((out[i].float() - r_out.float()).norm() / r_out.float().norm().clamp(min=1e-6)).item()
+                assert rel < 1e-3, f"seq {r} pos {pos}: x_out rel {rel:.3e}"
+                checked += 1
+            nxt[r] += acc[r]
+    lay.close()
+    assert checked >= n_acc, f"only {checked} tokens compared"
+
+
 @pytest.mark.parametrize("ratio", [COMPRESS_CSA, COMPRESS_HCA])
 def test_dsv4_paged_blocks_are_pure_addressing(ratio):
     """Compressed entries paged the way ATOM keeps them must change NOTHING but where

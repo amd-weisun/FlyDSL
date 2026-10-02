@@ -632,6 +632,7 @@ def build_dsv4_kernel(
     timeline: bool = False,
     moe_mode: MoeMode | str = MoeMode.A8W4,
     poll_timeout_us: int | None = None,
+    tokens_per_seq: int = 1,
     hidden: int = HIDDEN,
     q_lora: int = Q_LORA,
     head_dim: int = HEAD_DIM,
@@ -667,6 +668,14 @@ def build_dsv4_kernel(
     every task, and once its inputs have arrived, into the ``timeline`` buffer:
     int64 ``[sum(task counts), TL_COLS]`` (start, hint seen, inputs staged, compute
     done, end, then free debug marks) in ``stage_tasks`` order.
+
+    ``tokens_per_seq`` > 1 is a speculative (MTP) verify step: samples come in
+    runs of that many consecutive tokens of ONE sequence at consecutive positions,
+    sharing its state slot and caches. A token sees the earlier tokens of its run
+    -- their KV rows, compressed entries and compressor inputs, all written this
+    launch -- through their mailboxes, and the rolling compressor state is a ring
+    of ``C_ROWS + tokens_per_seq - 1`` rows (ATOM's 8 + K / 128 + K), so a step's
+    draft rows never alias the window a later step reads after a rejection.
 
     ``hang`` is one int32: with ``poll_timeout_us`` set, a poll that waits longer
     stores the launch's tag there and the launch winds down (see ``poll``); left
@@ -785,12 +794,19 @@ def build_dsv4_kernel(
     # ATOM's compressor keeps it: the window pooled at position p is rows
     # (p + 1 + i) % C_ROWS for i in [0, C_ROWS), oldest first. No row ever moves.
     C_ROWS = C_COFF * CR
+    TOK = tokens_per_seq
+    assert S % TOK == 0, "a launch holds whole runs of a sequence's tokens"
+    assert TOK == 1 or not CR or TOK <= C_ROWS, "the in-launch tail of the window is at most its length"
+    # the ring the state is stored in: C_ROWS plus the K draft positions of a step
+    C_RING = C_ROWS + TOK - 1
     OVERLAP = C_COFF > 1
     # Rows of state the pooling loop folds per trip. Its online softmax carries
     # (max, den, num) serially, but the LOADS do not depend on the carry, so
     # issuing a trip's worth together is what keeps the loop off memory latency:
     # one row at a time, HCA's 128 rows cost 270 ns each and 37% of the layer.
     CMP_CHUNK = max(c for c in range(1, 9) if C_ROWS % c == 0) if C_ROWS else 1
+    # with TOK > 1 the ring part of the window is its first C_ROWS - TOK rows
+    CMP_CHUNK_T = max(c for c in range(1, 9) if (C_ROWS - TOK) % c == 0) if (C_ROWS and TOK > 1) else 1
     # the window and the compressed entries share one cache, the compressed half
     # starting at `window`, so the attention gathers both from one index list
     CACHE_ROWS = window if window_rows is None else window_rows
@@ -2357,6 +2373,59 @@ def build_dsv4_kernel(
         # positions. The pooled row then gets the same norm / RoPE / FP8 round trip
         # the window KV does, rotated at the window's FIRST position, and lands in
         # the compressed half of the same cache.
+        def window_pool(p, j_tok, ring, launch, own):
+            """Online softmax over the C_ROWS-row compressor window ending at p, oldest
+            first; returns (den, num).
+
+            ``ring(i)`` loads window element i (position p + 1 - C_ROWS + i) from the
+            state ring; ``own(i)`` is element i from this token's own values (d = 0,
+            the newest position); ``launch(d, i)`` element i from the token d positions
+            back, which with TOK > 1 may be in this launch (d <= j_tok, the token's
+            index in its run) -- its state write is not reliably visible here yet, so
+            it comes from that token's mailbox.  A runtime loop over chunks keeps the
+            window out of registers and a chunk of loads in flight (see CMP_CHUNK)."""
+
+            def fold(acc, svs, kvs):
+                m, den, num = acc
+                for e in range_constexpr(len(svs)):
+                    m_new = fx.max(m, svs[e])
+                    rescale = _exp(m - m_new)
+                    w = _exp(svs[e] - m_new)
+                    den = den * rescale + w
+                    num = num * rescale + w * kvs[e]
+                    m = m_new
+                return [m, den, num]
+
+            n_ring = C_ROWS if const_expr(TOK == 1) else C_ROWS - TOK
+            chunk = CMP_CHUNK if const_expr(TOK == 1) else CMP_CHUNK_T
+            for _i, acc in range(
+                0, n_ring // chunk, fx.Int32(1), init=[fx.Float32(NEG), fx.Float32(0.0), fx.Float32(0.0)]
+            ):
+                ib = fx.Int32(_i) * chunk
+                lds_ = [ring(ib + e) for e in range(chunk)]
+                res = yield fold([fx.Float32(acc[0]), fx.Float32(acc[1]), fx.Float32(acc[2])], [a for a, _ in lds_], [b for _, b in lds_])
+            acc = [fx.Float32(res[0]), fx.Float32(res[1]), fx.Float32(res[2])]
+            if const_expr(TOK > 1):
+                svs, kvs = [], []
+                for i in range_constexpr(C_ROWS - TOK, C_ROWS):
+                    d = C_ROWS - 1 - i
+                    if const_expr(d == 0):
+                        sv, kv = own(i)
+                    else:
+                        r_sv, r_kv = ring(fx.Int32(i))
+                        l_sv, l_kv = launch(d, i)
+                        inl = fx.Int32(d) <= j_tok
+                        sv, kv = inl.select(l_sv, r_sv), inl.select(l_kv, r_kv)
+                    svs.append(sv)
+                    kvs.append(kv)
+                acc = fold(acc, svs, kvs)
+            return acc[1], acc[2]
+
+        def ring_row(p, i):
+            """State-ring row of window element i (position p + 1 - C_ROWS + i, which
+            is negative early in a sequence -- those rows still hold the initial state)."""
+            return (p + 1 + i + (C_RING - C_ROWS)) % C_RING
+
         if const_expr(CR):
             for tt in range(start("cmp"), S, G):
                 tt = fx.Int32(tt)
@@ -2386,45 +2455,37 @@ def build_dsv4_kernel(
                 stamp("cmp", tt, 2)
                 if live:
                     for j in range_constexpr(C_COFF):
-                        w = sb + (p % C_ROWS) * CW + j * HEAD_DIM + ch
+                        w = sb + (p % C_RING) * CW + j * HEAD_DIM + ch
                         bo.buffer_store(kvv[j], rs_kv, w)
                         bo.buffer_store(gtv[j] + ap0[j], rs_sc, w)
                 if (p + 1) % CR == 0:  # uniform across the CTA
-                    # Online softmax over the window, one channel per thread, so the
-                    # CR positions are a loop rather than CR unrolled copies -- a
-                    # CMP_CHUNK of them per trip, all their loads issued before any
-                    # is consumed. Keeping the loop runtime is what stops the whole
-                    # window being hoisted into registers; keeping a chunk of loads
-                    # in flight is what stops each row costing a round trip.
-                    for _i, acc in range(
-                        0,
-                        C_ROWS // CMP_CHUNK,
-                        fx.Int32(1),
-                        init=[fx.Float32(NEG), fx.Float32(0.0), fx.Float32(0.0)],
-                    ):
-                        ib = fx.Int32(_i) * CMP_CHUNK
-                        svs, kvs = [], []
-                        for e in range_constexpr(CMP_CHUNK):
-                            # an overlapped entry takes the previous window's rows
-                            # from their FIRST half and the current window's from
-                            # their SECOND
-                            i = ib + e
-                            coff = (i >= CR).select(fx.Int32(HEAD_DIM), fx.Int32(0)) if OVERLAP else 0
-                            wi = sb + ((p + 1 + i) % C_ROWS) * CW + coff + ch
-                            svs.append(ld_f32(rs_sc, wi))
-                            kvs.append(ld_f32(rs_kv, wi))
-                        m = fx.Float32(acc[0])
-                        den = fx.Float32(acc[1])
-                        num = fx.Float32(acc[2])
-                        for e in range_constexpr(CMP_CHUNK):
-                            m_new = fx.max(m, svs[e])
-                            rescale = _exp(m - m_new)
-                            w = _exp(svs[e] - m_new)
-                            den = den * rescale + w
-                            num = num * rescale + w * kvs[e]
-                            m = m_new
-                        res = yield [m, den, num]
-                    pooled = fx.Float32(res[2]) * _rcp(fx.Float32(res[1]))
+                    j_tok = tt % TOK
+
+                    # an overlapped entry takes the previous window's rows from their
+                    # FIRST half and the current window's from their SECOND
+                    def c_half(i):
+                        return (i >= CR).select(fx.Int32(1), fx.Int32(0)) if OVERLAP else 0
+
+                    def c_ring(i):
+                        wi = sb + ring_row(p, i) * CW + c_half(i) * HEAD_DIM + ch
+                        return ld_f32(rs_sc, wi), ld_f32(rs_kv, wi)
+
+                    def c_own(i):
+                        h = 1 if (OVERLAP and i >= CR) else 0
+                        return gtv[h] + ap0[h], kvv[h]
+
+                    def c_launch(d, i):
+                        h = 1 if (OVERLAP and i >= CR) else 0
+                        sm = tt - fx.min(fx.Int32(d), j_tok)  # clamped onto this token when not in the run
+                        q = fx.max(p - d, fx.Int32(0))
+                        apq = ld_f32(_rsrc(ape), (q % CR) * CW + h * HEAD_DIM + ch)
+                        return (
+                            getf(mb("c_gate"), (sm * C_COFF + h) * HEAD_DIM + ch) + apq,
+                            getf(mb("c_kv"), (sm * C_COFF + h) * HEAD_DIM + ch),
+                        )
+
+                    den_, num_ = window_pool(p, j_tok, c_ring, c_launch, c_own)
+                    pooled = num_ * _rcp(den_)
                     pooled = bf16_round(pooled)
                     ssq = block_sum(live.select(pooled * pooled, fx.Float32(0.0)))
                     # the model this reproduces returns bf16 from the norm, so the
@@ -2506,40 +2567,36 @@ def build_dsv4_kernel(
                 if ilive:
                     for e in range_constexpr(2):
                         for j in range_constexpr(C_COFF):
-                            w = isb + (p % C_ROWS) * IW + j * IHD + chs[e]
+                            w = isb + (p % C_RING) * IW + j * IHD + chs[e]
                             bo.buffer_store(kvv[e][j], rs_ikv, w)
                             bo.buffer_store(gtv[e][j] + ap0[e][j], rs_isc, w)
                 if (p + 1) % CR == 0:  # uniform across the CTA
+                    j_tok = tt % TOK
                     pooled = []
                     for e in range_constexpr(2):
-                        # a chunk of rows per trip, loads first -- see the KV
-                        # compressor's loop, which this one mirrors
-                        for _i, acc in range(
-                            0,
-                            C_ROWS // CMP_CHUNK,
-                            fx.Int32(1),
-                            init=[fx.Float32(NEG), fx.Float32(0.0), fx.Float32(0.0)],
-                        ):
-                            ib = fx.Int32(_i) * CMP_CHUNK
-                            svs, kvs = [], []
-                            for z in range_constexpr(CMP_CHUNK):
-                                i = ib + z
-                                coff = (i >= CR).select(fx.Int32(IHD), fx.Int32(0)) if OVERLAP else 0
-                                wi = isb + ((p + 1 + i) % C_ROWS) * IW + coff + chs[e]
-                                svs.append(ld_f32(rs_isc, wi))
-                                kvs.append(ld_f32(rs_ikv, wi))
-                            m = fx.Float32(acc[0])
-                            den = fx.Float32(acc[1])
-                            num = fx.Float32(acc[2])
-                            for z in range_constexpr(CMP_CHUNK):
-                                m_new = fx.max(m, svs[z])
-                                rescale = _exp(m - m_new)
-                                w = _exp(svs[z] - m_new)
-                                den = den * rescale + w
-                                num = num * rescale + w * kvs[z]
-                                m = m_new
-                            res = yield [m, den, num]
-                        pooled.append(bf16_round(fx.Float32(res[2]) * _rcp(fx.Float32(res[1]))))
+                        # the KV compressor's window, on the indexer's state and width
+
+                        def i_ring(i, e=e):
+                            coff = (i >= CR).select(fx.Int32(IHD), fx.Int32(0)) if OVERLAP else 0
+                            wi = isb + ring_row(p, i) * IW + coff + chs[e]
+                            return ld_f32(rs_isc, wi), ld_f32(rs_ikv, wi)
+
+                        def i_own(i, e=e):
+                            h = 1 if (OVERLAP and i >= CR) else 0
+                            return gtv[e][h] + ap0[e][h], kvv[e][h]
+
+                        def i_launch(d, i, e=e):
+                            h = 1 if (OVERLAP and i >= CR) else 0
+                            sm = tt - fx.min(fx.Int32(d), j_tok)
+                            q = fx.max(p - d, fx.Int32(0))
+                            apq = ld_f32(_rsrc(i_ape), (q % CR) * IW + h * IHD + chs[e])
+                            return (
+                                getf(mb("i_gate"), (sm * C_COFF + h) * IHD + chs[e]) + apq,
+                                getf(mb("i_kv"), (sm * C_COFF + h) * IHD + chs[e]),
+                            )
+
+                        den_, num_ = window_pool(p, j_tok, i_ring, i_launch, i_own)
+                        pooled.append(bf16_round(num_ * _rcp(den_)))
                     # RMS over the whole IHD row: both halves, one wave
                     sq = pooled[0] * pooled[0] + pooled[1] * pooled[1]
                     for off in range_constexpr(6):
@@ -2809,8 +2866,7 @@ def build_dsv4_kernel(
                     r_ic2 = _rsrc(i_cache)
                     r_ics = _rsrc(i_cache_s)
                     icb = ld_slot(s, st_ic)  # bytes; the scale pool's base is 1/16 of it
-                    ne = sp // CR  # the entry this launch wrote, if (sp + 1) % CR == 0
-                    has_new = ((sp + 1) % CR == 0) & (blk == ne // SCORE_TILE)
+                    j_tok = s % TOK
                     # Scores on MFMA: a wave takes 64 entries, 4 groups of 16 as the A rows
                     # (K = IHD, one 32-wide block per MFMA), the IH heads as the B columns.
                     # A lane's 8 key codes of a block are one dword of ATOM's FP4 pool (the
@@ -2846,19 +2902,25 @@ def build_dsv4_kernel(
                             if hn == i:
                                 lds_st(red, wave * 64 + g * 16 + 4 * (lane // 16) + i, v)
                     gpu.barrier()
-                    # the entry this launch just wrote is not reliably visible in the cache
+                    # an entry this launch just wrote is not reliably visible in the cache
                     # yet: its owning wave rescores it from the mailbox copy, lane j taking
-                    # dims j and j + 64
-                    if has_new & (wave == (ne - blk * SCORE_TILE) // 64):
-                        nv = getf_many([(mb("i_cnew"), s * IHD + lane + 64 * hf) for hf in range(IHD // 64)])
-                        sc_n = fx.Float32(0.0)
-                        for hh in range_constexpr(IH):
-                            part = fx.Float32(0.0)
-                            for hf in range_constexpr(IHD // 64):
-                                part = part + nv[hf] * lds_ld(xs, hh * IHD + lane + 64 * hf)
-                            sc_n = sc_n + fx.max(wave_sum(part), fx.Float32(0.0)) * wv[hh]
-                        if lane == 0:
-                            lds_st(red, ne - blk * SCORE_TILE, sc_n)
+                    # dims j and j + 64. With TOK > 1 that is each boundary of the run of
+                    # tokens up to s (token s - d wrote entry (sp - d) // CR).
+                    for d in range_constexpr(TOK):
+                        sd = s - fx.min(fx.Int32(d), j_tok)
+                        pd = sp - d
+                        ne = fx.max(pd, fx.Int32(0)) // CR
+                        has_new = (fx.Int32(d) <= j_tok) & ((pd + 1) % CR == 0) & (blk == ne // SCORE_TILE)
+                        if has_new & (wave == (ne - blk * SCORE_TILE) // 64):
+                            nv = getf_many([(mb("i_cnew"), sd * IHD + lane + 64 * hf) for hf in range(IHD // 64)])
+                            sc_n = fx.Float32(0.0)
+                            for hh in range_constexpr(IH):
+                                part = fx.Float32(0.0)
+                                for hf in range_constexpr(IHD // 64):
+                                    part = part + nv[hf] * lds_ld(xs, hh * IHD + lane + 64 * hf)
+                                sc_n = sc_n + fx.max(wave_sum(part), fx.Float32(0.0)) * wv[hh]
+                            if lane == 0:
+                                lds_st(red, ne - blk * SCORE_TILE, sc_n)
                     gpu.barrier()
                     sc_t = lds_ld(red, tid)
                     live = (c < n_live) & (c < N_COMP)
@@ -3208,27 +3270,35 @@ def build_dsv4_kernel(
             cannot rely on seeing our own global store. That covers the window row
             (kvnew) and, on a compression boundary, the compressed row (cnew).
 
-            Only sample ``s``'s own rows: the samples are separate sequences, so
-            another sample's new row is not in this one's cache and must not be
-            patched into its tile. ``kr`` is wave-uniform, so the polls below are
-            reached by a whole wave or none of it."""
+            Only the rows of sample ``s``'s own sequence: the samples are separate
+            sequences, so another one's new row is not in this one's cache and must
+            not be patched into its tile. With TOK > 1 that sequence is the run of
+            tokens up to ``s``: token s - d (d <= j_tok) wrote its window row and, on
+            its boundary, a compressed row this launch too, and later tokens' key
+            lists hold both. ``kr`` is wave-uniform, so the polls below are reached
+            by a whole wave or none of it."""
             sp = ld_pos(s)
-            w_row = ld_dest(0, s)
-            c_row = comp_row(s, sp // CR) if const_expr(CR) else fx.Int32(0)
-            for jj in range_constexpr(KPW):
-                j = wave * KPW + jj
-                kr = lds_ld(keys, j)
-                if kr == w_row:
-                    kvp = get2_many([(mb("kvnew"), s * HEAD_DIM + lane * EPL + m * 2) for m in range(WPL)])
-                    w = [bf16_pair(a0, a1) for a0, a1 in kvp]
-                    fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * WPL))
-                if const_expr(CR):
-                    # only a boundary step writes one, and then it is the newest
-                    # compressed slot
-                    if ((sp + 1) % CR == 0) & (kr == c_row):
-                        cvp = get2_many([(mb("cnew"), s * HEAD_DIM + lane * EPL + m * 2) for m in range(WPL)])
-                        w = [bf16_pair(a0, a1) for a0, a1 in cvp]
+            j_tok = s % TOK
+            for d in range_constexpr(TOK):
+                sd = s - fx.min(fx.Int32(d), j_tok)  # clamped onto s; masked by `inl`
+                inl = fx.Int32(d) <= j_tok
+                pd = sp - d
+                w_row = ld_dest(0, sd)
+                c_row = comp_row(sd, fx.max(pd, fx.Int32(0)) // CR) if const_expr(CR) else fx.Int32(0)
+                for jj in range_constexpr(KPW):
+                    j = wave * KPW + jj
+                    kr = lds_ld(keys, j)
+                    if inl & (kr == w_row):
+                        kvp = get2_many([(mb("kvnew"), sd * HEAD_DIM + lane * EPL + m * 2) for m in range(WPL)])
+                        w = [bf16_pair(a0, a1) for a0, a1 in kvp]
                         fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * WPL))
+                    if const_expr(CR):
+                        # only a boundary step writes one, and then it is that
+                        # token's newest compressed slot
+                        if inl & ((pd + 1) % CR == 0) & (kr == c_row):
+                            cvp = get2_many([(mb("cnew"), sd * HEAD_DIM + lane * EPL + m * 2) for m in range(WPL)])
+                            w = [bf16_pair(a0, a1) for a0, a1 in cvp]
+                            fx.ptr_store(fx.Vector.from_elements(w, fx.Float32), ktile + (j * KS + lane * WPL))
 
         def live_splits(s):
             """Splits of sample ``s`` that can hold a live key: the window's, then
@@ -4392,7 +4462,7 @@ def build_advance_step(scr_pairs: int, sym_pairs: int):
     """The ``@flyc.jit`` step advance for one scratch: ``step += 1`` plus a scrub.
 
     Tags are ``step * LAYER_SLOTS + layer + 1`` in int32, so they come round again
-    after 2**32 / LAYER_SLOTS steps (~46 h at 5 ms a step), and a mailbox left
+    after 2**32 / LAYER_SLOTS steps (~23 h at 5 ms a step), and a mailbox left
     unwritten that long would then read as fresh -- many are written only when
     their data calls for it (``cnew`` on compression steps, the indexer's live
     tiles, the picked experts' ``mid``). So each advance also zeroes the stale
