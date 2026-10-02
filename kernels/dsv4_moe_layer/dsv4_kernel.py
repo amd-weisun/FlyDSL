@@ -4053,7 +4053,10 @@ def build_dsv4_kernel(
         DN_SLOTS = TOP_K if SHARED_FP8 else MOE_SLOTS
         DN_NU = S * DN_SLOTS * DN_UNITS_PER_SLOT
         DN_UPW = (DN_NU + DN_WPR - 1) // DN_WPR
-        DN_SH_NU = S * DN_UNITS_PER_SLOT if SHARED_FP8 else 0
+        # the shared expert's units: one per K chunk, every sample in its own B column
+        # (its mid is slot 0 of each sample) -- not one per (sample, chunk), which
+        # loaded the same weights S times
+        DN_SH_NU = DN_UNITS_PER_SLOT if SHARED_FP8 else 0
         DN_SH_UPW = (DN_SH_NU + DN_WPR - 1) // DN_WPR
         DN_CPW = DN_UPW + DN_SH_UPW
         DN_BLK = S * MOE_SLOTS * INTER // 128
@@ -4091,9 +4094,10 @@ def build_dsv4_kernel(
             def u_dn_sh(cc):  # cc: this wave's cc-th unit of the FP8 shared expert
                 qs = (wave % DN_WPR) * DN_SH_UPW + cc
                 live = qs < DN_SH_NU
-                r = fx.min(qs, DN_SH_NU - 1)
-                s_q, kc = r // DN_UNITS_PER_SLOT, r % DN_UNITS_PER_SLOT
-                q = s_q * MOE_SLOTS * DN_UNITS_PER_SLOT + kc  # slot 0's mid
+                kc = fx.min(qs, DN_SH_NU - 1)
+                # this lane's B column is sample n_sel(), whose slot-0 mid it reads; the
+                # route weight is 1 and any MXFP8 scale is folded into the staged mid
+                q = n_sel() * MOE_SLOTS * DN_UNITS_PER_SLOT + kc
                 masked = DN_SH_NU % DN_WPR != 0
                 wb = bo.create_buffer_resource_from_addr(
                     w_sdn, num_records_bytes=live.select(fx.Int32(HIDDEN * INTER), fx.Int32(0)) if masked else None
@@ -4102,7 +4106,7 @@ def build_dsv4_kernel(
                     s_sdn, num_records_bytes=live.select(fx.Int32(SDN_S_BYTES), fx.Int32(0)) if masked else None
                 )
                 rg = dn_rg + gu
-                return unit_fp8mx(wb, sb, rg, rg, kc, INTER, q * 64, dn_coefficients(q, s_q, fx.Int32(0)), dn_ln)
+                return unit_fp8mx(wb, sb, rg, rg, kc, INTER, q * 64, None, dn_ln)
 
             def u_dn(cc):  # cc: 128-k chunk of this wave
                 if const_expr(cc >= DN_UPW):
