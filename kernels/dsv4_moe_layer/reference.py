@@ -347,14 +347,14 @@ def make_weights(
         # hyper-connection mixers, fp32 in the checkpoint. Replicated: every rank
         # must derive the same pre/post/comb or the residual streams diverge.
         for side in ("attn", "ffn"):
-            # stored bf16 and row-padded: the kernel consumes this as a packed
-            # MFMA operand, and halving the bytes matters because K is hc*hidden
+            # kept fp32 and row-padded, as the checkpoint has it: the kernel takes it as
+            # a bf16 hi / lo pair (packing.pack_hc_fn), which is ~16 mantissa bits
             fn = torch.zeros(cfg.hc_rows, cfg.hc_mult * cfg.hidden, device=device)
             fn[: cfg.hc_mix] = (
                 torch.randn(cfg.hc_mix, cfg.hc_mult * cfg.hidden, generator=rep, device=device)
                 / (cfg.hc_mult * cfg.hidden) ** 0.5
             )
-            t[f"hc_{side}_fn"] = fn.to(bfl)
+            t[f"hc_{side}_fn"] = fn
             t[f"hc_{side}_base"] = torch.randn(cfg.hc_mix, generator=rep, device=device) * 0.5
             t[f"hc_{side}_scale"] = torch.rand(3, generator=rep, device=device) + 0.5
 

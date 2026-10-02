@@ -14,8 +14,8 @@ are converted, and each conversion loses information the checkpoint has:
 
 - the compressors' ``wkv`` / ``wgate`` are BF16 in the checkpoint, and are requantized
   to FP8 128x128 blocks here because the kernel fuses them into the ``qkv_a`` GEMV;
-- the hyper-connection mixers (``hc_*_fn``) are FP32, and are stored as bf16 because
-  the kernel consumes them as a packed MFMA operand.
+The hyper-connection mixers (``hc_*_fn``) stay FP32; packing splits them into a bf16
+hi / lo pair, as ATOM's aiter mHC does, so they keep ~16 mantissa bits.
 
 The shared expert stays FP8 128x128, beside the routed experts' MXFP4 bank.
 """
@@ -175,7 +175,7 @@ def load_layer(
         for side in ("attn", "ffn"):
             fn = torch.zeros(cfg.hc_rows, cfg.hc_mult * cfg.hidden, dtype=torch.float32, device=device)
             fn[: cfg.hc_mix] = ck.get(p + f"hc_{side}_fn").float().to(device)
-            t[f"hc_{side}_fn"] = fn.to(torch.bfloat16)
+            t[f"hc_{side}_fn"] = fn  # fp32: packing splits it into bf16 hi / lo
             t[f"hc_{side}_base"] = ck.get(p + f"hc_{side}_base").float().to(device)
             t[f"hc_{side}_scale"] = ck.get(p + f"hc_{side}_scale").float().to(device)
 

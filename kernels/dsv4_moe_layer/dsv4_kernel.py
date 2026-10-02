@@ -2071,11 +2071,17 @@ def build_dsv4_kernel(
                 stamp(f"hcd_{side}", tt, 2)
                 gpu.barrier()
 
-                def u_hc(c, t=t):
-                    kc = (wave % HC_WPR) * (HC_NKC // HC_WPR) + c
-                    return unit_bf16(r_fn, wave // HC_WPR, t * HC_NKC + kc, HC_NKC_FULL, kc * 32)
+                # the mixer is an fp32 matrix packed as a bf16 hi / lo pair (packing.
+                # pack_hc_fn), lo HC_RG row groups past hi: unit c < n is a hi chunk,
+                # c >= n the same chunk's lo, both into the same tile
+                HC_UPW = HC_NKC // HC_WPR
 
-                acc = run_units(u_hc, HC_NKC // HC_WPR, HC_NKC // HC_WPR)
+                def u_hc(c, t=t):
+                    lo = 1 if c >= HC_UPW else 0
+                    kc = (wave % HC_WPR) * HC_UPW + c % HC_UPW
+                    return unit_bf16(r_fn, wave // HC_WPR + lo * HC_RG, t * HC_NKC + kc, HC_NKC_FULL, kc * 32)
+
+                acc = run_units(u_hc, 2 * HC_UPW, 2 * HC_UPW)
                 reduce_rows(HC_RG, acc, emit_out(HC_ROWS))
                 stamp(f"hcd_{side}", tt, 3)
                 gpu.barrier()

@@ -24,7 +24,8 @@ OPTIONAL_ATTENTION_NAMES = ("w_i_q_b",)
 EXPERT_NAMES = ("w_ug", "w_dn")
 # an MXFP4 bank's shared expert, kept FP8 beside it
 SHARED_EXPERT_NAMES = ("w_sug", "w_sdn")
-# hyper-connection mixers: bf16, K = hc_mult * hidden, rows already padded
+# hyper-connection mixers: fp32 (packed as a bf16 hi / lo pair), K = hc_mult * hidden,
+# rows already padded
 HC_NAMES = ("hc_attn_fn", "hc_ffn_fn")
 
 
@@ -45,5 +46,16 @@ def pack_layer_weights(
     packed["w_r"] = pack_bf16(tensors["w_r"])
     for name in HC_NAMES:
         if name in tensors:
-            packed[name] = pack_bf16(tensors[name])
+            packed[name] = pack_hc_fn(tensors[name])
     return packed
+
+
+def pack_hc_fn(fn: torch.Tensor) -> torch.Tensor:
+    """An fp32 hyper-connection mixer [rows, K] as a bf16 hi / lo pair, packed as one
+    [2 * rows, K] bf16 operand: hi = bf16(fn), lo = bf16(fn - hi), so hi + lo carries
+    ~16 mantissa bits (ATOM's aiter mHC packs the same pair). The kernel's hcd stage
+    reads lo at row group rg + rows / 16 and accumulates both into one tile."""
+    fn = fn.float()
+    hi = fn.to(torch.bfloat16)
+    lo = (fn - hi.float()).to(torch.bfloat16)
+    return pack_bf16(torch.cat([hi, lo]))
