@@ -148,6 +148,13 @@ def qkv_a_groups(n_tiles: int) -> int:
     return 2 if n_tiles > BLOCKS and n_tiles % 2 == 0 else 1
 
 
+def q_b_groups(n_tiles: int) -> int:
+    """16-row groups per q_b task, by qkv_a_groups' rule: every task stages each
+    sample's normalized q_a, and H * HEAD_DIM / Q_B_TILE = 512 tiles took two rounds
+    of 256 CTAs, staging it all twice per CTA (S times the work at batch S)."""
+    return qkv_a_groups(n_tiles)
+
+
 def router_spt(S: int) -> int:
     """Samples per router task. One per task until S * N_ROUTER outgrows the grid
     (S = 8: 384 tasks, two rounds of ~13 us on the FFN's critical path); then two
@@ -560,7 +567,7 @@ def stage_tasks(
         ("cmp", S if compress_ratio else 0),
         # the indexer's compressed entry, for the scoring that selects keys
         ("i_cmp", S if index_head_dim else 0),
-        ("q_b", heads * head_dim // Q_B_TILE),
+        ("q_b", heads * head_dim // Q_B_TILE // q_b_groups(heads * head_dim // Q_B_TILE)),
         ("q_norm", S * heads),
         # the indexer's query, and its rope / rotation / FP4 tail
         ("i_q_b", index_heads * index_head_dim // Q_B_TILE if index_head_dim else 0),
@@ -2544,15 +2551,21 @@ def build_dsv4_kernel(
         # ==================================== 3. q_a RMSNorm -> q_b (raw f32 query)
         r_wqb, r_sqb = _rsrc(w_q_b), _rsrc(s_q_b)
         QB_NKC = Q_LORA // 64
-        for t in range(start("q_b"), N_QB, G):
+        QB_R = q_b_groups(N_QB)  # row groups per task; WAVES // QB_R waves split K for each
+        QB_WPR = WAVES // QB_R
+        QB_UPW = QB_NKC // QB_WPR  # K chunks per wave
+        QB_BATCH = QB_NKC // WAVES
+        QB_ROWS = Q_B_TILE * QB_R
+        for t in range(start("q_b"), N_QB // QB_R, G):
             t = fx.Int32(t)
             stamp("q_b", t, 0)
+            qb_rg = t * QB_R + wave // QB_WPR
 
             def u_qb(c):
-                kc = wave * (QB_NKC // WAVES) + c
-                return unit_fp8(r_wqb, r_sqb, t, kc, QB_NKC, Q_LORA, 128, (n_sel() * Q_LORA + kc * 64) // 2)
+                kc = (wave % QB_WPR) * QB_UPW + c
+                return unit_fp8(r_wqb, r_sqb, qb_rg, kc, QB_NKC, Q_LORA, 128, (n_sel() * Q_LORA + kc * 64) // 2)
 
-            pre = [u_qb(c) for c in range(QB_NKC // WAVES)]
+            pre = [u_qb(c) for c in range(QB_BATCH)]
             hint_wait(
                 Q_LORA // QKV_A_TILE,
                 lambda k: (mb("q_a"), (S - 1) * Q_LORA + k * QKV_A_TILE + QKV_A_TILE - 1),
@@ -2566,18 +2579,16 @@ def build_dsv4_kernel(
             stage_x_rmsnorm(ld_qa, Q_LORA, g_q)
             stamp("q_b", t, 2)
             gpu.barrier()
-            acc = run_units(u_qb, QB_NKC // WAVES, QB_NKC // WAVES, pre)
-            reduce_rows(1, acc, emit_out(Q_B_TILE))
+            acc = run_units(u_qb, QB_UPW, QB_BATCH, pre)
+            reduce_rows(QB_R, acc, emit_out(QB_ROWS))
             stamp("q_b", t, 3)
             gpu.barrier()
             # published as f32: the per-head RMS below is taken on the unrounded GEMV
             # output, so rounding to bf16 happens only once, after RoPE
-            head = t // QB_PER_HEAD
-            hoff = (t % QB_PER_HEAD) * Q_B_TILE
-            if tid < S * Q_B_TILE:
-                s = tid // Q_B_TILE
-                r = tid % Q_B_TILE
-                put(mb("q_raw"), (s * H + head) * HEAD_DIM + hoff + r, lds_ld(outs, tid))
+            if tid < S * QB_ROWS:
+                s = tid // QB_ROWS
+                row = t * QB_ROWS + tid % QB_ROWS  # a head's rows are whole tiles, so whole groups
+                put(mb("q_raw"), (s * H + row // HEAD_DIM) * HEAD_DIM + row % HEAD_DIM, lds_ld(outs, tid))
             stamp("q_b", t, 4)
 
         # ========= 3b. the indexer's query: its own per-head projection off q_a
