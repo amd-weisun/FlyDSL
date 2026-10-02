@@ -104,7 +104,7 @@ THREADS = 512
 WAVES = THREADS // 64
 QKV_A_TILE = 16
 Q_B_TILE = 16
-UV_TILE = 64  # output dims merged per uv task
+UV_TILE = 64  # output dims merged per uv task, at least: see uv_tile
 ROW_TILE = 32  # rows per o_a / o_b / attention peer-reduce tile
 ROUTER_TILE = 8  # experts per router task (a part of a 16-row MFMA group)
 UG_TILE = 16  # intermediates per up/gate task (16 gate rows + 16 up rows)
@@ -153,6 +153,17 @@ def q_b_groups(n_tiles: int) -> int:
     sample's normalized q_a, and H * HEAD_DIM / Q_B_TILE = 512 tiles took two rounds
     of 256 CTAs, staging it all twice per CTA (S times the work at batch S)."""
     return qkv_a_groups(n_tiles)
+
+
+def uv_tile(S: int, heads: int, head_dim: int) -> int:
+    """Output dims merged per uv task: UV_TILE, widened until the S * heads * head_dim
+    dims fit one round of the grid. At 64 dims an S = 8 merge was 1024 tasks -- four
+    rounds of CTAs running 32 of their 512 threads, each redoing its head's split
+    weights; 256 dims is one round with 128 threads busy."""
+    t = UV_TILE
+    while S * heads * head_dim // t > BLOCKS and t * 2 <= head_dim:
+        t *= 2
+    return t
 
 
 def router_spt(S: int) -> int:
@@ -578,7 +589,7 @@ def stage_tasks(
         # ... and the top-k over them, which the split stage waits on
         ("i_topk", S * n_topk_parts(max_seq, compress_ratio, index_head_dim)),
         ("split", S * ((window if n_keys is None else n_keys) // SPLIT_KEYS)),
-        ("uv", S * (heads * head_dim // UV_TILE)),
+        ("uv", S * (heads * head_dim // uv_tile(S, heads, head_dim))),
         ("o_a", S * o_groups * o_lora // ROW_TILE),
         ("o_b", hidden // ROW_TILE),
         # ... and for the ffn side, once o_b has produced the new residual stream
@@ -892,6 +903,7 @@ def build_dsv4_kernel(
         assert K_PB == 64, "the FP4 pool's scale interleave is written for 64 entries a block (4 runs of 16)"
         assert IH % WAVES == 0, "one wave takes a whole index head"
         assert IHD - ROPE_DIM == 64, "rope must fall entirely in the head's second half"
+    UV_TILE = uv_tile(S, H, HEAD_DIM)  # shadows the module minimum
     N_UV = H * HEAD_DIM // UV_TILE
     UV_PER_HEAD = HEAD_DIM // UV_TILE
     OA_K = H * HEAD_DIM // O_GROUPS  # one group's slice of the concatenated heads
