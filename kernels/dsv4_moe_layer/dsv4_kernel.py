@@ -186,8 +186,7 @@ def ffn_hcc(S: int, hc_mult: int) -> bool:
 def router_spt(S: int) -> int:
     """Samples per router task. One per task until S * N_ROUTER outgrows the grid
     (S = 8: 384 tasks, two rounds of ~13 us on the FFN's critical path); then the
-    fewest that fit one round (2 at S = 8, 4 at S = 16), each in a B column of
-    each K-fold half -- at most 8 of them."""
+    fewest that fit one round, each in a B column of each K-fold half -- at most 8."""
     spt = 1
     while S * N_ROUTER > BLOCKS * spt and spt < ROUTER_TILE:
         spt *= 2
@@ -696,6 +695,11 @@ def build_dsv4_kernel(
     # is satisfied at every shipped shape; they are here so a future one fails the
     # build instead of hanging or quietly producing zeros on the GPU.
     assert 1 <= S <= 16, "n_sel / reduce_rows put the samples in the MFMA's 16 B columns"
+    assert S <= WAVES, f"dn_route routes sample s on wave s, and there are {WAVES} waves"
+    assert S * (1 + top_k) <= SPLIT_KEYS, (
+        f"dn_route packs S * MOE_SLOTS = {S * (1 + top_k)} expert ids into Smem.keys, "
+        f"which the split stage sizes at SPLIT_KEYS = {SPLIT_KEYS}"
+    )
     assert head_dim % 64 == 0, "the score MFMA walks HEAD_DIM in 32-wide steps over 2 wave halves"
     # The PV MFMA gives each wave HEAD_DIM / 32 / WAVES dim-pair groups and the KV
     # gather gives each lane HEAD_DIM / 64 elements; both silently produce no work at
@@ -966,10 +970,7 @@ def build_dsv4_kernel(
     QS = QK_DIM // 2 + 4
     KS = HEAD_DIM // 2 + 4
     KT_OFF = H * QS
-    # LDS stages at most SG samples' HIDDEN-wide input at once (S * HIDDEN bf16 is
-    # 229 KB at S = 16, past the 160 KB): qkv_a and up/gate work in groups of SG
-    SG = min(S, 8)
-    XN = max(SG * HIDDEN // 2, KT_OFF + SPLIT_KEYS * KS)
+    XN = max(S * HIDDEN // 2, KT_OFF + SPLIT_KEYS * KS)
     ON = S * max(ROW_TILE, QKV_A_TILE, UG_TILE * 2)  # (uv publishes from registers)
     DN_TILE = dn_tile(S, HIDDEN)
     N_DN_TILES = HIDDEN // DN_TILE
@@ -1034,7 +1035,7 @@ def build_dsv4_kernel(
         red: fx.Array[fx.Float32, WAVES * 64 * 4, 16]
         misc: fx.Array[fx.Float32, misc_words, 16]
         p: fx.Array[fx.Float32, H * SPLIT_KEYS, 16]
-        keys: fx.Array[fx.Int32, max(SPLIT_KEYS, S * MOE_SLOTS), 16]  # split keys / dn_route's experts
+        keys: fx.Array[fx.Int32, SPLIT_KEYS, 16]
         dnw: fx.Array[fx.Float32, S * MOE_SLOTS, 16]  # expert-down route weights
         # radix-select bins, replicated, plus two words to broadcast the winning digit
         hist: fx.Array[fx.Int32, (TK_BC + 4) if IHD else 1, 16]
@@ -1640,13 +1641,12 @@ def build_dsv4_kernel(
                 cur = nxt
             return acc
 
-        def reduce_rows(R, acc, emit, count=S):
-            """Sum the per-wave MFMA tiles of each of R row groups; emit(row_local, n, v) for
-            B columns n < count (the samples, or a group of them)."""
+        def reduce_rows(R, acc, emit):
+            """Sum the per-wave MFMA tiles of each of R row groups; emit(row_local, n, v) for n < S."""
             wpr = WAVES // R
             fx.ptr_store(fx.Vector.from_elements(acc, fx.Float32), red + (wave * 64 + lane) * 4)
             gpu.barrier()
-            n_out = R * 16 * count
+            n_out = R * 16 * S
             for i in range_constexpr((n_out + THREADS - 1) // THREADS):
                 t = tid + i * THREADS
                 if t < n_out:
@@ -2138,53 +2138,52 @@ def build_dsv4_kernel(
                             tot = tot + lds_ld(red, (w_ * NBLK + blk) * 64 + lane)
                         lds_st(red, idx, tot)
                 gpu.barrier()
-                # one wave per sample (and a second pass past WAVES samples): the Sinkhorn is a long dependent chain,
+                # one wave per sample (S <= WAVES): the Sinkhorn is a long dependent chain,
                 # and running every sample's on wave 0 in turn cost S chains per hcc_a and
                 # router task -- 8 of them back to back at S=8
-                for sp_ in range_constexpr((S + WAVES - 1) // WAVES):  # sample wave + sp_ * WAVES
-                    s_ = wave + sp_ * WAVES
-                    if s_ < S:
-                        rstd = _rsq(lds_ld(red, s_ * HC_VALS + HC_ROWS) * (1.0 / (HC * HIDDEN)) + EPS)
+                if wave < S:
+                    s_ = wave
+                    rstd = _rsq(lds_ld(red, s_ * HC_VALS + HC_ROWS) * (1.0 / (HC * HIDDEN)) + EPS)
 
-                        def coef(i, s_=s_, rstd=rstd):
-                            return lds_ld(red, s_ * HC_VALS + i) * rstd
+                    def coef(i, s_=s_, rstd=rstd):
+                        return lds_ld(red, s_ * HC_VALS + i) * rstd
 
-                        if lane < 2 * HC:  # pre then post share these lanes
-                            m = coef(fx.min(lane, fx.Int32(HC_MIX - 1)))
-                            b = ld_f32(r_sb, 3 + lane)
-                            v = (lane < HC).select(
-                                _rcp(1.0 + _exp(-(m * sc0 + b))) + hc_eps,
-                                2.0 * _rcp(1.0 + _exp(-(m * sc1 + b))),
-                            )
-                            lds_st(misc, HC_MISC + s_ * HC_COEF + lane, v)
-                            if publish:
-                                put(mb("hc_c"), (s_ * 2 + sd) * HC_COEF + lane, v)
-                        if lane < HC * HC:
-                            cb = coef(2 * HC + lane) * sc2 + ld_f32(r_sb, 3 + 2 * HC + lane)
-                            rmax = cb
-                            for off in HC_ROW_OFFS:
-                                rmax = _xred(rmax, off, fx.max)
-                            c = _exp(cb - rmax)
+                    if lane < 2 * HC:  # pre then post share these lanes
+                        m = coef(fx.min(lane, fx.Int32(HC_MIX - 1)))
+                        b = ld_f32(r_sb, 3 + lane)
+                        v = (lane < HC).select(
+                            _rcp(1.0 + _exp(-(m * sc0 + b))) + hc_eps,
+                            2.0 * _rcp(1.0 + _exp(-(m * sc1 + b))),
+                        )
+                        lds_st(misc, HC_MISC + s_ * HC_COEF + lane, v)
+                        if publish:
+                            put(mb("hc_c"), (s_ * 2 + sd) * HC_COEF + lane, v)
+                    if lane < HC * HC:
+                        cb = coef(2 * HC + lane) * sc2 + ld_f32(r_sb, 3 + 2 * HC + lane)
+                        rmax = cb
+                        for off in HC_ROW_OFFS:
+                            rmax = _xred(rmax, off, fx.max)
+                        c = _exp(cb - rmax)
+                        rsum = c
+                        for off in HC_ROW_OFFS:
+                            rsum = _xred(rsum, off, lambda a, b: a + b)
+                        c = c * _rcp(rsum) + hc_eps
+                        csum = c
+                        for off in HC_COL_OFFS:
+                            csum = _xred(csum, off, lambda a, b: a + b)
+                        c = c * _rcp(csum + hc_eps)
+                        for _ in range_constexpr(hc_sinkhorn_iters - 1):
                             rsum = c
                             for off in HC_ROW_OFFS:
                                 rsum = _xred(rsum, off, lambda a, b: a + b)
-                            c = c * _rcp(rsum) + hc_eps
+                            c = c * _rcp(rsum + hc_eps)
                             csum = c
                             for off in HC_COL_OFFS:
                                 csum = _xred(csum, off, lambda a, b: a + b)
                             c = c * _rcp(csum + hc_eps)
-                            for _ in range_constexpr(hc_sinkhorn_iters - 1):
-                                rsum = c
-                                for off in HC_ROW_OFFS:
-                                    rsum = _xred(rsum, off, lambda a, b: a + b)
-                                c = c * _rcp(rsum + hc_eps)
-                                csum = c
-                                for off in HC_COL_OFFS:
-                                    csum = _xred(csum, off, lambda a, b: a + b)
-                                c = c * _rcp(csum + hc_eps)
-                            lds_st(misc, HC_MISC + s_ * HC_COEF + 2 * HC + lane, c)
-                            if publish:
-                                put(mb("hc_c"), (s_ * 2 + sd) * HC_COEF + 2 * HC + lane, c)
+                        lds_st(misc, HC_MISC + s_ * HC_COEF + 2 * HC + lane, c)
+                        if publish:
+                            put(mb("hc_c"), (s_ * 2 + sd) * HC_COEF + 2 * HC + lane, c)
                 gpu.barrier()
 
             if const_expr(not contract):
@@ -2234,70 +2233,60 @@ def build_dsv4_kernel(
         QA_UPW = QA_NKC // QA_WPR  # K chunks per wave
         QA_BATCH = QA_NKC // WAVES
         QA_ROWS = QKV_A_TILE * QA_R
-        # At most SG samples' normalized input fits LDS (x holds SG * HIDDEN bf16): a
-        # larger batch runs the task once per group of SG, re-issuing its weight loads
-        # (L2 hits) with the group in the MFMA's B columns.
-        QA_GROUPS = S // SG
         for t in range(start("qkv_a"), N_QKV_A // QA_R, G):
             t = fx.Int32(t)
             stamp("qkv_a", t, 0)
             qa_rg = t * QA_R + wave // QA_WPR
-            qa_col = fx.min(lane % 16, SG - 1)  # this lane's B column: a sample of the group
 
             def u_qa(c):
                 kc = (wave % QA_WPR) * QA_UPW + c
-                return unit_fp8(r_wqa, r_sqa, qa_rg, kc, QA_NKC, HIDDEN, 128, (qa_col * HIDDEN + kc * 64) // 2)
+                return unit_fp8(r_wqa, r_sqa, qa_rg, kc, QA_NKC, HIDDEN, 128, (n_sel() * HIDDEN + kc * 64) // 2)
 
-            for g in range_constexpr(QA_GROUPS):
-                s0 = g * SG
-
-                def ld_h(sks, s0=s0):
-                    if const_expr(HC > 1):  # hc_pre already contracted the streams
-                        vals = poll([(mb("xin"), ((s0 + s) * HIDDEN + k) // 2, 2) for s, k in sks])
-                        res = []
-                        for i in range_constexpr(len(sks)):
-                            a0, a1 = bf2_f32(vals[i][0])
-                            b0, b1 = bf2_f32(vals[i][1])
-                            res.append([a0, a1, b0, b1])
-                        return res
+            def ld_h(sks):
+                if const_expr(HC > 1):  # hc_pre already contracted the streams
+                    vals = poll([(mb("xin"), (s * HIDDEN + k) // 2, 2) for s, k in sks])
                     res = []
-                    for s, k in sks:
-                        w = fx.Vector(bo.buffer_load(r_h, ((s0 + s) * HIDDEN + k) // 2, vec_width=2, dtype=T.i32))
-                        v = w.bitcast(fx.BFloat16).to(fx.Float32)
-                        res.append([v[j] for j in range(4)])
+                    for i in range_constexpr(len(sks)):
+                        a0, a1 = bf2_f32(vals[i][0])
+                        b0, b1 = bf2_f32(vals[i][1])
+                        res.append([a0, a1, b0, b1])
                     return res
+                res = []
+                for s, k in sks:
+                    w = fx.Vector(bo.buffer_load(r_h, (s * HIDDEN + k) // 2, vec_width=2, dtype=T.i32))
+                    v = w.bitcast(fx.BFloat16).to(fx.Float32)
+                    res.append([v[j] for j in range(4)])
+                return res
 
-                # the (small) input loads go out before the weight stream: loads complete in order
-                h_ld = load_x_rmsnorm(ld_h, HIDDEN, g_in, count=SG)
-                pre = [u_qa(c) for c in range(QA_BATCH)]
-                stage_x_rmsnorm(ld_h, HIDDEN, g_in, loaded=h_ld, count=SG)
-                gpu.barrier()
-                stamp("qkv_a", t, 2)
-                acc = run_units(u_qa, QA_UPW, QA_BATCH, pre)
-                reduce_rows(QA_R, acc, emit_out(QA_ROWS), count=SG)
-                stamp("qkv_a", t, 3)
-                gpu.barrier()
-                if tid < SG * QA_ROWS:
-                    s = s0 + tid // QA_ROWS
-                    row = t * QA_ROWS + tid % QA_ROWS
-                    v = lds_ld(outs, tid)
-                    # Column ranges of the fused GEMV, in layout order. Must match
-                    # reference.qkv_a_split(): the compressor's pair is C_COFF-wide, so
-                    # this is not "one head_dim each" once CSA overlaps.
-                    if row < Q_LORA:
-                        put(mb("q_a"), s * Q_LORA + row, v)
-                    elif row < Q_LORA + HEAD_DIM:
-                        put(mb("kv_a"), s * HEAD_DIM + row - Q_LORA, v)
-                    elif row < Q_LORA + HEAD_DIM + CW:
-                        put(mb("c_kv"), s * CW + row - Q_LORA - HEAD_DIM, v)
-                    elif row < Q_LORA + HEAD_DIM + 2 * CW:
-                        put(mb("c_gate"), s * CW + row - Q_LORA - HEAD_DIM - CW, v)
-                    elif row < Q_LORA + HEAD_DIM + 2 * CW + IW:
-                        put(mb("i_kv"), s * IW + row - Q_LORA - HEAD_DIM - 2 * CW, v)
-                    else:
-                        put(mb("i_gate"), s * IW + row - Q_LORA - HEAD_DIM - 2 * CW - IW, v)
-                if const_expr(g + 1 < QA_GROUPS):
-                    gpu.barrier()  # the next group restages x and re-emits outs
+            # the (small) input loads go out before the weight stream: loads complete in order
+            h_ld = load_x_rmsnorm(ld_h, HIDDEN, g_in)
+            pre = [u_qa(c) for c in range(QA_BATCH)]
+            stage_x_rmsnorm(ld_h, HIDDEN, g_in, loaded=h_ld)
+            gpu.barrier()
+            stamp("qkv_a", t, 2)
+            acc = run_units(u_qa, QA_UPW, QA_BATCH, pre)
+            reduce_rows(QA_R, acc, emit_out(QA_ROWS))
+            stamp("qkv_a", t, 3)
+            gpu.barrier()
+            if tid < S * QA_ROWS:
+                s = tid // QA_ROWS
+                row = t * QA_ROWS + tid % QA_ROWS
+                v = lds_ld(outs, tid)
+                # Column ranges of the fused GEMV, in layout order. Must match
+                # reference.qkv_a_split(): the compressor's pair is C_COFF-wide, so
+                # this is not "one head_dim each" once CSA overlaps.
+                if row < Q_LORA:
+                    put(mb("q_a"), s * Q_LORA + row, v)
+                elif row < Q_LORA + HEAD_DIM:
+                    put(mb("kv_a"), s * HEAD_DIM + row - Q_LORA, v)
+                elif row < Q_LORA + HEAD_DIM + CW:
+                    put(mb("c_kv"), s * CW + row - Q_LORA - HEAD_DIM, v)
+                elif row < Q_LORA + HEAD_DIM + 2 * CW:
+                    put(mb("c_gate"), s * CW + row - Q_LORA - HEAD_DIM - CW, v)
+                elif row < Q_LORA + HEAD_DIM + 2 * CW + IW:
+                    put(mb("i_kv"), s * IW + row - Q_LORA - HEAD_DIM - 2 * CW, v)
+                else:
+                    put(mb("i_gate"), s * IW + row - Q_LORA - HEAD_DIM - 2 * CW - IW, v)
             stamp("qkv_a", t, 4)
 
         def kv_quant(nv):
@@ -3797,17 +3786,14 @@ def build_dsv4_kernel(
             stamp("router", tt, 4)
 
         def dn_route(bs):
-            """Expert-down routing (wave s -> sample s, a second pass past WAVES samples):
-            expert ids -> keys[s * 9 + slot], route weights -> dnw[]; the scores must
-            have landed."""
-            for sp_ in range_constexpr((S + WAVES - 1) // WAVES):
-                s_ = wave + sp_ * WAVES
-                if s_ < S:
-                    e, w = route_topk(s_, bs=bs)
-                    if lane < MOE_SLOTS:  # slot 0: the shared expert, then pick lane (slot lane + 1)
-                        q = s_ * MOE_SLOTS + (lane + 1) % MOE_SLOTS
-                        lds_st(keys, q, (lane == TOP_K).select(fx.Int32(SHARED_EXPERT), e))
-                        lds_st(dnw, q, (lane == TOP_K).select(fx.Float32(1.0), w))
+            """Expert-down routing (wave s -> sample s): expert ids -> keys[s * 9 + slot],
+            route weights -> dnw[]; the scores must have landed."""
+            if wave < S:
+                e, w = route_topk(wave, bs=bs)
+                if lane < MOE_SLOTS:  # slot 0: the shared expert, then pick lane (slot lane + 1)
+                    q = wave * MOE_SLOTS + (lane + 1) % MOE_SLOTS
+                    lds_st(keys, q, (lane == TOP_K).select(fx.Int32(SHARED_EXPERT), e))
+                    lds_st(dnw, q, (lane == TOP_K).select(fx.Float32(1.0), w))
 
         # ================================ 9. expert up/gate + SiLU
         # One 16-row group (8 gate + 8 up rows), with all eight waves splitting K.
@@ -3967,17 +3953,7 @@ def build_dsv4_kernel(
             # and `down` polls them forever.
             UG8_UNITS = (HIDDEN // UG_UNIT_K) // WAVES
             XW = HIDDEN // (4 if use_fp8_block128 else 2)
-            # Past SG samples the input no longer fits LDS, so the grid splits into UH
-            # interleaved halves, half h taking samples [h * SG, (h + 1) * SG): a CTA
-            # stages only its half's SG inputs. Within the stage a sample's MFMA column
-            # and LDS slot are its index in the half; its mailboxes stay global.
-            UH = S // SG
-            GH = G // UH  # CTAs per half
-            u_start = fx.Int32(start("ug"))
-            ug_h = u_start % UH  # this CTA's half (0 when UH == 1)
-            u0 = u_start // UH  # ... and its index within it
-            hs0 = ug_h * SG  # the half's first sample
-            ug_col = fx.min(lane % 16, SG - 1)  # B column = sample index within the half
+            u0 = fx.Int32(start("ug"))
 
             def ug8_units(c, w_rg, w_ln, s_rg, e, sample, live=None):
                 nw = None if live is None else live.select(fx.Int32(UG_W_BYTES), fx.Int32(0))
@@ -3988,7 +3964,7 @@ def build_dsv4_kernel(
                 rs = bo.create_buffer_resource_from_addr(
                     s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES), num_records_bytes=ns
                 )
-                sn = ug_col if sample is None else fx.Int32(sample)  # the LDS slot: index within the half
+                sn = n_sel() if sample is None else fx.Int32(sample)
                 units = []
                 for cc in range_constexpr(UG8_UNITS):
                     unit = wave * UG8_UNITS + cc
@@ -4036,7 +4012,7 @@ def build_dsv4_kernel(
                 rs = bo.create_buffer_resource_from_addr(
                     s_sug, num_records_bytes=live.select(fx.Int32(SUG_S_BYTES), fx.Int32(0))
                 )
-                sn = ug_col
+                sn = n_sel()
                 units = []
                 for cc in range_constexpr(UG8_UNITS):
                     unit = wave * UG8_UNITS + cc
@@ -4052,14 +4028,12 @@ def build_dsv4_kernel(
                 return ug8_units(c, w_rg, w_ln, s_rg, fx.Int32(SHARED_EXPERT), None, live)
 
             def ug8_emit(c, slot, sample, shared, live):
-                """``sample``: the routed item's global sample; a shared tile covers the
-                half's SG samples, column n being sample hs0 + n."""
-                if tid < (SG if shared else 1) * UG8 // 2:
+                if tid < (S if shared else 1) * UG8 // 2:
                     n = tid // (UG8 // 2)
                     r = (tid % (UG8 // 2)) * 2
                     g0, g1 = lds_ld(outs, n * 16 + r), lds_ld(outs, n * 16 + r + 1)
                     v0, v1 = lds_ld(outs, n * 16 + UG8 + r), lds_ld(outs, n * 16 + UG8 + r + 1)
-                    sn = hs0 + n if shared else fx.Int32(sample)
+                    sn = n if shared else fx.Int32(sample)
                     sl = fx.Int32(0) if shared else slot
                     if live:
                         put2(
@@ -4068,8 +4042,8 @@ def build_dsv4_kernel(
                             _swiglu(g0, v0, swiglu_limit),
                             _swiglu(g1, v1, swiglu_limit),
                         )
-                if (c == 0) & (tid < SG if shared else tid == 0):
-                    sn = hs0 + tid if shared else fx.Int32(sample)
+                if (c == 0) & (tid < S if shared else tid == 0):
+                    sn = tid if shared else fx.Int32(sample)
                     sl = fx.Int32(0) if shared else slot
                     if live:
                         put(mb("sel"), sn * MOE_SLOTS + sl, lds_ld(keys, sn * MOE_SLOTS + sl))
@@ -4097,42 +4071,42 @@ def build_dsv4_kernel(
             # 2 * S items, while the rest had S -- the stage's tail. Its weights are
             # prefetched ahead of the routing wait and the input staging, as the
             # single-tile version did; dn_route and stage_moe_input are CTA-global.
-            N_UG_ITEMS = SG * N_UG_TASKS  # per half
-            UG_ITEMS = (N_UG_ITEMS + GH - 1) // GH
+            N_UG_ITEMS = S * N_UG_TASKS
+            UG_ITEMS = (N_UG_ITEMS + G - 1) // G
 
             def ug8_item(k):
-                """This CTA's k-th routed item: (live, uu, sample, local sample, c, slot,
-                w_rg, w_ln, s_rg). The index is clamped so a dead item's LDS and
-                descriptor indices stay in range; `live` is what suppresses its effects."""
-                w = u0 + k * GH
+                """This CTA's k-th routed item: (live, uu, sample, c, slot, w_rg, w_ln, s_rg).
+                The index is clamped so a dead item's LDS and descriptor indices stay in
+                range; `live` is what suppresses its effects."""
+                w = u0 + k * G
                 live = w < N_UG_ITEMS
                 ww = fx.min(w, fx.Int32(N_UG_ITEMS - 1))
                 uu = ww % N_UG_TASKS
-                s_loc = ww // N_UG_TASKS
+                sample = ww // N_UG_TASKS
                 _l, _u, c, slot, _h, w_rg, w_ln, s_rg = ug8_tile(uu)
-                return live, uu, hs0 + s_loc, s_loc, c, slot, w_rg, w_ln, s_rg
+                return live, uu, sample, c, slot, w_rg, w_ln, s_rg
 
             live0, uu0, c0, slot0, has_sh0, wr0, wl0, sr0 = ug8_tile(u0)
             shared_pre = shared_units(c0, wr0, wl0, sr0, has_sh0 & live0)
             dn_route(load_bias())
             gpu.barrier()
             items = [ug8_item(0)]
-            lv, uu_, sm, sml, c_, sl, wr, wl, sr = items[0]
-            cur = ug8_units(c_, wr, wl, sr, _uniform(lds_ld(keys, sm * MOE_SLOTS + sl)), sml, lv)
-            stage_moe_input([hs0 + j for j in range(SG)] if const_expr(UH > 1) else list(range(S)))
+            lv, uu_, sm, c_, sl, wr, wl, sr = items[0]
+            cur = ug8_units(c_, wr, wl, sr, _uniform(lds_ld(keys, sm * MOE_SLOTS + sl)), sm, lv)
+            stage_moe_input(list(range(S)))
             gpu.barrier()
             if has_sh0 & live0:
-                reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre), emit_out(16), count=SG)
+                reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre), emit_out(16))
                 gpu.barrier()
                 ug8_emit(c0, slot0, 0, True, live0)
             for k in range_constexpr(UG_ITEMS):
-                live, uu, sample, s_loc, c, slot, w_rg, w_ln, s_rg = items[k]
+                live, uu, sample, c, slot, w_rg, w_ln, s_rg = items[k]
                 stamp("ug", sample * N_UG_TASKS + uu, 0, pred=live)
                 pre = cur
                 if const_expr(k + 1 < UG_ITEMS):
                     items.append(ug8_item(k + 1))
-                    lv, uu_, sm, sml, c_, sl, wr, wl, sr = items[k + 1]
-                    cur = ug8_units(c_, wr, wl, sr, _uniform(lds_ld(keys, sm * MOE_SLOTS + sl)), sml, lv)
+                    lv, uu_, sm, c_, sl, wr, wl, sr = items[k + 1]
+                    cur = ug8_units(c_, wr, wl, sr, _uniform(lds_ld(keys, sm * MOE_SLOTS + sl)), sm, lv)
                 reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16))
                 gpu.barrier()
                 ug8_emit(c, slot, sample, False, live)
