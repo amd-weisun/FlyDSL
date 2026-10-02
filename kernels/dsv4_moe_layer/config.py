@@ -56,7 +56,7 @@ SCALE_BM = 128
 FP8_MAX = 448.0
 SOFTMAX_SCALE = HEAD_DIM**-0.5
 
-SUPPORTED_SAMPLES = (1, 2, 4, 8)
+SUPPORTED_SAMPLES = (1, 2, 4, 8, 16)
 SUPPORTED_PEERS = (1, 2, 4, 8)
 # 128 total heads / 8 ranks; the split-attention kernel requires
 # `heads % WAVES == 0 and heads <= 16`.

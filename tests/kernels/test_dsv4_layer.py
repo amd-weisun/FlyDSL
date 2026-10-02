@@ -157,7 +157,7 @@ def _compare_stages(got, ref, cfg, npes):
 
 @pytest.mark.parametrize("moe_mode", [MoeMode.A8W4, MoeMode.W8A8])
 @pytest.mark.parametrize("hc_mult", [1, 4])
-@pytest.mark.parametrize("S", [1, 2, 4, 8])
+@pytest.mark.parametrize("S", [1, 2, 4, 8, 16])
 def test_dsv4_layer_matches_golden(S, moe_mode, hc_mult):
     """hc_mult=1 is a plain residual; 4 is V4's hyper-connection stream.
 
@@ -209,7 +209,7 @@ def test_dsv4_layer_matches_golden(S, moe_mode, hc_mult):
 
 
 @pytest.mark.large_shape
-@pytest.mark.parametrize("S,hc_mult", [(1, 1), (8, 1), (1, 4), (8, 4)])
+@pytest.mark.parametrize("S,hc_mult", [(1, 1), (8, 1), (1, 4), (8, 4), (16, 4)])
 def test_dsv4_layer_matches_golden_at_real_dims(S, hc_mult):
     """The reduced shard above cannot catch mappings that only break at V4's own
     numbers -- 384 experts overflowed the selection key's id field, which 256 (and
