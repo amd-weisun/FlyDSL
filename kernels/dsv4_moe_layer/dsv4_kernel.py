@@ -166,6 +166,13 @@ def uv_tile(S: int, heads: int, head_dim: int) -> int:
     return t
 
 
+def o_a_spt(S: int, o_groups: int, o_lora: int) -> int:
+    """Samples per o_a task: one per task until the (sample, group, row tile) tasks
+    outgrow the grid (S = 8: 512, two rounds), then two share a task in two MFMA B
+    columns -- one round, and each tile's weights read half as often."""
+    return 2 if S % 2 == 0 and S * o_groups * o_lora // ROW_TILE > BLOCKS else 1
+
+
 def router_spt(S: int) -> int:
     """Samples per router task. One per task until S * N_ROUTER outgrows the grid
     (S = 8: 384 tasks, two rounds of ~13 us on the FFN's critical path); then two
@@ -590,7 +597,7 @@ def stage_tasks(
         ("i_topk", S * n_topk_parts(max_seq, compress_ratio, index_head_dim)),
         ("split", S * ((window if n_keys is None else n_keys) // SPLIT_KEYS)),
         ("uv", S * (heads * head_dim // uv_tile(S, heads, head_dim))),
-        ("o_a", S * o_groups * o_lora // ROW_TILE),
+        ("o_a", S * o_groups * o_lora // ROW_TILE // o_a_spt(S, o_groups, o_lora)),
         ("o_b", hidden // ROW_TILE),
         # ... and for the ffn side, once o_b has produced the new residual stream
         ("hcd_f", S * hc_tasks),
@@ -3429,16 +3436,19 @@ def build_dsv4_kernel(
         OA_NKC = OA_K // 64
         OA_R = ROW_TILE // 16
         OA_WPR = WAVES // OA_R
-        for tt in range(start("o_a"), N_OA, G):
+        OA_SPT = o_a_spt(S, O_GROUPS, O_LORA)
+        for tt in range(start("o_a"), N_OA // OA_SPT, G):
             tt = fx.Int32(tt)
             stamp("o_a", tt, 0)
-            s = tt // (O_GROUPS * OA_PER_GROUP)
+            s = (tt // (O_GROUPS * OA_PER_GROUP)) * OA_SPT  # the first of this task's samples
             t = tt % (O_GROUPS * OA_PER_GROUP)
             grp = t // OA_PER_GROUP
+            # B column n holds sample s + n (columns past OA_SPT repeat the last)
+            oa_col = fx.min(lane % 16, OA_SPT - 1)
 
             def u_oa(c):
                 kc = (wave % OA_WPR) * (OA_NKC // OA_WPR) + c
-                return unit_fp8(r_woa, r_soa, t * OA_R + wave // OA_WPR, kc, OA_NKC, OA_K, 128, (kc * 64) // 2)
+                return unit_fp8(r_woa, r_soa, t * OA_R + wave // OA_WPR, kc, OA_NKC, OA_K, 128, (oa_col * OA_K + kc * 64) // 2)
 
             pre = [u_oa(c) for c in range(OA_NKC // OA_WPR)]
             hint_wait(
@@ -3446,19 +3456,21 @@ def build_dsv4_kernel(
                 lambda k: (mb("o"), ((s * H + grp * (H // O_GROUPS) + k) * HEAD_DIM + HEAD_DIM - 2) // 2),
                 mark=("o_a", tt),
             )
-            stage_x_pairs("o", OA_K, lambda k: (s * H) * HEAD_DIM + grp * OA_K + k)
+            # the samples' slices one after another in LDS (each OA_K, a multiple of 4)
+            stage_x_pairs("o", OA_SPT * OA_K, lambda k: ((s + k // OA_K) * H) * HEAD_DIM + grp * OA_K + k % OA_K)
             stamp("o_a", tt, 2)
             gpu.barrier()
             acc = run_units(u_oa, OA_NKC // OA_WPR, OA_NKC // OA_WPR, pre)
             reduce_rows(OA_R, acc, emit_out(ROW_TILE))
             stamp("o_a", tt, 3)
             gpu.barrier()
-            if tid < ROW_TILE // 4:
-                r = tid * 4
+            if tid < OA_SPT * ROW_TILE // 4:
+                n = tid // (ROW_TILE // 4)
+                r = tid % (ROW_TILE // 4) * 4
                 put_bf(
                     mb("o_lora"),
-                    s * OB_K + t * ROW_TILE + r,
-                    [lds_ld(outs, r + j) for j in range(4)],
+                    (s + n) * OB_K + t * ROW_TILE + r,
+                    [lds_ld(outs, n * ROW_TILE + r + j) for j in range(4)],
                 )
             stamp("o_a", tt, 4)
 
