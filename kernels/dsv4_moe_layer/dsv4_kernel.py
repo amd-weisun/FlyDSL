@@ -2889,6 +2889,15 @@ def build_dsv4_kernel(
                 n_parts = (n_live <= TK_TRIPS * THREADS * TK_PER).select(fx.Int32(1), fx.Int32(TK_PARTS))
                 if (n_live > N_INDEX) & (part < n_parts):
                     tk_cbs, tk_keys = part_keys(sbase, part, n_live, n_parts)
+
+                    def trip_live(j):
+                        """Whether trip ``j`` of this part holds any live candidate --
+                        CTA-uniform, so a dead trip's work is branched over, not masked.
+                        A part is sized for the longest context it may take (8 trips at
+                        1M), and the radix walks every trip four times plus once more to
+                        compact: at an 8K context 7 of the 8 are dead, ~15 us at S=8."""
+                        return (fx.Int32(j) * n_parts + part) * (THREADS * TK_PER) < n_live
+
                     stamp("i_topk", tt, 2)
 
                     pfx = fx.Int32(0)  # the digits already fixed, in the unsigned domain
@@ -2910,17 +2919,18 @@ def build_dsv4_kernel(
                                 lds_st(hist, zi, fx.Int32(0))
                         gpu.barrier()
                         for j in range_constexpr(TK_TRIPS):
-                            for q in range_constexpr(TK_PER):
-                                c = tk_cbs[j] + q
-                                ok = c < n_live
-                                # a dead candidate keys as 0, the very bottom
-                                u = ok.select(tk_keys[j * TK_PER + q], fx.Int32(0))
-                                if ok & (((u ^ pfx) & hi) == 0):
-                                    fx.atomic_add(
-                                        hist + ((u >> sh) & (TK_BINS - 1)) * TK_REP + (tid & (TK_REP - 1)),
-                                        fx.Int32(1),
-                                        syncscope=fx.rocdl.SyncScope.Workgroup,
-                                    )
+                            if trip_live(j):
+                                for q in range_constexpr(TK_PER):
+                                    c = tk_cbs[j] + q
+                                    ok = c < n_live
+                                    # a dead candidate keys as 0, the very bottom
+                                    u = ok.select(tk_keys[j * TK_PER + q], fx.Int32(0))
+                                    if ok & (((u ^ pfx) & hi) == 0):
+                                        fx.atomic_add(
+                                            hist + ((u >> sh) & (TK_BINS - 1)) * TK_REP + (tid & (TK_REP - 1)),
+                                            fx.Int32(1),
+                                            syncscope=fx.rocdl.SyncScope.Workgroup,
+                                        )
                         gpu.barrier()
                         # Thread t takes bin TK_BINS - 1 - t, so an ascending exclusive
                         # scan over threads is a descending suffix sum over bins: every
@@ -3000,21 +3010,22 @@ def build_dsv4_kernel(
                         lds_st(hist, TK_BC + 1, fx.Int32(0))
                     gpu.barrier()
                     for j in range_constexpr(TK_TRIPS):
-                        for q in range_constexpr(TK_PER):
-                            c = tk_cbs[j] + q
-                            ok = c < n_live
-                            sk = tk_keys[j * TK_PER + q] ^ MIN_I32  # back to the signed-comparable domain
-                            if ok & (sk > thr):
-                                w = fx.Int32(
-                                    fx.atomic_add(hist + TK_BC, fx.Int32(1), syncscope=fx.rocdl.SyncScope.Workgroup)
-                                )
-                                put(mb("i_sel"), s * N_ISEL + gt_b + w, comp_row(s, c))
-                            if ok & (sk == thr):
-                                w = fx.Int32(
-                                    fx.atomic_add(hist + TK_BC + 1, fx.Int32(1), syncscope=fx.rocdl.SyncScope.Workgroup)
-                                )
-                                if (gt + eq_b + w) < k_want:
-                                    put(mb("i_sel"), s * N_ISEL + gt + eq_b + w, comp_row(s, c))
+                        if trip_live(j):
+                            for q in range_constexpr(TK_PER):
+                                c = tk_cbs[j] + q
+                                ok = c < n_live
+                                sk = tk_keys[j * TK_PER + q] ^ MIN_I32  # back to the signed-comparable domain
+                                if ok & (sk > thr):
+                                    w = fx.Int32(
+                                        fx.atomic_add(hist + TK_BC, fx.Int32(1), syncscope=fx.rocdl.SyncScope.Workgroup)
+                                    )
+                                    put(mb("i_sel"), s * N_ISEL + gt_b + w, comp_row(s, c))
+                                if ok & (sk == thr):
+                                    w = fx.Int32(
+                                        fx.atomic_add(hist + TK_BC + 1, fx.Int32(1), syncscope=fx.rocdl.SyncScope.Workgroup)
+                                    )
+                                    if (gt + eq_b + w) < k_want:
+                                        put(mb("i_sel"), s * N_ISEL + gt + eq_b + w, comp_row(s, c))
                     # the next task's first digit re-zeroes these counters
                     gpu.barrier()
                     # One part fills the tail, and it is the part that cannot collide:
