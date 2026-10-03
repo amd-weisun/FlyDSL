@@ -34,6 +34,7 @@ from kernels.dsv4_moe_layer.reference import (
     layer_idxs,
     make_weights,
     pack_fp4,
+    qkv_a_matrix,
     qkv_a_split,
     quant_dequant_fp4,
     rmsnorm,
@@ -243,7 +244,7 @@ def _load_block_weights(block, W, cfg, weight_fmt):
     _load_oracle_weights(block.attn, block.ffn, W, cfg, weight_fmt)
     if cfg.compress_ratio:
         # the compressors' projections live in our fused qkv_a; split them back out
-        dq = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+        dq = qkv_a_matrix(t)
         cut = qkv_a_split(cfg)
         c = block.attn.compressor
         c.wkv.weight.copy_(dq[slice(*cut["c_kv"])].float())
@@ -330,6 +331,10 @@ def test_v4_hca_compressor_matches_deepseek(steps):
 
     compressed_seen = 0
     near_ties = 0
+    # the oracle's own expert set: a near-tie on score + bias can tip either way (see
+    # test_v4_csa_layer_matches_deepseek), and the unbiased margin below misses it
+    cap = {}
+    block.ffn.gate.register_forward_hook(lambda m, i, o: cap.__setitem__("gate", o))
     for pos in range(steps):
         h = (0.5 * torch.randn(1, cfg.hc_mult, cfg.hidden, device=device)).to(torch.bfloat16)
         idx, dest = contiguous_pool([pos], cfg, device)
@@ -363,7 +368,9 @@ def test_v4_hca_compressor_matches_deepseek(steps):
         # says nothing about the compressor.
         sc = res["scores"][0].float() + W.t["bias"].float()
         top = torch.topk(sc, cfg.top_k + 1).values
-        if (top[cfg.top_k - 1] - top[cfg.top_k]).item() < NEAR_TIE:
+        o_experts = set(cap["gate"][1].reshape(-1).tolist())
+        g_experts = set(res["sel"].reshape(-1).tolist()) - {cfg.n_experts}  # less the shared slot
+        if (top[cfg.top_k - 1] - top[cfg.top_k]).item() < NEAR_TIE or o_experts != g_experts:
             near_ties += 1
             continue
 
@@ -398,7 +405,7 @@ def test_v4_compressor_matches_deepseek_directly(ratio):
         comp = om.Compressor(args, ratio, cfg.head_dim)
         comp.kv_cache = torch.zeros(1, cfg.n_compressed, cfg.head_dim, device=device)
         comp.freqs_cis = om.precompute_freqs_cis(cfg.rope_dim, 512, 0, cfg.compress_rope_theta, 1.0, 32, 1)
-    dq = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+    dq = qkv_a_matrix(t)
     coff = cfg.c_coff
     # by name: at ratio 4 the fused GEMV also carries the indexer's compressor,
     # so the attention compressor's pair is no longer the tail
@@ -604,7 +611,7 @@ def test_v4_indexer_matches_deepseek():
         idxr.kv_cache = torch.zeros(1, cfg.n_compressed, ihd, dtype=torch.bfloat16, device=device)
         idxr.freqs_cis = om.precompute_freqs_cis(cfg.rope_dim, 512, 0, cfg.rope_base, 1.0, 32, 1)
 
-    dq = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+    dq = qkv_a_matrix(t)
     cut = qkv_a_split(cfg)
     with torch.no_grad():
         idxr.compressor.wkv.weight.copy_(dq[slice(*cut["i_kv"])].float())

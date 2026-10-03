@@ -44,6 +44,8 @@ def pack_layer_weights(
     packed.update({name: pack_expert(tensors[name]) for name in EXPERT_NAMES})
     packed.update({name: pack_fp8(tensors[name]) for name in SHARED_EXPERT_NAMES if name in tensors})
     packed["w_r"] = pack_bf16(tensors["w_r"])
+    if "w_qkv_c" in tensors:  # the compressors' BF16 projections (the qkv_c stage)
+        packed["w_qkv_c"] = pack_bf16(tensors["w_qkv_c"])
     for name in HC_NAMES:
         if name in tensors:
             packed[name] = pack_hc_fn(tensors[name])

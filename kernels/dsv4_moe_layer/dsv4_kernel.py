@@ -586,7 +586,8 @@ def stage_tasks(
 
     MLA's ``uk`` stage has no V4 counterpart (no absorbed W_UK) and its ``o``
     GEMV splits into the grouped low-rank pair ``o_a`` / ``o_b``."""
-    n_qkv_a = qkv_a_rows(q_lora, head_dim, compress_ratio, c_coff, index_head_dim) // QKV_A_TILE
+    n_qkv_a = (q_lora + head_dim) // QKV_A_TILE
+    n_qkv_c = (qkv_a_rows(q_lora, head_dim, compress_ratio, c_coff, index_head_dim) - q_lora - head_dim) // QKV_A_TILE
     hc_tasks, _, _, _ = hc_shape(hc_mult, hidden)
     return [
         # hyper-connection pre-mix for the attention side, before anything reads
@@ -594,6 +595,8 @@ def stage_tasks(
         ("hcd_a", S * hc_tasks),
         ("hcc_a", (hidden // ROW_TILE) if hc_mult > 1 else 0),
         ("qkv_a", n_qkv_a // qkv_a_groups(n_qkv_a)),
+        # the compressors' projections, BF16 (as ATOM): the same normed input, its own weights
+        ("qkv_c", n_qkv_c // qkv_a_groups(n_qkv_c)),
         ("cache", 1),
         # the compressed entry has to land before the attention gathers it
         ("cmp", S if compress_ratio else 0),
@@ -736,8 +739,9 @@ def build_dsv4_kernel(
     MOE_SLOTS = 1 + TOP_K
     assert TOP_K <= 8, "ug keeps the routing weights in misc[:8], below the quant scales"
     SHARED_EXPERT = N_EXPERTS
-    QKV_A_ROWS = qkv_a_rows(Q_LORA, HEAD_DIM, compress_ratio, c_coff, index_head_dim)
+    QKV_A_ROWS = Q_LORA + HEAD_DIM  # the FP8 rows; the compressors' BF16 rows follow (qkv_c)
     N_QKV_A = QKV_A_ROWS // QKV_A_TILE
+    N_QKV_C = (qkv_a_rows(Q_LORA, HEAD_DIM, compress_ratio, c_coff, index_head_dim) - QKV_A_ROWS) // QKV_A_TILE
     N_ROW_TILES = HIDDEN // ROW_TILE
     N_ROUTER = N_EXPERTS // ROUTER_TILE
     N_UG_PER_SLOT = INTER // UG_TILE
@@ -1005,6 +1009,7 @@ def build_dsv4_kernel(
         "hcd_a",
         "hcc_a",
         "qkv_a",
+        "qkv_c",
         "cache",
         "cmp",
         "i_cmp",
@@ -1071,6 +1076,7 @@ def build_dsv4_kernel(
         hc_ffn_sb: Int64,
         w_qkv_a: Int64,
         s_qkv_a: Int64,
+        w_qkv_c: Int64,
         w_q_b: Int64,
         s_q_b: Int64,
         w_i_q_b: Int64,
@@ -2233,67 +2239,81 @@ def build_dsv4_kernel(
         # ================================================= 1. q_a / kv GEMV
         # 1 row group x (HIDDEN / 64) chunks: 8 waves split K (all prefetched)
         r_wqa, r_sqa = _rsrc(w_qkv_a), _rsrc(s_qkv_a)
+        r_wqc = _rsrc(w_qkv_c)
         QA_NKC = HIDDEN // 64
-        QA_R = qkv_a_groups(N_QKV_A)  # row groups per task; WAVES // QA_R waves split K for each
-        QA_WPR = WAVES // QA_R
-        QA_UPW = QA_NKC // QA_WPR  # K chunks per wave
-        QA_BATCH = QA_NKC // WAVES
-        QA_ROWS = QKV_A_TILE * QA_R
-        for t in range(start("qkv_a"), N_QKV_A // QA_R, G):
-            t = fx.Int32(t)
-            stamp("qkv_a", t, 0)
-            qa_rg = t * QA_R + wave // QA_WPR
 
-            def u_qa(c):
-                kc = (wave % QA_WPR) * QA_UPW + c
-                return unit_fp8(r_wqa, r_sqa, qa_rg, kc, QA_NKC, HIDDEN, 128, (n_sel() * HIDDEN + kc * 64) // 2)
+        def qkv_stage(name, n_tiles, row0, bf16_w):
+            """One fused-GEMV stage over n_tiles 16-row groups of the qkv_a output from
+            global row row0: the FP8 q_a | kv rows (qkv_a) or the compressors' BF16 rows
+            (qkv_c, ATOM's precision for them). Publishes by global row."""
+            QA_R = qkv_a_groups(n_tiles)  # row groups per task; WAVES // QA_R waves split K for each
+            QA_WPR = WAVES // QA_R
+            QA_UPW = QA_NKC // QA_WPR  # K chunks per wave
+            # units in flight per wave: a BF16 unit holds twice an FP8 one's weight words,
+            # so it issues a quarter as many: a full batch spilled 97 VGPRs, a half 41, this 10
+            QA_BATCH = max(1, QA_NKC // WAVES // (4 if bf16_w else 1))
+            QA_ROWS = QKV_A_TILE * QA_R
+            for t in range(start(name), n_tiles // QA_R, G):
+                t = fx.Int32(t)
+                stamp(name, t, 0)
+                qa_rg = t * QA_R + wave // QA_WPR
 
-            def ld_h(sks):
-                if const_expr(HC > 1):  # hc_pre already contracted the streams
-                    vals = poll([(mb("xin"), (s * HIDDEN + k) // 2, 2) for s, k in sks])
+                def u_qa(c):
+                    kc = (wave % QA_WPR) * QA_UPW + c
+                    if const_expr(bf16_w):
+                        return unit_bf16(r_wqc, qa_rg, kc, QA_NKC, (n_sel() * HIDDEN + kc * 64) // 2)
+                    return unit_fp8(r_wqa, r_sqa, qa_rg, kc, QA_NKC, HIDDEN, 128, (n_sel() * HIDDEN + kc * 64) // 2)
+
+                def ld_h(sks):
+                    if const_expr(HC > 1):  # hc_pre already contracted the streams
+                        vals = poll([(mb("xin"), (s * HIDDEN + k) // 2, 2) for s, k in sks])
+                        res = []
+                        for i in range_constexpr(len(sks)):
+                            a0, a1 = bf2_f32(vals[i][0])
+                            b0, b1 = bf2_f32(vals[i][1])
+                            res.append([a0, a1, b0, b1])
+                        return res
                     res = []
-                    for i in range_constexpr(len(sks)):
-                        a0, a1 = bf2_f32(vals[i][0])
-                        b0, b1 = bf2_f32(vals[i][1])
-                        res.append([a0, a1, b0, b1])
+                    for s, k in sks:
+                        w = fx.Vector(bo.buffer_load(r_h, (s * HIDDEN + k) // 2, vec_width=2, dtype=T.i32))
+                        v = w.bitcast(fx.BFloat16).to(fx.Float32)
+                        res.append([v[j] for j in range(4)])
                     return res
-                res = []
-                for s, k in sks:
-                    w = fx.Vector(bo.buffer_load(r_h, (s * HIDDEN + k) // 2, vec_width=2, dtype=T.i32))
-                    v = w.bitcast(fx.BFloat16).to(fx.Float32)
-                    res.append([v[j] for j in range(4)])
-                return res
 
-            # the (small) input loads go out before the weight stream: loads complete in order
-            h_ld = load_x_rmsnorm(ld_h, HIDDEN, g_in)
-            pre = [u_qa(c) for c in range(QA_BATCH)]
-            stage_x_rmsnorm(ld_h, HIDDEN, g_in, loaded=h_ld)
-            gpu.barrier()
-            stamp("qkv_a", t, 2)
-            acc = run_units(u_qa, QA_UPW, QA_BATCH, pre)
-            reduce_rows(QA_R, acc, emit_out(QA_ROWS))
-            stamp("qkv_a", t, 3)
-            gpu.barrier()
-            if tid < S * QA_ROWS:
-                s = tid // QA_ROWS
-                row = t * QA_ROWS + tid % QA_ROWS
-                v = lds_ld(outs, tid)
-                # Column ranges of the fused GEMV, in layout order. Must match
-                # reference.qkv_a_split(): the compressor's pair is C_COFF-wide, so
-                # this is not "one head_dim each" once CSA overlaps.
-                if row < Q_LORA:
-                    put(mb("q_a"), s * Q_LORA + row, v)
-                elif row < Q_LORA + HEAD_DIM:
-                    put(mb("kv_a"), s * HEAD_DIM + row - Q_LORA, v)
-                elif row < Q_LORA + HEAD_DIM + CW:
-                    put(mb("c_kv"), s * CW + row - Q_LORA - HEAD_DIM, v)
-                elif row < Q_LORA + HEAD_DIM + 2 * CW:
-                    put(mb("c_gate"), s * CW + row - Q_LORA - HEAD_DIM - CW, v)
-                elif row < Q_LORA + HEAD_DIM + 2 * CW + IW:
-                    put(mb("i_kv"), s * IW + row - Q_LORA - HEAD_DIM - 2 * CW, v)
-                else:
-                    put(mb("i_gate"), s * IW + row - Q_LORA - HEAD_DIM - 2 * CW - IW, v)
-            stamp("qkv_a", t, 4)
+                # the (small) input loads go out before the weight stream: loads complete in order
+                h_ld = load_x_rmsnorm(ld_h, HIDDEN, g_in)
+                pre = [u_qa(c) for c in range(QA_BATCH)]
+                stage_x_rmsnorm(ld_h, HIDDEN, g_in, loaded=h_ld)
+                gpu.barrier()
+                stamp(name, t, 2)
+                acc = run_units(u_qa, QA_UPW, QA_BATCH, pre)
+                reduce_rows(QA_R, acc, emit_out(QA_ROWS))
+                stamp(name, t, 3)
+                gpu.barrier()
+                if tid < S * QA_ROWS:
+                    s = tid // QA_ROWS
+                    row = row0 + t * QA_ROWS + tid % QA_ROWS
+                    v = lds_ld(outs, tid)
+                    # Column ranges of the fused GEMV, in layout order. Must match
+                    # reference.qkv_a_split(): the compressor's pair is C_COFF-wide, so
+                    # this is not "one head_dim each" once CSA overlaps.
+                    if row < Q_LORA:
+                        put(mb("q_a"), s * Q_LORA + row, v)
+                    elif row < Q_LORA + HEAD_DIM:
+                        put(mb("kv_a"), s * HEAD_DIM + row - Q_LORA, v)
+                    elif row < Q_LORA + HEAD_DIM + CW:
+                        put(mb("c_kv"), s * CW + row - Q_LORA - HEAD_DIM, v)
+                    elif row < Q_LORA + HEAD_DIM + 2 * CW:
+                        put(mb("c_gate"), s * CW + row - Q_LORA - HEAD_DIM - CW, v)
+                    elif row < Q_LORA + HEAD_DIM + 2 * CW + IW:
+                        put(mb("i_kv"), s * IW + row - Q_LORA - HEAD_DIM - 2 * CW, v)
+                    else:
+                        put(mb("i_gate"), s * IW + row - Q_LORA - HEAD_DIM - 2 * CW - IW, v)
+                stamp(name, t, 4)
+
+        qkv_stage("qkv_a", N_QKV_A, 0, False)
+        if const_expr(N_QKV_C):
+            qkv_stage("qkv_c", N_QKV_C, QKV_A_ROWS, True)
 
         def kv_quant(nv):
             """This thread's KV channel through the NoPE FP8 round trip, one 64-wide
@@ -4341,6 +4361,7 @@ def build_dsv4_kernel(
         hc_ffn_sb: Int64,
         w_qkv_a: Int64,
         s_qkv_a: Int64,
+        w_qkv_c: Int64,
         w_q_b: Int64,
         s_q_b: Int64,
         w_i_q_b: Int64,
@@ -4411,6 +4432,7 @@ def build_dsv4_kernel(
             hc_ffn_sb,
             w_qkv_a,
             s_qkv_a,
+            w_qkv_c,
             w_q_b,
             s_q_b,
             w_i_q_b,

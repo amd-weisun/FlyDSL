@@ -469,6 +469,7 @@ class Dsv4MoeLayer:
             p(self.hc_sb["ffn"]),
             p(t["w_qkv_a"]),
             p(t["s_qkv_a"]),
+            p(t["w_qkv_c"]) if "w_qkv_c" in t else 0,
             p(t["w_q_b"]),
             p(t["s_q_b"]),
             p(t["w_i_q_b"]) if "w_i_q_b" in t else 0,

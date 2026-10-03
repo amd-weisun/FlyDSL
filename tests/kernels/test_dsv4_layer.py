@@ -33,6 +33,7 @@ from kernels.dsv4_moe_layer.reference import (
     fp4_pool_rows,
     fp4_pool_store,
     fp4_row_bytes,
+    qkv_a_matrix,
     qkv_a_split,
     rmsnorm,
     unpack_fp4,
@@ -1091,7 +1092,7 @@ def test_dsv4_csa_compressor_in_kernel():
     ks = torch.zeros(cfg.c_rows, cfg.c_coff * cfg.head_dim, device=dev)
     ss = torch.full((cfg.c_rows, cfg.c_coff * cfg.head_dim), float("-inf"), device=dev)
     cache_r = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
-    dq = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+    dq = qkv_a_matrix(t)
     cut = qkv_a_split(cfg)
 
     emitted = 0
@@ -1168,7 +1169,7 @@ def test_dsv4_indexer_compressor_in_kernel(indexer_hadamard):
     i_ks = torch.zeros(cfg.c_rows, cfg.c_coff * ihd, device=dev)
     i_ss = torch.full((cfg.c_rows, cfg.c_coff * ihd), float("-inf"), device=dev)
     i_ref = torch.zeros(cfg.n_compressed, fp4_row_bytes(ihd), dtype=torch.uint8, device=dev)
-    dq = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+    dq = qkv_a_matrix(t)
     cut = qkv_a_split(cfg)
 
     emitted = 0
@@ -1243,7 +1244,7 @@ def test_dsv4_indexer_query_in_kernel(indexer_hadamard):
 
     cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
     kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
-    dq_qkv = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+    dq_qkv = qkv_a_matrix(t)
     dq_iqb = dequant(t["w_i_q_b"], t["s_i_q_b"], 128)
 
     for pos in range(3):
@@ -1312,7 +1313,7 @@ def test_dsv4_indexer_scoring_in_kernel(indexer_hadamard):
     i_ks = torch.zeros(cfg.c_rows, cfg.c_coff * ihd, device=dev)
     i_ss = torch.full((cfg.c_rows, cfg.c_coff * ihd), float("-inf"), device=dev)
     i_ref = torch.zeros(cfg.n_compressed, fp4_row_bytes(ihd), dtype=torch.uint8, device=dev)
-    dq_qkv = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+    dq_qkv = qkv_a_matrix(t)
     dq_iqb = dequant(t["w_i_q_b"], t["s_i_q_b"], 128)
     cut = qkv_a_split(cfg)
     scale = ihd**-0.5 * cfg.index_heads_total**-0.5
@@ -1391,7 +1392,7 @@ def _indexer_score_rank(rank, npes, port, results):
         layer = Dsv4MoeLayer(W, samples=1, rank=rank, npes=npes, moe_mode=mode, allow_unindexed_csa=True)
         cos, sin = rope_table(2048, theta=cfg.rope_base, device=dev)
         kv_k = torch.zeros(cfg.cache_rows, cfg.head_dim, dtype=torch.bfloat16, device=dev)
-        dq_qkv = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+        dq_qkv = qkv_a_matrix(t)
         dq_iqb = dequant(t["w_i_q_b"], t["s_i_q_b"], 128)
         scale = ihd**-0.5 * cfg.index_heads_total**-0.5
         gen = torch.Generator(device=dev).manual_seed(TP_SEED + 99)  # identical everywhere
@@ -1561,7 +1562,7 @@ def test_dsv4_indexer_topk_in_kernel():
     i_ks = torch.zeros(cfg.c_rows, cfg.c_coff * ihd, device=dev)
     i_ss = torch.full((cfg.c_rows, cfg.c_coff * ihd), float("-inf"), device=dev)
     i_ref = torch.zeros(cfg.n_compressed, fp4_row_bytes(ihd), dtype=torch.uint8, device=dev)
-    dq_qkv = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+    dq_qkv = qkv_a_matrix(t)
     cut = qkv_a_split(cfg)
 
     chose, discarded = 0, 0

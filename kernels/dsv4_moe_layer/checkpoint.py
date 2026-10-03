@@ -12,8 +12,8 @@ Most tensors map across unchanged -- FP8 E4M3 with E8M0 128x128 block scales, an
 routed experts' packed FP4 with E8M0 per-32 scales, are the kernel's own formats. Two
 are converted, and each conversion loses information the checkpoint has:
 
-- the compressors' ``wkv`` / ``wgate`` are BF16 in the checkpoint, and are requantized
-  to FP8 128x128 blocks here because the kernel fuses them into the ``qkv_a`` GEMV;
+- (no longer: the compressors' ``wkv`` / ``wgate`` stay BF16, as ATOM applies them,
+  in their own matrix ``w_qkv_c``; the kernel runs them as a BF16 stage beside qkv_a);
 The hyper-connection mixers (``hc_*_fn``) stay FP32; packing splits them into a bf16
 hi / lo pair, as ATOM's aiter mHC does, so they keep ~16 mantissa bits.
 
@@ -32,7 +32,6 @@ from safetensors import safe_open
 from kernels.dsv4_moe_layer.config import ExpertWeight, MoeMode, moe_format
 from kernels.dsv4_moe_layer.reference import LayerWeights, V4Config, fp8_mats
 
-FP8_MAX = 448.0
 
 
 def config_for_layer(path: str, layer: int, tp: int) -> V4Config:
@@ -100,15 +99,6 @@ def e8m0_float(s: torch.Tensor) -> torch.Tensor:
     return torch.exp2(s.view(torch.uint8).float() - 127.0)
 
 
-def fp8_block_quant(w: torch.Tensor, bk: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
-    """Float [rows, K] -> FP8 E4M3 plus one float32 scale per 128 x ``bk`` block (amax / 448)."""
-    rows, k = w.shape
-    b = w.float().reshape(rows // 128, 128, k // bk, bk)
-    s = (b.abs().amax(dim=(1, 3)) / FP8_MAX).clamp_min(torch.finfo(torch.float32).tiny)
-    q = (b / s[:, None, :, None]).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    return q.reshape(rows, k), s
-
-
 def load_layer(
     ck: Checkpoint,
     layer: int,
@@ -150,11 +140,10 @@ def load_layer(
         bf16_rows += [p + "attn.compressor.wkv.weight", p + "attn.compressor.wgate.weight"]
         if cfg.indexed:
             bf16_rows += [p + "attn.indexer.compressor.wkv.weight", p + "attn.indexer.compressor.wgate.weight"]
-    for name in bf16_rows:
-        q, s = fp8_block_quant(ck.get(name).to(device))
-        parts.append((q, s))
     t["w_qkv_a"] = torch.cat([q for q, _ in parts])
     t["s_qkv_a"] = torch.cat([s for _, s in parts])
+    if bf16_rows:  # the compressors' projections, at the checkpoint's own BF16
+        t["w_qkv_c"] = torch.cat([ck.get(name).to(device).to(torch.bfloat16) for name in bf16_rows])
 
     t["w_q_b"], t["s_q_b"] = fp8(p + "attn.wq_b", rows=shard(cfg.heads * cfg.head_dim))
     t["w_o_a"], t["s_o_a"] = fp8(p + "attn.wo_a", rows=shard(cfg.o_groups * cfg.o_lora))

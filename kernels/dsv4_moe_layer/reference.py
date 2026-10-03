@@ -254,13 +254,23 @@ def qkv_a_split(cfg: V4Config):
     return o
 
 
+def qkv_a_matrix(t: dict) -> torch.Tensor:
+    """The fused qkv_a GEMV's matrix, dequantized: the FP8 q_a | kv rows, then the
+    compressors' BF16 rows (``w_qkv_c``, in ``qkv_a_split``'s order) when the layer
+    compresses."""
+    w = dequant(t["w_qkv_a"], t["s_qkv_a"], 128)
+    return torch.cat([w, t["w_qkv_c"].float()]) if "w_qkv_c" in t else w
+
+
 def fp8_mats(cfg: V4Config):
     """(rows, K, BK) of every FP8 attention matrix in one rank's shard."""
     return {
         # wq_a, wkv and -- when the layer compresses -- the compressor's own wkv and
         # wgate all read the same normed input, so they fuse into one GEMV rather
         # than costing a second weight stream and another dependency
-        "qkv_a": (cfg.q_lora + cfg.head_dim + qkv_a_tail(cfg), cfg.hidden, 128),
+        # q_a and kv only: the compressors' rows are BF16 in the checkpoint and ATOM
+        # applies them so, so they are a separate matrix (w_qkv_c, qkv_a_matrix)
+        "qkv_a": (cfg.q_lora + cfg.head_dim, cfg.hidden, 128),
         "q_b": (cfg.heads * cfg.head_dim, cfg.q_lora, 128),
         **({"i_q_b": (cfg.index_heads * cfg.index_head_dim, cfg.q_lora, 128)} if cfg.indexed else {}),
         "o_a": (cfg.o_groups * cfg.o_lora, cfg.group_dim, 128),
@@ -326,6 +336,10 @@ def make_weights(
         # qkv_a is replicated (wkv is not TP-sharded in V4); the rest are shards
         gen = rep if name == "qkv_a" else shd
         t[f"w_{name}"], t[f"s_{name}"] = _rand_fp8(rows, k, bk, gen, device)
+    if qkv_a_tail(cfg):  # the compressors' projections: BF16, replicated
+        t["w_qkv_c"] = (
+            torch.randn(qkv_a_tail(cfg), cfg.hidden, generator=rep, device=device) / cfg.hidden**0.5
+        ).to(bfl)
 
     if cfg.compress_ratio:
         # The compressor runs in fp32, and is replicated: it consumes the same
@@ -920,7 +934,7 @@ def golden_layer(
     else:
         xin, post_a, comb_a = h, None, None
     x = bf(rmsnorm(xin, t["g_in"], cfg.eps))
-    qkv = x @ dq["qkv_a"].T
+    qkv = x @ qkv_a_matrix(t).T
     hd = cfg.head_dim
     # sliced by name: the compressor's projections are c_coff-wide, and CSA adds
     # the indexer's pair after them
