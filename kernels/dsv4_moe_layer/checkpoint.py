@@ -99,6 +99,15 @@ def e8m0_float(s: torch.Tensor) -> torch.Tensor:
     return torch.exp2(s.view(torch.uint8).float() - 127.0)
 
 
+def layer_prefix(path: str, layer: int) -> str:
+    """The checkpoint's name prefix for ``layer``: ``layers.N.`` for the main stack, and
+    ``mtp.M.`` for the MTP block(s) after it (layer num_hidden_layers + M -- ATOM's MTP
+    layer_id), whose names are otherwise a main layer's."""
+    with open(os.path.join(path, "config.json")) as f:
+        n = json.load(f)["num_hidden_layers"]
+    return f"layers.{layer}." if layer < n else f"mtp.{layer - n}."
+
+
 def load_layer(
     ck: Checkpoint,
     layer: int,
@@ -114,7 +123,7 @@ def load_layer(
     """
     cfg = config_for_layer(ck.path, layer, tp)
     cfg.validate()
-    p = f"layers.{layer}."
+    p = layer_prefix(ck.path, layer)
     t = {}
 
     def fp8(name, rows=None, cols=None):
