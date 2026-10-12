@@ -358,6 +358,17 @@ def unit_fp8mx(st, w_rsrc, s_rsrc, rg, s_rg, kc, K, b_word, coef=None, ln=None):
     return ("fp8mx", wv, (s, coef), b_word + (lane // 16) * 4)
 
 
+def unit_bf16_rows(st, w_rsrc, rg, kc, K, b_word, ln=None):
+    """Issue one 64-k chunk of row group ``rg`` of a row-major BF16 ``[N, K]`` matrix (ATOM's unshuffled
+    layout): lane ``16 * g + r`` reads K 64 kc + 16 g .. + 15 of row r (32 contiguous bytes), the activation
+    order of the ``fp8s`` units."""
+    lane = st.lane
+    ln = lane if ln is None else ln
+    base = ((rg * 16 + ln % 16) * K + kc * 64 + (ln // 16) * 16) // 2
+    wv = [fx.Vector(bo.buffer_load(w_rsrc, base + 4 * h, vec_width=4, dtype=T.i32)) for h in range(2)]
+    return ("bf16s", wv, None, b_word + (lane // 16) * 8)
+
+
 def unit_bf16(st, w_rsrc, rg, kc, NKC, b_word, ln=None):
     lane = st.lane
     ln = lane if ln is None else ln
@@ -482,7 +493,9 @@ def mma_units(st, acc, units):
                 a = fp8_to_bf16x8(wv[wh][ws * 2], wv[wh][ws * 2 + 1])
             else:
                 a = wv[sp].bitcast(fx.BFloat16)
-            b = fx.ptr_load(xs + (bw + sp * (4 if unit_format == "fp8s" else 16)), result_type=v4f).bitcast(fx.BFloat16)
+            b = fx.ptr_load(xs + (bw + sp * (4 if unit_format in ("fp8s", "bf16s") else 16)), result_type=v4f).bitcast(
+                fx.BFloat16
+            )
             c = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
         if const_expr(coef is None):
             acc = [acc[e] + c[e] for e in range(4)]
@@ -870,6 +883,7 @@ HELPERS = (
     unit_f8f8,
     unit_fp8mx,
     unit_bf16,
+    unit_bf16_rows,
     unit_mxfp4_atom,
     unit_mxfp4_rows,
     mma_units,

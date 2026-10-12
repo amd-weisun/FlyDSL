@@ -239,7 +239,8 @@ def golden_moe(W: LayerWeights, m: torch.Tensor, xq: torch.Tensor | None = None)
         prob.append(w)
     routed = bf(routed)
     gu = bf(mm(m, t["w_sh_ug"]))
-    sh = bf(mm(bf(F.silu(gu[:, : cfg.shared_inter]) * gu[:, cfg.shared_inter :]), t["w_sh_dn"]))
+    mid_sh = bf(F.silu(gu[:, : cfg.shared_inter]) * gu[:, cfg.shared_inter :])
+    sh = bf(mm(mid_sh, t["w_sh_dn"]))
     y = bf(bf(sh * bf(torch.sigmoid(sg))[:, None]) + routed)
     return dict(
         logits=logits,
@@ -249,6 +250,7 @@ def golden_moe(W: LayerWeights, m: torch.Tensor, xq: torch.Tensor | None = None)
         prob=torch.stack(prob),
         mid=torch.stack(mids).view(S, cfg.top_k, inter),
         routed=routed,
+        mid_sh=mid_sh,
         shared=sh,
         y_moe=y,
     )
