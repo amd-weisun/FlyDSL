@@ -146,8 +146,10 @@ class Qwen35MonoKernel:
             sl_out = sl_in if sl_out is None else sl_out
             if conv.dtype != torch.bfloat16 or tuple(conv.shape[1:]) != (cfg.conv_kernel - 1, cfg.conv_dim):
                 raise ValueError(f"conv_state must be bf16 [slots, {cfg.conv_kernel - 1}, {cfg.conv_dim}]")
-            if ssm.dtype != torch.bfloat16 or tuple(ssm.shape[1:]) != (cfg.hv, cfg.linear_v_dim, cfg.linear_k_dim):
-                raise ValueError(f"ssm_state must be bf16 [slots, {cfg.hv}, {cfg.linear_v_dim}, {cfg.linear_k_dim}]")
+            if ssm.dtype != torch.bfloat16 or tuple(ssm.shape[1:]) != (cfg.hv, cfg.linear_k_dim, cfg.linear_v_dim):
+                raise ValueError(
+                    f"ssm_state must be bf16 [slots, {cfg.hv}, {cfg.linear_k_dim}, {cfg.linear_v_dim}] (K-major, as ATOM)"
+                )
             i32("slots_in", sl_in, (S,))
             i32("slots_out", sl_out, (S,))
         if x_out is None:

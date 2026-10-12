@@ -5,6 +5,7 @@
 
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from kernels.common import buffer_ops as bo
 from kernels.monokernel.dsv4.kernel.common import sort_network
@@ -18,10 +19,12 @@ from kernels.monokernel.ops import (
     read_lane_i32,
     rsq,
     rsrc,
+    wave_max,
     wave_umax,
     write_lane_i32,
     xred,
 )
+from kernels.monokernel.qwen35.config import FP8_MAX
 from kernels.monokernel.qwen35.kernel.plan import MOE_MISC, TL_COLS
 
 
@@ -31,6 +34,17 @@ def silu(x):
 
 def sigmoid(x):
     return rcp(1.0 + exp(-x))
+
+
+def quant_floor(a0, a1):
+    """``helpers.quant_scaled`` with aiter's group-quant floor: the block max is at least 1e-10, so a
+    near-zero block gets a finite scale. -> (q0, q1, scale) of a 128-block held as 2 f32 per lane."""
+    amax = fx.max(wave_max(fx.max(fmath.absf(a0), fmath.absf(a1))), fx.Float32(1.0e-10))
+    qs = amax * (1.0 / FP8_MAX)
+    inv = rcp(amax) * FP8_MAX
+    q0 = fx.min(fx.max(a0 * inv, -FP8_MAX), FP8_MAX)
+    q1 = fx.min(fx.max(a1 * inv, -FP8_MAX), FP8_MAX)
+    return q0, q1, qs
 
 
 @traced

@@ -8,7 +8,8 @@ points follow what baseline ATOM stores between its kernels (bf16 projections, c
 and attention output). State layouts are ATOM's native ones:
 
 - conv state ``[slots, conv_kernel - 1, conv_dim]`` bf16, oldest row first;
-- recurrent state ``[slots, hv, v_dim, k_dim]`` bf16;
+- recurrent state ``[slots, hv, k_dim, v_dim]`` bf16 (ATOM's pool declares ``(hv, v, k)`` but its recurrence
+  indexes element ``(k, v)`` at ``k * v_dim + v``: K-major in memory);
 - full-attention K/V as a dequantized history ``[samples, max_seq, local_kv_heads, head_dim]`` fp32.
 """
 
@@ -20,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from kernels.monokernel.qwen35.config import FP8_MAX, Q35Config
-from kernels.monokernel.reference import _rand_fp8, bf, dequant, quant_dequant
+from kernels.monokernel.reference import _rand_fp8, bf, dequant
 
 
 @dataclass
@@ -107,6 +108,15 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return torch.cat([xr * cos[:, None] + rot * sin[:, None], xp], -1)
 
 
+def act_quant(x: torch.Tensor, block: int = 128) -> torch.Tensor:
+    """Per-``block`` dynamic FP8 E4M3 of the last dim, dequantized; the block max is floored at 1e-10 as
+    aiter's group quant does, so a near-zero block (a dead expert slice) never divides by ~0."""
+    xb = x.float().reshape(*x.shape[:-1], -1, block)
+    scale = xb.abs().amax(-1, keepdim=True).clamp_min(1e-10) / FP8_MAX
+    q = (xb / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).float()
+    return (q * scale).reshape(x.shape)
+
+
 def kv_quant_dequant(x: torch.Tensor) -> torch.Tensor:
     """Per-token-per-head FP8 E4M3 (``amax / 448`` scale) over the last dim, dequantized."""
     amax = x.float().abs().amax(-1, keepdim=True)
@@ -151,10 +161,10 @@ def golden_gdn(
         v = v.view(cfg.hv, -1)
         q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1.0e-6) * cfg.linear_k_dim**-0.5
         k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1.0e-6)
-        h = ssm_state[si].float() * torch.exp(g[s])[:, None, None]  # [hv, V, K]
-        delta = (v - torch.einsum("hvk,hk->hv", h, k)) * beta[s][:, None]
-        h = h + delta[:, :, None] * k[:, None, :]
-        core[s] = torch.einsum("hvk,hk->hv", h, q)
+        h = ssm_state[si].float() * torch.exp(g[s])[:, None, None]  # [hv, K, V]
+        delta = (v - torch.einsum("hkv,hk->hv", h, k)) * beta[s][:, None]
+        h = h + k[:, :, None] * delta[:, None, :]
+        core[s] = torch.einsum("hkv,hk->hv", h, q)
         ssm_state[so] = h.to(ssm_state.dtype)
     core = bf(core)
     # Qwen3_5MoeRMSNormGated: norm in fp32, to bf16, times the weight, times silu(z)
@@ -216,7 +226,7 @@ def golden_moe(W: LayerWeights, a: torch.Tensor, allreduce, xq: torch.Tensor | N
     x2 = bf(gemma_rmsnorm(a, t["g_post"], cfg.eps))
     logits = bf(x2 @ t["w_r"].float().T)
     shared_gate = torch.sigmoid(bf(x2 @ t["w_sg"].float().T))[:, 0]
-    xq_ref = quant_dequant(x2) if cfg.act_fp8 else x2
+    xq_ref = act_quant(x2) if cfg.act_fp8 else x2
     xq = xq_ref if xq is None else xq.float()
     inter = cfg.local_inter
     y = torch.zeros(S, cfg.hidden, device=a.device)
@@ -230,7 +240,7 @@ def golden_moe(W: LayerWeights, a: torch.Tensor, allreduce, xq: torch.Tensor | N
             ug = dequant(t["w_ug"][e], t["s_ug"][e], 128) @ xq[s]
             mid = F.silu(ug[:inter]) * ug[inter:]
             mids.append(mid)
-            mid = quant_dequant(mid) if cfg.act_fp8 else bf(mid)
+            mid = act_quant(mid) if cfg.act_fp8 else bf(mid)
             y[s] += wgt * (dequant(t["w_dn"][e], t["s_dn"][e], 128) @ mid)
         sel.append(torch.tensor(experts, device=a.device, dtype=torch.int32))
         prob.append(torch.tensor(weights, device=a.device))

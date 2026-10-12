@@ -22,7 +22,7 @@ from kernels.monokernel.ops import (
     uniform_f32,
     xshfl,
 )
-from kernels.monokernel.qwen35.kernel.common import sigmoid, silu
+from kernels.monokernel.qwen35.kernel.common import quant_floor, sigmoid, silu
 from kernels.monokernel.qwen35.kernel.plan import MOE_MISC, ROUTER_TILE, UG8, WAVES, router_spt
 
 
@@ -63,7 +63,6 @@ def ffn_stages(ctx):
     poll = ctx["poll"]
     put = ctx["put"]
     put2 = ctx["put2"]
-    quant_scaled = ctx["quant_scaled"]
     red = ctx["red"]
     reduce_rows = ctx["reduce_rows"]
     route_softmax = ctx["route_softmax"]
@@ -131,7 +130,7 @@ def ffn_stages(ctx):
                 a0, a1 = xa[s_l]
                 # the expert input is the bf16 normed activation, block-quantized to FP8
                 v0, v1 = bf16_round(a0 * rstds[s_l] * xg[0]), bf16_round(a1 * rstds[s_l] * xg[1])
-                q0, q1, qs = quant_scaled(v0, v1)
+                q0, q1, qs = quant_floor(v0, v1)
                 w8 = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)) & 0xFFFF
                 w8n = xshfl(w8, 1)
                 if lane % 2 == 0:  # FP8 bytes k .. k + 3 in one tagged word
@@ -332,7 +331,7 @@ def ffn_stages(ctx):
         for b in range_constexpr((DN_BLK + WAVES - 1) // WAVES):
             blk = wave + b * WAVES
             if blk < DN_BLK:
-                q0, q1, qs = quant_scaled(mids[b][0], mids[b][1])
+                q0, q1, qs = quant_floor(mids[b][0], mids[b][1])
                 st_f8(blk * 128 + lane * 2, q0, q1)
                 if lane == 0:
                     lds_st(misc, blk, qs * lds_ld(dnw, blk // (INTER // 128)))

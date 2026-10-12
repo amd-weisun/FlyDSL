@@ -44,7 +44,7 @@ def _states(cfg, n_slots, gen):
     conv = (0.5 * torch.randn(n_slots, cfg.conv_kernel - 1, cfg.conv_dim, generator=gen, device="cuda")).to(
         torch.bfloat16
     )
-    ssm = (0.1 * torch.randn(n_slots, cfg.hv, cfg.linear_v_dim, cfg.linear_k_dim, generator=gen, device="cuda")).to(
+    ssm = (0.1 * torch.randn(n_slots, cfg.hv, cfg.linear_k_dim, cfg.linear_v_dim, generator=gen, device="cuda")).to(
         torch.bfloat16
     )
     return conv, ssm
