@@ -463,8 +463,9 @@ def qsa_stages(ctx):
             # V rows of the tile -> vt [dim][key] (bf16): 8 dims per load
             for i in range_constexpr(KT * (HD // 8) // THREADS):
                 ch = tid + i * THREADS
-                kk2 = ch // (HD // 8)
-                dc = ch % (HD // 8)
+                # lanes take consecutive keys: each store instruction writes one vt row's 64 keys (no bank conflicts)
+                kk2 = ch % KT
+                dc = ch // KT
                 tk2, ok2 = key_token(lds_ld(ent, it * EPT + kk2 // RATIO), kk2 % RATIO, pos)
                 vrow = kv_row(s, ok2.select(tk2, fx.Int32(0)), kvh)
                 w4 = fx.Vector(bo.buffer_load(r_vc, (vrow + 8 * dc) // 2, vec_width=4, dtype=T.i32))
