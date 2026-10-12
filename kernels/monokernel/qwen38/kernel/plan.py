@@ -21,6 +21,9 @@ HC_KS = 512  # K of one hyper-connection down task (8 chunks of 64, inside one s
 HC_RB = 64  # rows of one hyper-connection reduce task
 OUT_TILE = 16  # out_proj rows per task
 SH_TILE = 16  # shared-expert intermediates per up/gate task
+KT = 64  # keys per attention tile (16 entries of 4 tokens)
+BS = 16  # tokens per KV-cache block (ATOM's kv_cache_block_size)
+QSA_TASKS = ("q", "kv", "iq", "rk")  # norm / RoPE / cache-write tasks per sample: heads, kv heads, index heads, key
 
 
 def hc_rows(dims: dict) -> int:
@@ -44,9 +47,29 @@ def gdn_dims(dims: dict) -> dict:
 
 
 def proj_rows(full: bool, dims: dict) -> int:
-    """Rows of the token mixer's input projection: GDN [q | k | v | z | b | a]."""
+    """Rows of the token mixer's input projection: GDN [q | k | v | z | b | a]; QSA [gate | q | k | v] then the
+    indexer's [q heads | key]."""
+    if full:
+        hd = dims["head_dim"]
+        return 2 * dims["heads"] * hd + 2 * dims["kv_heads"] * hd + (dims["index_heads"] + 1) * dims["index_dim"]
     g = gdn_dims(dims)
     return g["conv_dim"] + g["value_dim"] + 2 * dims["hv"]
+
+
+def qk_tasks(dims: dict) -> int:
+    """Norm / RoPE / cache tasks per sample: query heads, kv heads, index heads, the index key."""
+    return dims["heads"] + dims["kv_heads"] + dims["index_heads"] + 1
+
+
+def n_groups(dims: dict) -> int:
+    """Compressed index groups of the longest sequence."""
+    return dims["max_seq"] // dims["index_ratio"]
+
+
+def n_split(S: int, dims: dict) -> int:
+    """Attention splits per (sample, kv head): about one task per CTA, at most one per tile."""
+    max_tiles = -(-(dims["index_budget"] // dims["index_ratio"] + 1) // (KT // dims["index_ratio"]))
+    return max(1, min(max_tiles, 128 // (S * dims["kv_heads"])))
 
 
 def out_k(full: bool, dims: dict) -> int:
@@ -73,25 +96,55 @@ def layout(S: int, full: bool, **dims):
             (f"hrs_{side}", S * dims["hc"] * pr),  # per-stream rstd
             (f"m_{side}", S * H // 2 * pr),  # the sublayer input, bf16 pairs
         ]
-    g = gdn_dims(dims)
-    mixer = [
-        ("conv", S * g["conv_dim"] * pr),
-        ("z", S * g["value_dim"] * pr),
-        ("ba", S * 2 * dims["hv"] * pr),
-    ]
+    if full:
+        hd, nq, kvh, ih, idim = (
+            dims["head_dim"],
+            dims["heads"],
+            dims["kv_heads"],
+            dims["index_heads"],
+            dims["index_dim"],
+        )
+        ns = n_split(S, dims)
+        mixer = [
+            ("gate", S * nq * hd * pr),  # output gate logits (bf16 values)
+            ("qr", S * nq * hd * pr),  # raw query
+            ("kvr", S * 2 * kvh * hd * pr),  # raw k then v
+            ("iqr", S * ih * idim * pr),  # raw index query
+            ("rkr", S * idim * pr),  # raw index key
+            ("q", S * nq * hd * pr),  # normed, rotated query
+            ("kvnew", S * kvh * 2 * hd * pr),  # this token's K / V (bf16 values)
+            ("iq", S * ih * idim * pr),
+            ("cnew", S * idim * pr),  # the compressed key this token closes
+            ("isc", S * n_groups(dims) * pr),  # indexer scores
+            ("gsel", S * dims["index_budget"] // dims["index_ratio"] * pr),  # selected groups
+            ("gcnt", S * pr),
+            ("sp_acc", S * ns * nq * hd * pr),
+            ("sp_ml", S * ns * nq * 2 * pr),
+        ]
+    else:
+        g = gdn_dims(dims)
+        mixer = [
+            ("conv", S * g["conv_dim"] * pr),
+            ("z", S * g["value_dim"] * pr),
+            ("ba", S * 2 * dims["hv"] * pr),
+        ]
     slots = dims["top_k"]
-    items = hc + mixer + [
-        ("gated", S * out_k(full, dims) // 2 * pr),
-        ("x1", S * W4 // 2 * pr),  # the bundle after the mixer's combine, bf16 pairs
-        ("scores", S * router_rows(dims["n_experts"]) * pr),
-        ("xq", S * H // 4 * pr),
-        ("xqs", S * H // 128 * pr),
-        ("sel", S * slots * pr),
-        ("prob", S * slots * pr),
-        ("mid", S * slots * dims["inter"] * pr),
-        ("mid_sh", S * dims["shared_inter"] // 2 * pr),  # shared-expert SwiGLU, bf16 pairs
-        ("xqd", S * H * 4),  # debug: dequantized MoE input (plain f32), last: not scrubbed
-    ]
+    items = (
+        hc
+        + mixer
+        + [
+            ("gated", S * out_k(full, dims) // 2 * pr),
+            ("x1", S * W4 // 2 * pr),  # the bundle after the mixer's combine, bf16 pairs
+            ("scores", S * router_rows(dims["n_experts"]) * pr),
+            ("xq", S * H // 4 * pr),
+            ("xqs", S * H // 128 * pr),
+            ("sel", S * slots * pr),
+            ("prob", S * slots * pr),
+            ("mid", S * slots * dims["inter"] * pr),
+            ("mid_sh", S * dims["shared_inter"] // 2 * pr),  # shared-expert SwiGLU, bf16 pairs
+            ("xqd", S * H * 4),  # debug: dequantized MoE input (plain f32), last: not scrubbed
+        ]
+    )
     off, scratch = 0, {}
     for name, size in items:
         scratch[name] = off
@@ -112,10 +165,21 @@ def stage_tasks(S: int, full: bool, **dims):
             (f"hcu_{side}", H // 32),
         ]
 
-    mixer = [
-        ("proj", -(-proj_rows(full, dims) // (PROJ_TILE * PROJ_GROUPS))),
-        ("gdn", S * dims["hv"]),
-    ]
+    if full:
+        ns = n_split(S, dims)
+        mixer = [
+            ("proj", -(-proj_rows(full, dims) // (PROJ_TILE * PROJ_GROUPS))),
+            ("qk", S * qk_tasks(dims)),
+            ("i_score", S * -(-n_groups(dims) // THREADS)),
+            ("i_topk", S),
+            ("split", S * dims["kv_heads"] * ns),
+            ("merge", S * dims["heads"] * (dims["head_dim"] // 64)),
+        ]
+    else:
+        mixer = [
+            ("proj", -(-proj_rows(full, dims) // (PROJ_TILE * PROJ_GROUPS))),
+            ("gdn", S * dims["hv"]),
+        ]
     return (
         hc("a")
         + mixer

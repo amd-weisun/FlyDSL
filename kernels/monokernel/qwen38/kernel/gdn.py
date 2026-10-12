@@ -6,7 +6,7 @@ input ``m_a`` (causal conv fused), and the delta-rule recurrence on the fp32 sta
 gate), publishing ``gated`` for out_proj. The Qwen3.5 recurrence's thread mapping, at 48 v-heads per k-head x 3."""
 
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from kernels.common import buffer_ops as bo
@@ -29,9 +29,10 @@ def _sum8(v):
 
 
 @traced
-def proj_stage_rows(ctx, name, n_rows, w, src, epilogue):
-    """Stage ``name``: ``n_rows`` rows of the row-major BF16 matrix ``w`` [n_rows, hidden] times the bf16 mailbox
-    ``src`` [S, hidden], PROJ_GROUPS row groups per task; ``epilogue(s, row, value)`` per output."""
+def proj_stage_rows(ctx, name, mats, src, epilogue):
+    """Stage ``name``: the rows of row-major BF16 matrices ``mats`` = [(pointer, rows)] (one or two, read as one
+    row range; the first's rows a multiple of 16) times the bf16 mailbox ``src`` [S, hidden], PROJ_GROUPS row
+    groups per task; ``epilogue(s, row, value)`` per output."""
     G = ctx["G"]
     HIDDEN = ctx["HIDDEN"]
     S = ctx["S"]
@@ -51,16 +52,28 @@ def proj_stage_rows(ctx, name, n_rows, w, src, epilogue):
     UPW = NKC // WPR
     ROWS = PROJ_TILE * PROJ_GROUPS
     assert NKC % WPR == 0
-    r_w = bo.create_buffer_resource_from_addr(w, num_records_bytes=fx.Int32(n_rows * HIDDEN * 2))
+    n_rows = sum(r for _, r in mats)
+    rg0 = mats[0][1] // 16
+    assert mats[0][1] % 16 == 0 and len(mats) <= 2
     batch = max(1, NKC // WAVES)
     for t in range(start(name), -(-n_rows // ROWS), G):
         t = fx.Int32(t)
         stamp(name, t, 0)
         rg = t * PROJ_GROUPS + wave // WPR
+        if const_expr(len(mats) == 1):
+            r_w = bo.create_buffer_resource_from_addr(mats[0][0], num_records_bytes=fx.Int32(n_rows * HIDDEN * 2))
+            rg_w = rg
+        else:
+            first = rg < rg0
+            r_w = bo.create_buffer_resource_from_addr(
+                first.select(mats[0][0], mats[1][0]),
+                num_records_bytes=first.select(fx.Int32(mats[0][1] * HIDDEN * 2), fx.Int32(mats[1][1] * HIDDEN * 2)),
+            )
+            rg_w = first.select(rg, rg - rg0)
 
         def u(c):
             kc = (wave % WPR) * UPW + c
-            return unit_bf16_rows(r_w, rg, kc, HIDDEN, (n_sel() * HIDDEN + kc * 64) // 2)
+            return unit_bf16_rows(r_w, rg_w, kc, HIDDEN, (n_sel() * HIDDEN + kc * 64) // 2)
 
         pre = [u(c) for c in range(batch)]
         gpu.barrier()
@@ -138,7 +151,7 @@ def gdn_stages(ctx):
         else:
             put(mb("ba"), s * 2 * HV + row - CONV_DIM - VALUE_DIM, bf16_round(v))
 
-    proj_stage_rows(ctx, "proj", CONV_DIM + VALUE_DIM + 2 * HV, w_proj, "m_a", proj_epilogue)
+    proj_stage_rows(ctx, "proj", [(w_proj, CONV_DIM + VALUE_DIM + 2 * HV)], "m_a", proj_epilogue)
 
     # ================================ 2. gated delta rule + gated RMSNorm (one task per sample x v-head)
     assert K_DIM == KL * KPT and V_DIM == WAVES * (64 // KL) * VPT, "one 128 x 128 head over 512 threads"
@@ -164,10 +177,7 @@ def gdn_stages(ctx):
         ok = (si >= 0) & (so >= 0)
         # the state does not depend on this launch: issue its loads before waiting for the inputs
         r_in = rsrc(ssm_state + (fx.Int64(fx.max(si, 0)) * HV + fx.Int64(h)) * HEAD_BYTES)
-        sv = [
-            fx.Vector(bo.buffer_load(r_in, (k0_ + j) * V_DIM + v0_, vec_width=VPT, dtype=T.f32))
-            for j in range(KPT)
-        ]
+        sv = [fx.Vector(bo.buffer_load(r_in, (k0_ + j) * V_DIM + v0_, vec_width=VPT, dtype=T.f32)) for j in range(KPT)]
         alog = ld_f32(r_alog, h)
         dtb = ld_f32(r_dtb, h)
         if tid < K_DIM:

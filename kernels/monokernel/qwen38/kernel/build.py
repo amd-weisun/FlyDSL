@@ -22,6 +22,7 @@ import enum
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl.expr import const_expr
 from flydsl.expr.typing import Int32, Int64, T
 from kernels.common import buffer_ops as bo
 from kernels.monokernel.helpers import SHARED_SOURCE_KEY
@@ -33,7 +34,9 @@ from kernels.monokernel.qwen38.kernel.hc import hc_stages
 from kernels.monokernel.qwen38.kernel.out import out_stage
 from kernels.monokernel.qwen38.kernel.plan import (
     BLOCKS,
+    BS,
     HC_KS,
+    KT,
     LAYER_SLOTS,
     MOE_MISC,
     PROJ_GROUPS,
@@ -45,22 +48,26 @@ from kernels.monokernel.qwen38.kernel.plan import (
     hc_ksplit,
     hc_rows,
     layout,
+    n_groups,
+    n_split,
     out_k,
     router_rows,
     stage_tasks,
 )
+from kernels.monokernel.qwen38.kernel.qsa import qsa_stages
 
 ARGS = (
     "h_in x_out slots_in slots_out conv_state ssm_state "
+    "positions block_tables slot_mapping k_cache v_cache i_cache c_cache rope_cos rope_sin g_qn1 g_kn1 g_iq1 g_ik1 "
+    "w_qkv w_idx "
     "hca_g hca_down hca_up hca_inj hcm_g hcm_down hcm_up hcm_inj "
     "w_proj w_conv a_log dt_bias g_norm w_out w_r w_ug s_ug w_dn s_dn w_sh_ug w_sh_dn "
-    "scratch timeline_buf step"
+    "scratch timeline_buf step layer bt_stride"
 ).split()
 
 
 def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
-    """Return the ``@flyc.jit`` launcher for one whole layer (GDN; QSA to come)."""
-    assert not full, "the QSA layer is not built yet"
+    """Return the ``@flyc.jit`` launcher for one whole layer: QSA when ``full``, else Gated DeltaNet."""
     assert 1 <= S <= 8
     assert dims["k_dim"] == dims["v_dim"] == 128 and dims["hv"] % dims["hk"] == 0
     HIDDEN = dims["hidden"]
@@ -87,6 +94,16 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
     XQ_BLOCKS = HIDDEN // 128
     DN_TILE = dn_tile(S, HIDDEN)
     OUT_K = out_k(full, dims)
+    FULL = full
+    NQ, KVH, HD, ROPE = dims["heads"], dims["kv_heads"], dims["head_dim"], dims["rope_dim"]
+    IH, IHD, RATIO = dims["index_heads"], dims["index_dim"], dims["index_ratio"]
+    SEL = dims["index_budget"] // RATIO
+    MAXG = n_groups(dims)
+    NS = n_split(S, dims)
+    EPT = KT // RATIO
+    MAX_SPAN = -(-(-(-(SEL + 1) // EPT)) // NS)
+    if FULL:
+        assert NQ % KVH == 0 and BS % RATIO == 0 and IH * IHD <= THREADS
     W = 1
     G = BLOCKS
     SC = layout(S, full, **dims)
@@ -105,9 +122,10 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
         S * OUT_K // 2,
         S * TOP_K * INTER // 4 + S * SH_INTER // 2,
         2 * K_DIM + 2 * V_DIM + 2,
+        16 * KT + 32 + 2 * HD + 2,  # split: P | rescale | this token's K / V
         1024,
     )
-    ON = max(S * PROJ_TILE * PROJ_GROUPS, S * WAVES * 16, 2 * S * DN_TILE, V_DIM)
+    ON = max(S * PROJ_TILE * PROJ_GROUPS, S * WAVES * 16, 2 * S * DN_TILE, V_DIM, HD)
     MISC = max(MOE_MISC + S * XQ_BLOCKS, S * TOP_K * INTER // 128, KSPLIT) + 8
 
     @fx.struct
@@ -118,6 +136,10 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
         misc: fx.Array[fx.Float32, MISC, 16]
         keys: fx.Array[fx.Int32, S * TOP_K, 16]
         dnw: fx.Array[fx.Float32, S * TOP_K, 16]
+        kvt: fx.Array[fx.BFloat16, (16 * (HD + 8)) if FULL else 8, 16]  # the attention's query rows
+        vt: fx.Array[fx.BFloat16, (HD * (KT + 8)) if FULL else 8, 16]  # a tile's V, [dim][key]
+        ent: fx.Array[fx.Int32, (MAX_SPAN * EPT) if FULL else 8, 16]  # a split's selected groups
+        hist: fx.Array[fx.Int32, 264 if FULL else 8, 16]  # radix-select bins
 
     bc = dict(locals())
     bc.pop("dims")
@@ -133,6 +155,21 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
         slots_out: Int64,
         conv_state: Int64,
         ssm_state: Int64,
+        positions: Int64,
+        block_tables: Int64,
+        slot_mapping: Int64,
+        k_cache: Int64,
+        v_cache: Int64,
+        i_cache: Int64,
+        c_cache: Int64,
+        rope_cos: Int64,
+        rope_sin: Int64,
+        g_qn1: Int64,
+        g_kn1: Int64,
+        g_iq1: Int64,
+        g_ik1: Int64,
+        w_qkv: Int64,
+        w_idx: Int64,
         hca_g: Int64,
         hca_down: Int64,
         hca_up: Int64,
@@ -158,6 +195,7 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
         timeline_buf: Int64,
         step: Int64,
         layer: Int32,
+        bt_stride: Int32,
     ):
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
@@ -170,6 +208,10 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
         misc = lds.misc.ptr
         keys = lds.keys.ptr
         dnw = lds.dnw.ptr
+        kvt = lds.kvt.ptr
+        vt = lds.vt.ptr
+        ent = lds.ent.ptr
+        hist = lds.hist.ptr
         tag = uniform(bo.buffer_load(rsrc(step), 0, vec_width=1, dtype=T.i32)) * LAYER_SLOTS + layer + 1
         rank = fx.Int32(0)
         sym = fx.Int64(0)
@@ -181,7 +223,10 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
         ctx.update(common_defs(ctx))
         ctx["unit_bf16_rows"] = ctx["st"].unit_bf16_rows
         hc_stages(ctx, "a", False)
-        gdn_stages(ctx)
+        if const_expr(FULL):
+            qsa_stages(ctx)
+        else:
+            gdn_stages(ctx)
         out_stage(ctx)
         hc_stages(ctx, "m", True)
         ffn_stages(ctx)
@@ -194,6 +239,21 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
         slots_out: Int64,
         conv_state: Int64,
         ssm_state: Int64,
+        positions: Int64,
+        block_tables: Int64,
+        slot_mapping: Int64,
+        k_cache: Int64,
+        v_cache: Int64,
+        i_cache: Int64,
+        c_cache: Int64,
+        rope_cos: Int64,
+        rope_sin: Int64,
+        g_qn1: Int64,
+        g_kn1: Int64,
+        g_iq1: Int64,
+        g_ik1: Int64,
+        w_qkv: Int64,
+        w_idx: Int64,
         hca_g: Int64,
         hca_down: Int64,
         hca_up: Int64,
@@ -219,6 +279,7 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
         timeline_buf: Int64,
         step: Int64,
         layer: Int32,
+        bt_stride: Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
         qwen38_kernel(
@@ -228,6 +289,21 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
             slots_out,
             conv_state,
             ssm_state,
+            positions,
+            block_tables,
+            slot_mapping,
+            k_cache,
+            v_cache,
+            i_cache,
+            c_cache,
+            rope_cos,
+            rope_sin,
+            g_qn1,
+            g_kn1,
+            g_iq1,
+            g_ik1,
+            w_qkv,
+            w_idx,
             hca_g,
             hca_down,
             hca_up,
@@ -253,6 +329,7 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
             timeline_buf,
             step,
             layer,
+            bt_stride,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
     return flyc.compile[{"llvm_options": {"disable-vector-combine": True}}](launch_qwen38)

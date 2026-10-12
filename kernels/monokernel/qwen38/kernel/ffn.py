@@ -182,10 +182,12 @@ def ffn_stages(ctx):
 
         def ug8_units(w_rg, w_ln, s_rg, e, sample, live):
             rw = bo.create_buffer_resource_from_addr(
-                w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES), num_records_bytes=live.select(fx.Int32(UG_W_BYTES), fx.Int32(0))
+                w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES),
+                num_records_bytes=live.select(fx.Int32(UG_W_BYTES), fx.Int32(0)),
             )
             rs = bo.create_buffer_resource_from_addr(
-                s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES), num_records_bytes=live.select(fx.Int32(UG_S_BYTES), fx.Int32(0))
+                s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES),
+                num_records_bytes=live.select(fx.Int32(UG_S_BYTES), fx.Int32(0)),
             )
             sn = fx.Int32(sample)
             units = []
@@ -271,7 +273,6 @@ def ffn_stages(ctx):
     SH_NKC = SH_INTER // 64
     SH_UPW = -(-SH_NKC // DN_WPR)
     XSH = S * TOP_K * INTER // 4  # LDS word of the shared-expert activation (after the routed FP8 mids)
-    r_shdn = rsrc(w_sh_dn)
     NOUT = S * DN_TILE
     for t in range(start("down"), HIDDEN // DN_TILE, G):
         t = fx.Int32(t)

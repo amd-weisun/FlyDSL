@@ -11,15 +11,24 @@ import torch
 from kernels.monokernel.dsv4.kernel import build_advance_step
 from kernels.monokernel.packing import shuffle_fp8
 from kernels.monokernel.qwen38.kernel import build_qwen38_kernel
+from kernels.monokernel.qwen38.kernel.build import ARGS
 from kernels.monokernel.qwen38.kernel.plan import TL_COLS, layout, router_rows, stage_tasks
-from kernels.monokernel.qwen38.reference import LayerWeights
+from kernels.monokernel.qwen38.reference import LayerWeights, rope_cos_sin
 
 __all__ = ["Qwen38MonoKernel", "Qwen38Variant", "pack_layer_weights"]
 
 
-def shape_dims(cfg) -> dict:
-    """The shape arguments layout(), stage_tasks() and the builder must share identically."""
+def shape_dims(cfg, max_seq: int = 4096) -> dict:
+    """The shape arguments layout(), stage_tasks() and the builder must share identically; ``max_seq`` sizes
+    the indexer's score mailbox (the longest context a launch serves)."""
     return dict(
+        max_seq=max_seq,
+        kv_heads=cfg.kv_heads,
+        rope_dim=cfg.rope_dim,
+        index_heads=cfg.index_heads,
+        index_dim=cfg.index_dim,
+        index_budget=cfg.index_budget,
+        index_ratio=cfg.index_ratio,
         hidden=cfg.hidden,
         hc=cfg.hc,
         hc_lowrank=cfg.hc_lowrank,
@@ -49,21 +58,44 @@ def pack_layer_weights(W: LayerWeights) -> dict:
         for k in ("down", "up", "inj"):
             p[f"{hc}_{k}"] = t[f"{hc}_{k}"].contiguous()
     if W.full:
-        raise NotImplementedError("QSA layer")
+        H, hd = cfg.heads, cfg.head_dim
+        wq = t["w_q"].view(H, 2, hd, -1)  # per head [q | gate] in the checkpoint
+        p["w_qkv"] = torch.cat(
+            [wq[:, 1].reshape(H * hd, -1), wq[:, 0].reshape(H * hd, -1), t["w_k"], t["w_v"]]
+        ).contiguous()  # ATOM's qkv_proj: every head's gate, then every head's q
+        p["w_idx"] = t["w_idx"].contiguous()
+        p["w_out"] = t["w_o"].contiguous()
+        for k in ("g_qn", "g_kn", "g_iq", "g_ik"):
+            p[k + "1"] = (1.0 + t[k].float()).contiguous()
+        p.update(_moe(t))
+        return p
     p["w_proj"] = torch.cat([t["w_qkv"], t["w_z"], t["w_ba"]]).contiguous()
     p["w_conv"] = t["w_conv"].to(torch.bfloat16).contiguous()
     p["a_log"] = f32(t["a_log"])
     p["dt_bias"] = f32(t["dt_bias"])
     p["g_norm"] = f32(t["g_norm"])
     p["w_out"] = t["w_out"].contiguous()
-    p["w_r"] = torch.cat([t["w_r"], t["w_sg"]]).contiguous()
-    p["w_ug"] = shuffle_fp8(t["w_ug"])
-    p["s_ug"] = f32(t["s_ug"])
-    p["w_dn"] = shuffle_fp8(t["w_dn"])
-    p["s_dn"] = f32(t["s_dn"])
-    p["w_sh_ug"] = t["w_sh_ug"].contiguous()
-    p["w_sh_dn"] = t["w_sh_dn"].contiguous()
+    p.update(_moe(t))
     return p
+
+
+def _moe(t) -> dict:
+    return dict(
+        w_r=torch.cat([t["w_r"], t["w_sg"]]).contiguous(),
+        w_ug=shuffle_fp8(t["w_ug"]),
+        s_ug=t["s_ug"].float().contiguous(),
+        w_dn=shuffle_fp8(t["w_dn"]),
+        s_dn=t["s_dn"].float().contiguous(),
+        w_sh_ug=t["w_sh_ug"].contiguous(),
+        w_sh_dn=t["w_sh_dn"].contiguous(),
+    )
+
+
+def rope_tables(cfg, max_pos: int, device="cuda"):
+    """The kernel's RoPE tables: cos, sin f32 [max_pos, rope_dim / 2] of bf16-rounded values (ATOM's)."""
+    cos, sin = rope_cos_sin(torch.arange(max_pos, device=device), cfg)
+    half = cfg.rope_dim // 2
+    return cos[:, :half].contiguous(), sin[:, :half].contiguous()
 
 
 class Qwen38Variant:
@@ -74,9 +106,9 @@ class Qwen38Variant:
     _cache: dict = {}
     _adv_cache: dict = {}
 
-    def __init__(self, cfg, samples: int, full: bool, timeline=False):
+    def __init__(self, cfg, samples: int, full: bool, timeline=False, max_seq: int = 4096):
         self.cfg, self.S, self.full = cfg, samples, full
-        dims = shape_dims(cfg)
+        dims = shape_dims(cfg, max_seq)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.scr_layout = layout(samples, full, **dims)
         self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
@@ -102,53 +134,84 @@ class Qwen38MonoKernel:
     """One decoder layer: its weights (``packed``, ATOM's tensors in serving) on a ``Qwen38Variant``. State belongs
     to the caller: a GDN layer's conv / fp32 recurrent state with per-sample ``slots_in`` / ``slots_out``."""
 
-    def __init__(self, W: LayerWeights, samples: int, timeline=False, variant=None, packed=None):
+    def __init__(self, W: LayerWeights, samples: int, timeline=False, variant=None, packed=None, max_seq=4096):
         self.W, self.S, self.full = W, samples, W.full
         self.packed = pack_layer_weights(W) if packed is None else packed
         if variant is None:
-            variant = Qwen38Variant(W.cfg, samples, W.full, timeline)
+            variant = Qwen38Variant(W.cfg, samples, W.full, timeline, max_seq)
         elif (variant.S, variant.full) != (samples, W.full):
             raise ValueError("the variant was built for another sample count or layer kind")
         self.variant = variant
         self.scr_layout, self.scratch = variant.scr_layout, variant.scratch
         self.stages, self.timeline = variant.stages, variant.timeline
 
-    def forward(self, X, *, gdn_state, x_out=None, layer=0, advance=True):
+    def forward(self, X, *, gdn_state=None, kv=None, rope=None, x_out=None, layer=0, advance=True):
         """One layer on the bundle ``X`` [S, hc * hidden] bf16 -> the next bundle; updates the state in place.
-        ``gdn_state = (conv_state [slots, 3, conv_dim] bf16, ssm_state [slots, hv, k, v] fp32, slots_in,
-        slots_out)``."""
+
+        GDN: ``gdn_state = (conv_state [slots, 3, conv_dim] bf16, ssm_state [slots, hv, k, v] fp32, slots_in,
+        slots_out)``. QSA: ``kv = (k_cache, v_cache [blocks, 16, kv_heads, head_dim] bf16, index_cache
+        [blocks, 16, 1, index_dim] bf16, compressed_cache [blocks, 4, 1, index_dim] bf16, positions, block_tables,
+        slot_mapping)`` (ATOM's QSA pool) and ``rope`` = ``rope_tables(...)``."""
         cfg, S = self.W.cfg, self.S
         if tuple(X.shape) != (S, cfg.streams) or X.dtype != torch.bfloat16 or not X.is_contiguous():
             raise ValueError(f"X must be contiguous bfloat16 {(S, cfg.streams)}")
-        conv, ssm, sl_in, sl_out = gdn_state
-        sl_out = sl_in if sl_out is None else sl_out
-        if conv.dtype != torch.bfloat16 or tuple(conv.shape[1:]) != (cfg.conv_kernel - 1, cfg.conv_dim):
-            raise ValueError(f"conv_state must be bf16 [slots, {cfg.conv_kernel - 1}, {cfg.conv_dim}]")
-        if ssm.dtype != torch.float32 or tuple(ssm.shape[1:]) != (cfg.linear_v_heads, cfg.linear_k_dim, cfg.linear_v_dim):
-            raise ValueError("ssm_state must be fp32 [slots, hv, k_dim, v_dim] (K-major, as ATOM)")
-        for name, sl in (("slots_in", sl_in), ("slots_out", sl_out)):
-            if tuple(sl.shape) != (S,) or sl.dtype != torch.int32:
-                raise ValueError(f"{name} must be int32 [{S}]")
+
+        def i32(name, t, shape):
+            if tuple(t.shape[: len(shape)]) != shape or t.dtype != torch.int32 or t.stride(-1) != 1:
+                raise ValueError(f"{name} must be int32 {shape} with unit-stride rows")
+
         if x_out is None:
             x_out = torch.empty_like(X)
-        p, v = self.packed, self.variant
-        ptr = lambda x: x.data_ptr()  # noqa: E731
-        v.launch(
-            ptr(X),
-            ptr(x_out),
-            ptr(sl_in),
-            ptr(sl_out),
-            ptr(conv),
-            ptr(ssm),
-            *(ptr(p[f"{hc}_{k}"]) for hc in ("hca", "hcm") for k in ("g", "down", "up", "inj")),
-            *(ptr(p[k]) for k in ("w_proj", "w_conv", "a_log", "dt_bias", "g_norm", "w_out")),
-            *(ptr(p[k]) for k in ("w_r", "w_ug", "s_ug", "w_dn", "s_dn", "w_sh_ug", "w_sh_dn")),
-            ptr(v.scratch),
-            0 if v.timeline is None else ptr(v.timeline),
-            ptr(v.step),
-            layer,
-            stream=torch.cuda.current_stream(),
-        )
+        a = dict(h_in=X, x_out=x_out)
+        if self.full:
+            kc, vc, ic, cc, pos, bt, slots = kv
+            for name, t, shp in (
+                ("k_cache", kc, (16, cfg.kv_heads, cfg.head_dim)),
+                ("index_cache", ic, (16, 1, cfg.index_dim)),
+                ("compressed_cache", cc, (16 // cfg.index_ratio, 1, cfg.index_dim)),
+            ):
+                if t.dtype != torch.bfloat16 or tuple(t.shape[1:]) != shp or not t.is_contiguous():
+                    raise ValueError(f"{name} must be contiguous bf16 [blocks, {shp}] (ATOM's QSA pool)")
+            i32("positions", pos, (S,))
+            i32("slot_mapping", slots, (S,))
+            i32("block_tables", bt, (S,))
+            a.update(
+                positions=pos,
+                block_tables=bt,
+                slot_mapping=slots,
+                k_cache=kc,
+                v_cache=vc,
+                i_cache=ic,
+                c_cache=cc,
+                rope_cos=rope[0],
+                rope_sin=rope[1],
+                bt_stride=bt.stride(0),
+            )
+        else:
+            conv, ssm, sl_in, sl_out = gdn_state
+            sl_out = sl_in if sl_out is None else sl_out
+            if conv.dtype != torch.bfloat16 or tuple(conv.shape[1:]) != (cfg.conv_kernel - 1, cfg.conv_dim):
+                raise ValueError(f"conv_state must be bf16 [slots, {cfg.conv_kernel - 1}, {cfg.conv_dim}]")
+            if ssm.dtype != torch.float32 or tuple(ssm.shape[1:]) != (
+                cfg.linear_v_heads,
+                cfg.linear_k_dim,
+                cfg.linear_v_dim,
+            ):
+                raise ValueError("ssm_state must be fp32 [slots, hv, k_dim, v_dim] (K-major, as ATOM)")
+            i32("slots_in", sl_in, (S,))
+            i32("slots_out", sl_out, (S,))
+            a.update(slots_in=sl_in, slots_out=sl_out, conv_state=conv, ssm_state=ssm)
+        v = self.variant
+        a.update(self.packed)
+        a.update(scratch=v.scratch, timeline_buf=v.timeline, step=v.step, layer=layer)
+        args = []
+        for name in ARGS:
+            x = a.get(name)
+            if name in ("layer", "bt_stride"):
+                args.append(int(x or 0))
+            else:
+                args.append(0 if x is None else x.data_ptr())
+        v.launch(*args, stream=torch.cuda.current_stream())
         if advance:
             v.advance_step()
         return x_out
@@ -170,9 +233,21 @@ class Qwen38MonoKernel:
         return dict(
             m=self.debug("m_a", (S, cfg.hidden), bf2=True),
             r=self.debug("hr_a", (S, cfg.hc)),
-            conv=self.debug("conv", (S, cfg.conv_dim)),
-            z=self.debug("z", (S, cfg.value_dim)),
-            gated=self.debug("gated", (S, cfg.value_dim), bf2=True),
+            **(
+                dict(
+                    q=self.debug("q", (S, cfg.heads, cfg.head_dim)),
+                    iq=self.debug("iq", (S, cfg.index_heads, cfg.index_dim)),
+                    gsel=self.debug("gsel", (S, cfg.block_topk), torch.int32),
+                    gcnt=self.debug("gcnt", (S,), torch.int32),
+                    gated=self.debug("gated", (S, cfg.heads * cfg.head_dim), bf2=True),
+                )
+                if self.full
+                else dict(
+                    conv=self.debug("conv", (S, cfg.conv_dim)),
+                    z=self.debug("z", (S, cfg.value_dim)),
+                    gated=self.debug("gated", (S, cfg.value_dim), bf2=True),
+                )
+            ),
             x1=self.debug("x1", (S, cfg.streams), bf2=True),
             m2=self.debug("m_m", (S, cfg.hidden), bf2=True),
             r2=self.debug("hr_m", (S, cfg.hc)),
