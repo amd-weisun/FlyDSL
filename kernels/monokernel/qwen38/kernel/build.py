@@ -45,6 +45,7 @@ from kernels.monokernel.qwen38.kernel.plan import (
     WAVES,
     dn_tile,
     gdn_dims,
+    gdn_hpt,
     hc_ksplit,
     hc_rows,
     layout,
@@ -77,6 +78,7 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
     assert HIDDEN % HC_KS == 0 and LOWRANK % 64 == 0 and HIDDEN % 32 == 0
     HK, HV, K_DIM, V_DIM = dims["hk"], dims["hv"], dims["k_dim"], dims["v_dim"]
     VPK = HV // HK
+    GDN_HPT = gdn_hpt(S, HV)
     g = gdn_dims(dims)
     KEY_DIM, VALUE_DIM, CONV_DIM = g["key_dim"], g["value_dim"], g["conv_dim"]
     assert CONV_DIM % (PROJ_TILE * PROJ_GROUPS) == 0
@@ -121,11 +123,11 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
         S * HIDDEN // 2,
         S * OUT_K // 2,
         S * TOP_K * INTER // 4 + S * SH_INTER // 2,
-        2 * K_DIM + 2 * V_DIM + 2,
+        2 * (2 * K_DIM + 2 * V_DIM + 2),
         16 * KT + 32 + 2 * HD + 2,  # split: P | rescale | this token's K / V
         1024,
     )
-    ON = max(S * PROJ_TILE * PROJ_GROUPS, S * WAVES * 16, 2 * S * DN_TILE, V_DIM, HD)
+    ON = max(S * PROJ_TILE * PROJ_GROUPS, S * WAVES * 16, 2 * S * DN_TILE, 2 * V_DIM, HD)
     MISC = max(MOE_MISC + S * XQ_BLOCKS, S * TOP_K * INTER // 128, KSPLIT) + 8
 
     @fx.struct

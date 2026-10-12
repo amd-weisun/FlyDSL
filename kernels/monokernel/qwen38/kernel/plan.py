@@ -32,6 +32,11 @@ def dn_parts(S: int) -> int:
     return 1 if S < 4 else min(8, S)  # measured: S = 2 is neutral (the extra comb hop eats the gain)
 
 
+def gdn_hpt(S: int, hv: int) -> int:
+    """v-heads per recurrence task: two (256 threads each) when one per task would need more than one grid round."""
+    return 2 if S * hv > BLOCKS and hv % 2 == 0 else 1
+
+
 def hc_rows(dims: dict) -> int:
     """Rows of the down + inject GEMV (low rank, then the inject logits), padded to a 32-row task pair."""
     return -(-(dims["hc_lowrank"] + dims["hc"]) // 32) * 32
@@ -186,7 +191,7 @@ def stage_tasks(S: int, full: bool, **dims):
     else:
         mixer = [
             ("proj", -(-proj_rows(full, dims) // (PROJ_TILE * PROJ_GROUPS))),
-            ("gdn", S * dims["hv"]),
+            ("gdn", S * dims["hv"] // gdn_hpt(S, dims["hv"])),
         ]
     return (
         hc("a")
