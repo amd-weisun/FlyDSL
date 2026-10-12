@@ -24,7 +24,7 @@ from kernels.monokernel.ops import (
     xshfl,
 )
 from kernels.monokernel.qwen35.kernel.common import quant_floor, sigmoid, silu
-from kernels.monokernel.qwen38.kernel.plan import MOE_MISC, SH_TILE, UG8, WAVES
+from kernels.monokernel.qwen38.kernel.plan import MOE_MISC, SH_TILE, UG8, WAVES, dn_parts
 
 
 @traced
@@ -259,14 +259,17 @@ def ffn_stages(ctx):
     up_gate()
 
     # =============== expert down (routed W8A8 + shared BF16) + the MLP-side combine -> x_out
+    # S > 1: a row tile's (sample, slot) units split into DN_P parts, each task one part; part 0 also takes the
+    # shared expert. Parts publish partials and ``comb`` adds them and combines (S = 1: inline).
+    DN_P = dn_parts(S)
     DN_NKC = INTER // 64
     assert DN_TILE % 16 == 0 and HIDDEN % DN_TILE == 0
     DN_R = DN_TILE // 16
     DN_WPR = WAVES // DN_R
     DN_UNITS_PER_SLOT = INTER // 128
     DN_NU = S * TOP_K * DN_UNITS_PER_SLOT
-    DN_UPW = (DN_NU + DN_WPR - 1) // DN_WPR
-    DN_BLK = S * TOP_K * INTER // 128
+    DN_UP = -(-DN_NU // DN_P)  # units per part
+    DN_UPW = (DN_UP + DN_WPR - 1) // DN_WPR
     DN_W_BYTES = HIDDEN * INTER
     DN_S_BYTES = HIDDEN // 128 * (INTER // 128) * 4
     DN_BATCH = 9
@@ -274,26 +277,51 @@ def ffn_stages(ctx):
     SH_UPW = -(-SH_NKC // DN_WPR)
     XSH = S * TOP_K * INTER // 4  # LDS word of the shared-expert activation (after the routed FP8 mids)
     NOUT = S * DN_TILE
-    for t in range(start("down"), HIDDEN // DN_TILE, G):
-        t = fx.Int32(t)
-        stamp("down", t, 0)
+
+    def combine_rows(t, tile, routed_of, shared_of):
+        """Thread (sample n, stream st, row pair) of rows tile * t ..: y = bf16(bf16(shared) * bf16(sigmoid(gate)))
+        + bf16(routed), x_out = x1 + y * 2 sigmoid(r / hc)."""
+        if tid < S * HC * tile // 2:
+            n = tid // (HC * tile // 2)
+            st = (tid // (tile // 2)) % HC
+            rp = (tid % (tile // 2)) * 2
+            sg = bf16_round(sigmoid(getf(mb("scores"), n * ROUTER_ROWS + N_EXPERTS)))
+            r = poll([(mb("hr_m"), n * HC + st, 1)])[0][0].bitcast(fx.Float32)
+            inj = 2.0 * sigmoid(bf16_round(r * (1.0 / HC)))
+            idx = n * W4 + st * HIDDEN + t * tile + rp
+            xv = bf2_f32(poll([(mb("x1"), idx // 2, 1)])[0][0])
+            rv, sv = routed_of(n, rp), shared_of(n, rp)
+            outv = []
+            for e in range_constexpr(2):
+                y = bf16_round(bf16_round(bf16_round(sv[e]) * sg) + bf16_round(rv[e]))
+                outv.append(xv[e] + y * inj)
+            bo.buffer_store(bf16_pair(outv[0], outv[1]), rsrc(x_out), idx // 2)
+
+    for tt in range(start("down"), HIDDEN // DN_TILE * DN_P, G):
+        tt = fx.Int32(tt)
+        t = tt // DN_P
+        part = tt % DN_P
+        stamp("down", tt, 0)
         gpu.barrier()
         gu = wave // DN_WPR
         dn_rg = t * DN_TILE // 16
         dn_off = t * DN_TILE % 16
         dn_lr = gu * 16 + lane % 16 - dn_off
         dn_ln = ((dn_lr >= 0) & (dn_lr < DN_TILE)).select(lane, lane ^ 8)
+        u_lo = part * DN_UP
 
         def u_dn(cc):
-            qu = (wave % DN_WPR) * DN_UPW + cc
-            live = qu < DN_NU
-            r = fx.min(qu, DN_NU - 1)
+            ql = (wave % DN_WPR) * DN_UPW + cc
+            qu = u_lo + ql
+            live = (ql < DN_UP) & (qu < DN_NU)
+            # a dead unit reads a staged block of this part (another part's LDS is stale: 0 x NaN is NaN)
+            r = fx.min(u_lo + fx.min(ql, DN_UP - 1), DN_NU - 1)
             s_q = r // (TOP_K * DN_UNITS_PER_SLOT)
             slot_q = (r // DN_UNITS_PER_SLOT) % TOP_K
             kc = r % DN_UNITS_PER_SLOT
             q = (s_q * TOP_K + slot_q) * DN_UNITS_PER_SLOT + kc
             e = uniform(lds_ld(keys, s_q * TOP_K + slot_q))
-            masked = DN_NU % DN_WPR != 0
+            masked = (DN_UP % DN_WPR != 0) or (DN_NU % DN_P != 0)
             wb = bo.create_buffer_resource_from_addr(
                 w_dn + fx.Int64(e) * fx.Int64(DN_W_BYTES),
                 num_records_bytes=live.select(fx.Int32(DN_W_BYTES), fx.Int32(0)) if masked else None,
@@ -309,9 +337,9 @@ def ffn_stages(ctx):
             return unit_f8f8(wb, sb, dn_rg + gu, kc * 2, DN_NKC, INTER, q * 32, coef, dn_ln)
 
         def u_sh(cc):
-            # chunks past K read the last one against zero weights
+            # chunks past K (and every chunk outside part 0) read against zero weights
             kc_raw = (wave % DN_WPR) * SH_UPW + cc
-            ok = kc_raw < SH_NKC
+            ok = (kc_raw < SH_NKC) & (part == 0)
             kc = fx.min(kc_raw, SH_NKC - 1)
             rb = bo.create_buffer_resource_from_addr(
                 w_sh_dn, num_records_bytes=ok.select(fx.Int32(HIDDEN * SH_INTER * 2), fx.Int32(0))
@@ -320,17 +348,14 @@ def ffn_stages(ctx):
 
         pre = [u_dn(cc) for cc in range(min(DN_BATCH, DN_UPW))]
         pre_sh = [u_sh(cc) for cc in range(SH_UPW)]
-        hint_wait(0, None, mark=("down", t))
-        mids = get2_many(
-            [
-                (mb("mid"), fx.min(wave + b * WAVES, DN_BLK - 1) * 128 + lane * 2)
-                for b in range((DN_BLK + WAVES - 1) // WAVES)
-            ]
-        )
-        stamp("down", t, 2)
-        for b in range_constexpr((DN_BLK + WAVES - 1) // WAVES):
-            blk = wave + b * WAVES
-            if blk < DN_BLK:
+        hint_wait(0, None, mark=("down", tt))
+        # this part's mid blocks (block q = unit q: 128 intermediates of one (sample, slot))
+        NB = (DN_UP + WAVES - 1) // WAVES
+        mids = get2_many([(mb("mid"), fx.min(u_lo + wave + b * WAVES, DN_NU - 1) * 128 + lane * 2) for b in range(NB)])
+        stamp("down", tt, 2)
+        for b in range_constexpr(NB):
+            blk = u_lo + wave + b * WAVES
+            if (wave + b * WAVES < DN_UP) & (blk < DN_NU):
                 q0, q1, qs = quant_floor(mids[b][0], mids[b][1])
                 st_f8(blk * 128 + lane * 2, q0, q1, natural=True)
                 if lane == 0:
@@ -356,25 +381,52 @@ def ffn_stages(ctx):
         reduce_rows(DN_R, acc, emit_dn(0))
         gpu.barrier()
         reduce_rows(DN_R, acc_sh, emit_dn(NOUT))
-        stamp("down", t, 3)
+        stamp("down", tt, 3)
         gpu.barrier()
-        # thread (sample n, stream st, row pair): y = bf16(bf16(shared) * bf16(sigmoid(gate))) + bf16(routed)
-        if tid < S * HC * DN_TILE // 2:
-            n = tid // (HC * DN_TILE // 2)
-            st = (tid // (DN_TILE // 2)) % HC
-            rp = (tid % (DN_TILE // 2)) * 2
-            sg = bf16_round(sigmoid(getf(mb("scores"), n * ROUTER_ROWS + N_EXPERTS)))
-            r = poll([(mb("hr_m"), n * HC + st, 1)])[0][0].bitcast(fx.Float32)
-            inj = 2.0 * sigmoid(bf16_round(r * (1.0 / HC)))
-            idx = n * W4 + st * HIDDEN + t * DN_TILE + rp
-            xv = bf2_f32(poll([(mb("x1"), idx // 2, 1)])[0][0])
-            outv = []
-            for e in range_constexpr(2):
-                routed = bf16_round(lds_ld(outs, n * DN_TILE + rp + e))
-                shared = bf16_round(lds_ld(outs, NOUT + n * DN_TILE + rp + e))
-                y = bf16_round(bf16_round(shared * sg) + routed)
-                outv.append(xv[e] + y * inj)
-            bo.buffer_store(bf16_pair(outv[0], outv[1]), rsrc(x_out), idx // 2)
+        if const_expr(DN_P == 1):
+            combine_rows(
+                t,
+                DN_TILE,
+                lambda n, rp: [lds_ld(outs, n * DN_TILE + rp + e) for e in range(2)],
+                lambda n, rp: [lds_ld(outs, NOUT + n * DN_TILE + rp + e) for e in range(2)],
+            )
+        else:
+            if tid < S * DN_TILE // 2:
+                n = tid // (DN_TILE // 2)
+                rp = (tid % (DN_TILE // 2)) * 2
+                row = t * DN_TILE + rp
+                put2(
+                    mb("dnp"),
+                    (part * S + n) * HIDDEN + row,
+                    lds_ld(outs, n * DN_TILE + rp),
+                    lds_ld(outs, n * DN_TILE + rp + 1),
+                )
+                if part == 0:
+                    put2(
+                        mb("dnsh"),
+                        n * HIDDEN + row,
+                        lds_ld(outs, NOUT + n * DN_TILE + rp),
+                        lds_ld(outs, NOUT + n * DN_TILE + rp + 1),
+                    )
         gpu.barrier()
-        stamp("down", t, 4)
+        stamp("down", tt, 4)
+
+    if const_expr(DN_P > 1):
+        CT = 16
+        for t in range(start("comb"), HIDDEN // CT, G):
+            t = fx.Int32(t)
+            stamp("comb", t, 0)
+
+            def routed_of(n, rp):
+                parts = get2_many([(mb("dnp"), (pp * S + n) * HIDDEN + t * CT + rp) for pp in range(DN_P)])
+                tot = [fx.Float32(0.0), fx.Float32(0.0)]
+                for pp in range_constexpr(DN_P):
+                    tot = [tot[0] + parts[pp][0], tot[1] + parts[pp][1]]
+                return tot
+
+            def shared_of(n, rp):
+                return list(get2_many([(mb("dnsh"), n * HIDDEN + t * CT + rp)])[0])
+
+            combine_rows(t, CT, routed_of, shared_of)
+            stamp("comb", t, 4)
     return {}

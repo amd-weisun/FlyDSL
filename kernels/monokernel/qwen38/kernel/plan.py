@@ -26,6 +26,12 @@ BS = 16  # tokens per KV-cache block (ATOM's kv_cache_block_size)
 QSA_TASKS = ("q", "kv", "iq", "rk")  # norm / RoPE / cache-write tasks per sample: heads, kv heads, index heads, key
 
 
+def dn_parts(S: int) -> int:
+    """Parts the expert-down units of a row tile split into (each publishes a partial, ``comb`` adds them): enough
+    tasks to keep every CTA streaming expert rows at S > 1."""
+    return 1 if S < 4 else min(8, S)  # measured: S = 2 is neutral (the extra comb hop eats the gain)
+
+
 def hc_rows(dims: dict) -> int:
     """Rows of the down + inject GEMV (low rank, then the inject logits), padded to a 32-row task pair."""
     return -(-(dims["hc_lowrank"] + dims["hc"]) // 32) * 32
@@ -142,6 +148,8 @@ def layout(S: int, full: bool, **dims):
             ("prob", S * slots * pr),
             ("mid", S * slots * dims["inter"] * pr),
             ("mid_sh", S * dims["shared_inter"] // 2 * pr),  # shared-expert SwiGLU, bf16 pairs
+            ("dnp", dn_parts(S) * S * H * pr),  # routed expert-down partials per part (S > 1)
+            ("dnsh", S * H * pr),  # shared-expert down (S > 1)
             ("xqd", S * H * 4),  # debug: dequantized MoE input (plain f32), last: not scrubbed
         ]
     )
@@ -189,6 +197,7 @@ def stage_tasks(S: int, full: bool, **dims):
             ("router", router_rows(dims["n_experts"]) // 16),
             ("sh_ug", dims["shared_inter"] // SH_TILE),
             ("ug", S * dims["top_k"] * (dims["inter"] // UG8)),
-            ("down", H // dn_tile(S, H)),
+            ("down", H // dn_tile(S, H) * dn_parts(S)),
         ]
+        + ([("comb", H // 16)] if dn_parts(S) > 1 else [])
     )

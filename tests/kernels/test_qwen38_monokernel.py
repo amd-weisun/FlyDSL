@@ -14,6 +14,7 @@ import torch
 
 from flydsl.runtime.device import get_rocm_arch
 from kernels.monokernel.qwen38.config import Q38Config
+from kernels.monokernel.qwen38.kernel.plan import dn_parts
 from kernels.monokernel.qwen38.op import Qwen38MonoKernel, rope_tables
 from kernels.monokernel.qwen38.reference import (
     apply_rope,
@@ -92,8 +93,11 @@ def test_qwen38_gdn_layer_matches_golden(S):
             errs["mid_sh"] = _rel(got["mid_sh"], own["mid_sh"])
             # in units of the bf16 storage floor (<= 1: the increment is exact to storage); budget 2
             errs["x_out_vs_floor"] = 1e-2 * _combine_err(out, got["x1"], own["y_moe"], got["r2"], cfg.hc)
+            if dn_parts(S) > 1:  # the split expert down: its partials must add up per sample
+                routed = layer.debug("dnp", (dn_parts(S), S, cfg.hidden)).sum(0)
+                errs["routed_worst_sample"] = max(_rel(routed[s], own["routed"][s]) for s in range(S))
         print(f"S={S} step {step}", {k: f"{v:.2e}" for k, v in errs.items()})
-        bad = {k: v for k, v in errs.items() if v > 2e-2}
+        bad = {k: v for k, v in errs.items() if not v <= 2e-2}  # NaN fails too
         assert not bad, f"step {step}: {bad} (all: {errs})"
 
 
@@ -189,5 +193,5 @@ def test_qwen38_qsa_layer_matches_golden(S):
             # in units of the bf16 storage floor (<= 1: the increment is exact to storage); budget 2
             errs["x_out_vs_floor"] = 1e-2 * _combine_err(out, got["x1"], own["y_moe"], got["r2"], cfg.hc)
         print(f"QSA S={S} step {step} pos {pos.tolist()}", {k: f"{v:.2e}" for k, v in errs.items()})
-        bad = {k: v for k, v in errs.items() if v > 2e-2}
+        bad = {k: v for k, v in errs.items() if not v <= 2e-2}  # NaN fails too
         assert not bad, f"step {step}: {bad} (all: {errs})"
