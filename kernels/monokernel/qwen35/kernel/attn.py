@@ -247,31 +247,49 @@ def attn_stages(ctx):
         a5 = fx.Float32(0.0)
         a6 = fx.Float32(0.0)
         a7 = fx.Float32(0.0)
-        for it in range(0, ntile):
-            kb = k0 + it * KT
-            blk0 = kb // BS
-            # S^T partial: keys of row group WRG (= block blk0 + WRG) x heads, half WKH of the head dim
-            kblk = uniform(bo.buffer_load(r_bt, s * bt_stride + fx.min(blk0 + WRG, last_blk), vec_width=1, dtype=T.i32))
-            kbase = kblk * (HD * BS)
-            c4 = v4z
+        def tile_loads(kb_):
+            """A tile's K fragments (this wave's row group and head-dim half), V fragments (dims 16 n + lane
+            % 16, keys 32 ks + 8 g4 ..) and the lane's key scales: issued a tile ahead (blocks past the
+            context clamp to the last one; those keys are masked)."""
+            b0 = kb_ // BS
+            kblk = uniform(bo.buffer_load(r_bt, s * bt_stride + fx.min(b0 + WRG, last_blk), vec_width=1, dtype=T.i32))
+            kw = []
             for c in range_constexpr(KSTEPS):
                 ks = WKH * KSTEPS + c
-                off = kbase + ((2 * ks + g4 // 2) * BS + lane % 16) * 16 + 8 * (g4 % 2)
+                off = kblk * (HD * BS) + ((2 * ks + g4 // 2) * BS + lane % 16) * 16 + 8 * (g4 % 2)
                 w2 = fx.Vector(bo.buffer_load(r_kc, off // 4, vec_width=2, dtype=T.i32))
-                c4 = mfma(fp8_to_bf16x8(w2[0], w2[1]), qb[c], c4)
-            fx.ptr_store(c4, red + (wave * 64 + lane) * 4)
-            # this lane's V fragments: dims 16 n + lane % 16, keys 32 ks + 8 g4 .. + 7 (masked keys' bytes 0)
-            vfr = []
+                kw += [w2[0], w2[1]]
+            vw = []
             for n in range_constexpr(NG):
                 for ks in range_constexpr(2):
-                    kfirst = kb + 32 * ks + 8 * g4
-                    vblk = ld_block(s, fx.min(blk0 + 2 * ks + g4 // 2, last_blk))
+                    vblk = ld_block(s, fx.min(b0 + 2 * ks + g4 // 2, last_blk))
                     dim = (wave * NG + n) * 16 + lane % 16
                     w2 = fx.Vector(
                         bo.buffer_load(
                             r_vc, (vblk * (HD * BS) + dim * 16 + 8 * (g4 % 2)) // 4, vec_width=2, dtype=T.i32
                         )
                     )
+                    vw += [w2[0], w2[1]]
+            sblk = ld_block(s, fx.min(b0 + lane // 16, last_blk))
+            return kw + vw + [ld_f32(r_ks, sblk * BS + lane % 16), ld_f32(r_vs, sblk * BS + lane % 16)]
+
+        # the next tile's fragments, carried as named scalars (the loop rewriter carries names, not lists)
+        f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17 = tile_loads(k0)
+        for it in range(0, ntile):
+            kb = k0 + it * KT
+            cur = [f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15]
+            ksc, vsc = f16, f17
+            # S^T partial: keys of row group WRG (= block kb / BS + WRG) x heads, half WKH of the head dim
+            c4 = v4z
+            for c in range_constexpr(KSTEPS):
+                c4 = mfma(fp8_to_bf16x8(cur[2 * c], cur[2 * c + 1]), qb[c], c4)
+            fx.ptr_store(c4, red + (wave * 64 + lane) * 4)
+            f0, f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, f17 = tile_loads(kb + KT)
+            # this lane's V fragments (masked keys' bytes 0)
+            vfr = []
+            for n in range_constexpr(NG):
+                for ks in range_constexpr(2):
+                    kfirst = kb + 32 * ks + 8 * g4
                     words = []
                     for half in range_constexpr(2):
                         mask = fx.Int32(0)
@@ -279,7 +297,7 @@ def attn_stages(ctx):
                             key = kfirst + half * 4 + j
                             ok = (key < k1) & (key < pos0)
                             mask = mask | ok.select(fx.Int32(0xFF << (8 * j) if j < 3 else -(1 << 24)), fx.Int32(0))
-                        words.append(w2[half] & mask)
+                        words.append(cur[2 * KSTEPS + (n * 2 + ks) * 2 + half] & mask)
                     vfr.append(fp8_to_bf16x8(words[0], words[1]))
             gpu.barrier()
             # softmax over the tile: wave = head, lane = key
@@ -288,9 +306,6 @@ def attn_stages(ctx):
             dot = lds_ld(red, (lane // 16) * 256 + src) + lds_ld(red, (lane // 16 + 4) * 256 + src)
             key_abs = kb + lane
             ok = (key_abs < k1) & (key_abs < pos0)
-            sblk = ld_block(s, fx.min(blk0 + lane // 16, last_blk))
-            ksc = ld_f32(r_ks, sblk * BS + kk)
-            vsc = ld_f32(r_vs, sblk * BS + kk)
             sc_ = ok.select(dot * ksc * SCALE, fx.Float32(NEG))
             m_new = fx.max(m, wave_max(sc_))
             p = exp(sc_ - m_new)

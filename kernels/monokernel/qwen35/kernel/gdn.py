@@ -14,14 +14,15 @@ from kernels.monokernel.ops import bf16_round, exp, ld_bf16, ld_f32, lds_ld, lds
 from kernels.monokernel.qwen35.kernel.common import sigmoid, silu
 from kernels.monokernel.qwen35.kernel.plan import PROJ_GROUPS, PROJ_TILE, WAVES
 
-# recurrence thread mapping over ATOM's K-major state [K][V]: lane % 16 takes 8 consecutive k, the
-# 16-lane row and the wave take 4 consecutive v (one 8-byte vector per k); k-reductions span the 16 lanes
-KPT = 8  # k per thread
-VPT = 4  # v per thread
+# recurrence thread mapping over ATOM's K-major state [K][V]: lane % 8 takes 16 consecutive k, lane // 8
+# and the wave take 2 consecutive v (one 4-byte vector per k); k-reductions span 8 lanes (3 DPP levels)
+KPT = 16  # k per thread
+VPT = 2  # v per thread
+KL = 8  # lanes sharing a v pair (over k)
 
 
-def _sum16(v):
-    for off in (1, 2, 4, 8):
+def _sum8(v):
+    for off in (1, 2, 4):
         v = v + xshfl(v, off)
     return v
 
@@ -129,13 +130,14 @@ def gdn_stages(ctx):
     )
 
     # ================================ 2. gated delta rule + gated RMSNorm (one task per sample x v-head)
-    assert K_DIM == 16 * KPT and V_DIM == WAVES * 4 * VPT, "one 128 x 128 head over 512 threads"
+    assert K_DIM == KL * KPT and V_DIM == WAVES * (64 // KL) * VPT, "one 128 x 128 head over 512 threads"
     HEAD_BYTES = V_DIM * K_DIM * 2
-    kg = lane % 16
+    kg = lane % KL
     k0_ = kg * KPT
-    v0_ = (wave * 4 + lane // 16) * VPT
+    v0_ = (wave * (64 // KL) + lane // KL) * VPT
     r_alog, r_dtb, r_gn = rsrc(a_log), rsrc(dt_bias), rsrc(g_norm)
     v4f = fx.Vector.make_type(4, fx.Float32)
+    vvf = fx.Vector.make_type(VPT, fx.Float32)
     # LDS (f32 words of xs): q 0, k K_DIM, v 2*K_DIM, z 2*K_DIM + V_DIM, b / a after
     XQ, XK, XV = 0, K_DIM, 2 * K_DIM
     XZ = XV + V_DIM
@@ -192,9 +194,9 @@ def gdn_stages(ctx):
             x_sp = a_in + dtb
             softplus = (x_sp > 20.0).select(x_sp, fmath.log1p(exp(x_sp)))
             decay = exp(-exp(alog) * softplus)
-            # this thread's 8 q / k (L2-normalized over the head: sums over the 16 lanes)
-            qx = [fx.Vector(fx.ptr_load(xs + (XQ + k0_ + 4 * i), result_type=v4f)) for i in range(2)]
-            kx = [fx.Vector(fx.ptr_load(xs + (XK + k0_ + 4 * i), result_type=v4f)) for i in range(2)]
+            # this thread's KPT q / k (L2-normalized over the head: sums over the KL lanes)
+            qx = [fx.Vector(fx.ptr_load(xs + (XQ + k0_ + 4 * i), result_type=v4f)) for i in range(KPT // 4)]
+            kx = [fx.Vector(fx.ptr_load(xs + (XK + k0_ + 4 * i), result_type=v4f)) for i in range(KPT // 4)]
             qq = [qx[j // 4][j % 4] for j in range(KPT)]
             kk = [kx[j // 4][j % 4] for j in range(KPT)]
             qsq = fx.Float32(0.0)
@@ -204,12 +206,12 @@ def gdn_stages(ctx):
                 qsq = qsq + qq[j] * qq[j]
                 ksq = ksq + kk[j] * kk[j]
                 kq = kq + kk[j] * qq[j]
-            q_scale = rsq(_sum16(qsq) + 1.0e-6) * (K_DIM**-0.5)
-            k_scale = rsq(_sum16(ksq) + 1.0e-6)
+            q_scale = rsq(_sum8(qsq) + 1.0e-6) * (K_DIM**-0.5)
+            k_scale = rsq(_sum8(ksq) + 1.0e-6)
             qq = [x * q_scale for x in qq]
             kk = [x * k_scale for x in kk]
-            dot_kq = _sum16(kq) * q_scale * k_scale
-            # decay, S^T k and S^T q over this thread's k (4 v at once), summed over the 16 lanes
+            dot_kq = _sum8(kq) * q_scale * k_scale
+            # decay, S^T k and S^T q over this thread's k (VPT v at once), summed over the KL lanes
             dvec = fx.Vector.filled(VPT, decay, fx.Float32)
             skp = fx.Vector.filled(VPT, 0.0, fx.Float32)
             sqp = fx.Vector.filled(VPT, 0.0, fx.Float32)
@@ -217,18 +219,14 @@ def gdn_stages(ctx):
                 sv[j] = sv[j] * dvec
                 skp = fx.math.fma(sv[j], fx.Vector.filled(VPT, kk[j], fx.Float32), skp)
                 sqp = fx.math.fma(sv[j], fx.Vector.filled(VPT, qq[j], fx.Float32), sqp)
-            vin = fx.Vector(fx.ptr_load(xs + (XV + v0_), result_type=v4f))
-            delta = [(vin[e] - _sum16(skp[e])) * beta for e in range(VPT)]
+            vin = fx.Vector(fx.ptr_load(xs + (XV + v0_), result_type=vvf))
+            delta = [(vin[e] - _sum8(skp[e])) * beta for e in range(VPT)]
             dv = fx.Vector.from_elements(delta, fx.Float32)
             for j in range_constexpr(KPT):
                 sv[j] = fx.math.fma(fx.Vector.filled(VPT, kk[j], fx.Float32), dv, sv[j])
-            outs_v = [bf16_round(_sum16(sqp[e]) + delta[e] * dot_kq) for e in range(VPT)]
-            if ok:
-                r_o = rsrc(ssm_state + (fx.Int64(so) * HV + fx.Int64(h)) * HEAD_BYTES)
-                for j in range_constexpr(KPT):
-                    bo.buffer_store(sv[j].to(fx.BFloat16), r_o, (k0_ + j) * V_DIM + v0_)
+            outs_v = [bf16_round(_sum8(sqp[e]) + delta[e] * dot_kq) for e in range(VPT)]
             stamp("gdn", tt, 3)
-            # gated RMSNorm over the head's V_DIM outputs (lane kg 0 of each row holds its 4 once)
+            # gated RMSNorm over the head's V_DIM outputs (lane kg 0 of each group holds its VPT once)
             ssq = fx.Float32(0.0)
             for e in range_constexpr(VPT):
                 ssq = ssq + outs_v[e] * outs_v[e]
@@ -242,6 +240,11 @@ def gdn_stages(ctx):
             gpu.barrier()
             if tid < V_DIM // 2:
                 put_bf(mb("gated"), s * VALUE_DIM + h * V_DIM + 2 * tid, [lds_ld(outs, 2 * tid), lds_ld(outs, 2 * tid + 1)])
+            # the new state after the publish: out_proj waits on the gated row, not on this store
+            if ok:
+                r_o = rsrc(ssm_state + (fx.Int64(so) * HV + fx.Int64(h)) * HEAD_BYTES)
+                for j in range_constexpr(KPT):
+                    bo.buffer_store(sv[j].to(fx.BFloat16), r_o, (k0_ + j) * V_DIM + v0_)
             stamp("gdn", tt, 4)
 
     return {}
