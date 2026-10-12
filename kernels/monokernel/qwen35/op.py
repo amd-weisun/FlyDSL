@@ -89,10 +89,15 @@ class Qwen35Variant:
     _cache: dict = {}
     _adv_cache: dict = {}
 
-    def __init__(self, cfg, samples: int, full: bool, rank: int = 0, npes: int = 1, group=None, timeline=False):
+    def __init__(
+        self, cfg, samples: int, full: bool, rank: int = 0, npes: int = 1, group=None, timeline=False, tokens_per_seq=1
+    ):
         if full and cfg.local_kv_heads != 1:
             raise ValueError("the full-attention kernel holds one K / V head per rank")
+        if samples % tokens_per_seq:
+            raise ValueError("an MTP verify launch holds whole sequences of tokens_per_seq rows")
         self.cfg, self.S, self.full, self.rank, self.npes = cfg, samples, full, rank, npes
+        self.T = tokens_per_seq
         dims = shape_dims(cfg)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.scr_layout, self.sym_layout = layout(samples, npes, full, **dims)
@@ -100,10 +105,10 @@ class Qwen35Variant:
         self.peer_buffer = SymmetricPeerBuffer(self.sym_layout["_bytes"], rank=rank, npes=npes, group=group)
         self.sym, self.peers = self.peer_buffer.local_address, self.peer_buffer.addresses
         self.step = torch.zeros(1, dtype=torch.int32, device=dev)
-        self.key = (samples, npes, full, timeline, cfg.eps, cfg.rope_dim, tuple(sorted(dims.items())))
+        self.key = (samples, npes, full, timeline, tokens_per_seq, cfg.eps, cfg.rope_dim, tuple(sorted(dims.items())))
         if self.key not in Qwen35Variant._cache:
             Qwen35Variant._cache[self.key] = build_qwen35_kernel(
-                samples, npes, full, eps=cfg.eps, rope_dim=cfg.rope_dim, timeline=timeline, **dims
+                samples, npes, full, eps=cfg.eps, rope_dim=cfg.rope_dim, tokens_per_seq=tokens_per_seq, timeline=timeline, **dims
             )
         self.launch = Qwen35Variant._cache[self.key]
         # the step advance clears mailbox pairs; the plain-f32 "xqd" region sits last and is skipped
@@ -111,7 +116,7 @@ class Qwen35Variant:
         if adv_key not in Qwen35Variant._adv_cache:
             Qwen35Variant._adv_cache[adv_key] = build_advance_step(*adv_key)
         self._advance = Qwen35Variant._adv_cache[adv_key]
-        self.stages = stage_tasks(samples, full, **dims)
+        self.stages = stage_tasks(samples, full, tokens_per_seq=tokens_per_seq, **dims)
         n_tasks = sum(n for _, n in self.stages)
         self.timeline = torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev) if timeline else None
 
@@ -142,13 +147,20 @@ class Qwen35MonoKernel:
         timeline=False,
         variant: "Qwen35Variant | None" = None,
         packed: dict | None = None,
+        tokens_per_seq: int = 1,
     ):
         self.W, self.S, self.rank, self.npes, self.full = W, samples, rank, npes, W.full
         self.packed = pack_layer_weights(W) if packed is None else packed
         self._owns_variant = variant is None
         if variant is None:
-            variant = Qwen35Variant(W.cfg, samples, W.full, rank, npes, group, timeline)
-        elif (variant.S, variant.full, variant.npes, variant.rank) != (samples, W.full, npes, rank):
+            variant = Qwen35Variant(W.cfg, samples, W.full, rank, npes, group, timeline, tokens_per_seq)
+        elif (variant.S, variant.full, variant.npes, variant.rank, variant.T) != (
+            samples,
+            W.full,
+            npes,
+            rank,
+            tokens_per_seq,
+        ):
             raise ValueError("the variant was built for another sample count, layer kind or rank")
         self.variant = variant
         self.scr_layout, self.scratch = variant.scr_layout, variant.scratch
@@ -157,7 +169,10 @@ class Qwen35MonoKernel:
     def forward(self, h, *, gdn_state=None, kv=None, rope=None, x_out=None, layer=0, advance=True):
         """One layer on the residual ``h`` [S, hidden] bf16; updates the state in place.
 
-        GDN: ``gdn_state = (conv_state, ssm_state, slots_in, slots_out)``. Full attention: ``kv = (k_cache,
+        GDN: ``gdn_state = (conv_state, ssm_state, slots_in, slots_out)``; an MTP verify variant
+        (``tokens_per_seq`` T > 1) takes ``(conv_state, ssm_state, n_accepted, spec_slots)``: per sequence the
+        tokens accepted last step, per row the state slot after its token (ATOM's ``spec_state_indices``,
+        flattened), the conv window [slots, T + 2, conv_dim] in each sequence's first slot. Full attention: ``kv = (k_cache,
         v_cache, k_scale, v_scale, positions, block_tables, slot_mapping)`` in ATOM's MHA pool layout (the
         new token goes to cache slot ``slot_mapping[s]``, -1 = no write) and ``rope = (cos, sin)``, f32
         ``[positions, rope_dim / 2]``."""
@@ -170,7 +185,7 @@ class Qwen35MonoKernel:
                 raise ValueError(f"{name} must be int32 {shape} with unit-stride rows")
 
         z = torch.zeros(1, dtype=torch.int32, device=h.device)
-        conv = ssm = sl_in = sl_out = z
+        conv = ssm = sl_in = sl_out = n_acc = z
         kc = vc = ks = vs = pos = bt = slots = cos = sin = z
         bt_stride = 0
         if self.full:
@@ -185,10 +200,17 @@ class Qwen35MonoKernel:
                 raise ValueError("k_scale / v_scale must be float32 [blocks, 1, 16]")
             bt_stride = bt.stride(0)
         else:
-            conv, ssm, sl_in, sl_out = gdn_state
-            sl_out = sl_in if sl_out is None else sl_out
-            if conv.dtype != torch.bfloat16 or tuple(conv.shape[1:]) != (cfg.conv_kernel - 1, cfg.conv_dim):
-                raise ValueError(f"conv_state must be bf16 [slots, {cfg.conv_kernel - 1}, {cfg.conv_dim}]")
+            T = self.variant.T
+            if T == 1:
+                conv, ssm, sl_in, sl_out = gdn_state
+                sl_out = sl_in if sl_out is None else sl_out
+            else:
+                conv, ssm, n_acc, sl_out = gdn_state
+                sl_in = sl_out
+                i32("n_accepted", n_acc, (S // T,))
+            width = cfg.conv_kernel - 1 if T == 1 else T + 2
+            if conv.dtype != torch.bfloat16 or tuple(conv.shape[1:]) != (width, cfg.conv_dim):
+                raise ValueError(f"conv_state must be bf16 [slots, {width}, {cfg.conv_dim}]")
             if ssm.dtype != torch.bfloat16 or tuple(ssm.shape[1:]) != (cfg.hv, cfg.linear_k_dim, cfg.linear_v_dim):
                 raise ValueError(
                     f"ssm_state must be bf16 [slots, {cfg.hv}, {cfg.linear_k_dim}, {cfg.linear_v_dim}] (K-major, as ATOM)"
@@ -206,6 +228,7 @@ class Qwen35MonoKernel:
             ptr(x_out),
             ptr(sl_in),
             ptr(sl_out),
+            ptr(n_acc),
             ptr(conv),
             ptr(ssm),
             ptr(pos),

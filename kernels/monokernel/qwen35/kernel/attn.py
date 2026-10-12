@@ -11,7 +11,7 @@ keeps the FP8 codes (exact in bf16) and applies a key's scale to its score / sof
 """
 
 import flydsl.expr as fx
-from flydsl.expr import arith, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from kernels.common import buffer_ops as bo
@@ -50,6 +50,7 @@ def attn_stages(ctx):
     QG = ctx["QG"]
     ROPE = ctx["ROPE"]
     S = ctx["S"]
+    T_SEQ = ctx["T_SEQ"]
     SCALE = ctx["SCALE"]
     block_sum = ctx["block_sum"]
     block_tables = ctx["block_tables"]
@@ -210,6 +211,8 @@ def attn_stages(ctx):
         gpu.barrier()
         pos = ld_pos(s)
         ctx_len = pos + 1
+        # keys from pos0 on are this launch's (the sequence's earlier MTP tokens and this one): from kvnew
+        pos0 = pos - s % T_SEQ
         span = (ctx_len + NSPLIT * KT - 1) // (NSPLIT * KT) * KT  # keys per split, whole tiles
         k0 = js * span
         k1 = fx.min(k0 + span, ctx_len)
@@ -274,7 +277,7 @@ def attn_stages(ctx):
                         mask = fx.Int32(0)
                         for j in range_constexpr(4):
                             key = kfirst + half * 4 + j
-                            ok = (key < k1) & (key != pos)
+                            ok = (key < k1) & (key < pos0)
                             mask = mask | ok.select(fx.Int32(0xFF << (8 * j) if j < 3 else -(1 << 24)), fx.Int32(0))
                         words.append(w2[half] & mask)
                     vfr.append(fp8_to_bf16x8(words[0], words[1]))
@@ -284,7 +287,7 @@ def attn_stages(ctx):
             src = (wave + 16 * (kk // 4)) * 4 + kk % 4
             dot = lds_ld(red, (lane // 16) * 256 + src) + lds_ld(red, (lane // 16 + 4) * 256 + src)
             key_abs = kb + lane
-            ok = (key_abs < k1) & (key_abs != pos)
+            ok = (key_abs < k1) & (key_abs < pos0)
             sblk = ld_block(s, fx.min(blk0 + lane // 16, last_blk))
             ksc = ld_f32(r_ks, sblk * BS + kk)
             vsc = ld_f32(r_vs, sblk * BS + kk)
@@ -313,41 +316,47 @@ def attn_stages(ctx):
             a0, a1, a2, a3 = acc[0][0], acc[0][1], acc[0][2], acc[0][3]
             a4, a5, a6, a7 = acc[1][0], acc[1][1], acc[1][2], acc[1][3]
             gpu.barrier()
-        # this launch's token: one more key, in the split that holds it
-        if (pos >= k0) & (pos < k1):
-            if tid < 2 * HD:
-                nv = poll([(mb("kvnew"), s * (2 * HD + 2) + tid, 1)])[0][0].bitcast(fx.Float32)
-                lds_st(xs, XN + tid, nv)
-            # its two scales (2 * HD may be every thread, so not a thread past the codes)
-            if tid < 2:
-                sc2 = poll([(mb("kvnew"), s * (2 * HD + 2) + 2 * HD + tid, 1)])[0][0].bitcast(fx.Float32)
-                lds_st(xs, XN + 2 * HD + tid, sc2)
-            gpu.barrier()
-            part = fx.Float32(0.0)
-            for e in range_constexpr(HD // 64):
-                d = lane * (HD // 64) + e
-                qd = fx.Float32(fx.ptr_load(kvt + (wave * QROWE + d)))
-                part = part + qd * lds_ld(xs, XN + d)
-            s_new = wave_sum(part) * lds_ld(xs, XN + 2 * HD) * SCALE
-            m_new = fx.max(m, s_new)
-            corr = exp(m - m_new)
-            p_new = exp(s_new - m_new)
-            lsum = lsum * corr + p_new
-            m = m_new
-            if lane == 0:
-                lds_st(xs, XC + wave, corr)
-                lds_st(xs, XC + 16 + wave, p_new * lds_ld(xs, XN + 2 * HD + 1))
-            gpu.barrier()
-            cr = fx.Vector.from_elements([lds_ld(xs, XC + fx.min(4 * g4 + e, H - 1)) for e in range(4)], fx.Float32)
-            pn = fx.Vector.from_elements(
-                [lds_ld(xs, XC + 16 + fx.min(4 * g4 + e, H - 1)) for e in range(4)], fx.Float32
-            )
-            vd0 = fx.Vector.filled(4, lds_ld(xs, XN + HD + (wave * NG) * 16 + lane % 16), fx.Float32)
-            vd1 = fx.Vector.filled(4, lds_ld(xs, XN + HD + (wave * NG + 1) * 16 + lane % 16), fx.Float32)
-            n0 = fx.Vector.from_elements([a0, a1, a2, a3], fx.Float32) * cr + pn * vd0
-            n1 = fx.Vector.from_elements([a4, a5, a6, a7], fx.Float32) * cr + pn * vd1
-            a0, a1, a2, a3 = n0[0], n0[1], n0[2], n0[3]
-            a4, a5, a6, a7 = n1[0], n1[1], n1[2], n1[3]
+        # this launch's tokens of the sequence (positions pos0 .. pos): one more key each, in the split
+        # that holds it
+        for tk in range_constexpr(T_SEQ):
+            kpos = pos0 + tk
+            krow = s - s % T_SEQ + tk
+            if const_expr(tk > 0):
+                gpu.barrier()  # the previous key's LDS row is read
+            if (kpos <= pos) & (kpos >= k0) & (kpos < k1):
+                if tid < 2 * HD:
+                    nv = poll([(mb("kvnew"), krow * (2 * HD + 2) + tid, 1)])[0][0].bitcast(fx.Float32)
+                    lds_st(xs, XN + tid, nv)
+                # its two scales (2 * HD may be every thread, so not a thread past the codes)
+                if tid < 2:
+                    sc2 = poll([(mb("kvnew"), krow * (2 * HD + 2) + 2 * HD + tid, 1)])[0][0].bitcast(fx.Float32)
+                    lds_st(xs, XN + 2 * HD + tid, sc2)
+                gpu.barrier()
+                part = fx.Float32(0.0)
+                for e in range_constexpr(HD // 64):
+                    d = lane * (HD // 64) + e
+                    qd = fx.Float32(fx.ptr_load(kvt + (wave * QROWE + d)))
+                    part = part + qd * lds_ld(xs, XN + d)
+                s_new = wave_sum(part) * lds_ld(xs, XN + 2 * HD) * SCALE
+                m_new = fx.max(m, s_new)
+                corr = exp(m - m_new)
+                p_new = exp(s_new - m_new)
+                lsum = lsum * corr + p_new
+                m = m_new
+                if lane == 0:
+                    lds_st(xs, XC + wave, corr)
+                    lds_st(xs, XC + 16 + wave, p_new * lds_ld(xs, XN + 2 * HD + 1))
+                gpu.barrier()
+                cr = fx.Vector.from_elements([lds_ld(xs, XC + fx.min(4 * g4 + e, H - 1)) for e in range(4)], fx.Float32)
+                pn = fx.Vector.from_elements(
+                    [lds_ld(xs, XC + 16 + fx.min(4 * g4 + e, H - 1)) for e in range(4)], fx.Float32
+                )
+                vd0 = fx.Vector.filled(4, lds_ld(xs, XN + HD + (wave * NG) * 16 + lane % 16), fx.Float32)
+                vd1 = fx.Vector.filled(4, lds_ld(xs, XN + HD + (wave * NG + 1) * 16 + lane % 16), fx.Float32)
+                n0 = fx.Vector.from_elements([a0, a1, a2, a3], fx.Float32) * cr + pn * vd0
+                n1 = fx.Vector.from_elements([a4, a5, a6, a7], fx.Float32) * cr + pn * vd1
+                a0, a1, a2, a3 = n0[0], n0[1], n0[2], n0[3]
+                a4, a5, a6, a7 = n1[0], n1[1], n1[2], n1[3]
         # publish: rows 4 g4 + e < H are the query heads
         if lane < 4 * H:
             accs = [a0, a1, a2, a3, a4, a5, a6, a7]

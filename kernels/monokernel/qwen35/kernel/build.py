@@ -74,16 +74,20 @@ def build_qwen35_kernel(
     inter,
     eps,
     rope_dim,
+    tokens_per_seq=1,
     timeline=False,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer: full attention when ``full``, else
-    Gated DeltaNet. ``heads`` / ``inter`` are this rank's (one K / V head per rank)."""
+    Gated DeltaNet. ``heads`` / ``inter`` are this rank's (one K / V head per rank). ``tokens_per_seq`` > 1:
+    an MTP verify step, rows ``q * tokens_per_seq + j`` = token j of sequence q (consecutive positions)."""
     assert 1 <= S <= 8, "dn_route routes sample s on wave s; the samples sit in the MFMA's B columns"
     assert k_dim == v_dim == 128, "the recurrence maps 8 K lanes x 4 values and 64 V rows per pass"
     assert hv % hk == 0
     assert n_experts % 64 == 0 and top_k < 16
     assert inter % 128 == 0 and hidden % 128 == 0
     HIDDEN = hidden
+    T_SEQ = tokens_per_seq
+    assert S % T_SEQ == 0
     HK, HV, K_DIM, V_DIM = hk, hv, k_dim, v_dim
     VPK = HV // HK
     g = gdn_dims(dict(hk=hk, hv=hv, k_dim=k_dim, v_dim=v_dim))
@@ -142,7 +146,7 @@ def build_qwen35_kernel(
         inter=inter,
     )
     SC, SY = layout(S, W, full, **dims)
-    stages = stage_tasks(S, full, **dims)
+    stages = stage_tasks(S, full, tokens_per_seq=T_SEQ, **dims)
     base, first, acc = {}, {}, 0
     for name, n in stages:
         first[name] = acc
@@ -178,6 +182,7 @@ def build_qwen35_kernel(
         x_out: Int64,
         slots_in: Int64,
         slots_out: Int64,
+        n_accepted: Int64,
         conv_state: Int64,
         ssm_state: Int64,
         positions: Int64,
@@ -255,6 +260,7 @@ def build_qwen35_kernel(
         x_out: Int64,
         slots_in: Int64,
         slots_out: Int64,
+        n_accepted: Int64,
         conv_state: Int64,
         ssm_state: Int64,
         positions: Int64,
@@ -299,6 +305,7 @@ def build_qwen35_kernel(
             x_out,
             slots_in,
             slots_out,
+            n_accepted,
             conv_state,
             ssm_state,
             positions,

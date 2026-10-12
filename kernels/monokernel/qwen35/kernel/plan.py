@@ -104,8 +104,10 @@ def layout(S: int, npes: int, full: bool, *, hidden, hk, hv, k_dim, v_dim, heads
     return scratch, sym
 
 
-def stage_tasks(S: int, full: bool, *, hidden, hk, hv, k_dim, v_dim, heads, head_dim, n_experts, top_k, inter):
-    """[(stage name, task count)] in execution order."""
+def stage_tasks(
+    S: int, full: bool, *, hidden, hk, hv, k_dim, v_dim, heads, head_dim, n_experts, top_k, inter, tokens_per_seq=1
+):
+    """[(stage name, task count)] in execution order (``tokens_per_seq``: MTP verify, a GDN task per sequence)."""
     if full:
         mixer = [
             ("proj", (heads * 2 * head_dim + 2 * head_dim) // PROJ_TILE // PROJ_GROUPS),
@@ -118,7 +120,7 @@ def stage_tasks(S: int, full: bool, *, hidden, hk, hv, k_dim, v_dim, heads, head
         mixer = [
             ("proj", (g["conv_dim"] + g["value_dim"]) // PROJ_TILE // PROJ_GROUPS),
             ("proj_ba", -(-(2 * hv // PROJ_TILE) // PROJ_GROUPS)),
-            ("gdn", S * hv),
+            ("gdn", S // tokens_per_seq * hv),
         ]
     return mixer + [
         ("out", hidden // ROW_TILE),

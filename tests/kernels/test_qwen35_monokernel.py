@@ -166,6 +166,118 @@ def test_qwen35_full_attention_layer_matches_golden(S):
         layer.close()
 
 
+# MTP verify: T tokens per sequence in one launch == T sequential decode steps of the golden
+MTP_CASES = [(2, 1), (2, 4), (3, 2), (4, 2)]  # (tokens per sequence, sequences)
+
+
+@pytest.mark.parametrize("T,Q", MTP_CASES)
+def test_qwen35_gdn_mtp_verify_matches_sequential_golden(T, Q):
+    cfg = Q35Config(tp=4, rank=0)
+    W = make_weights(cfg, full=False)
+    gen = torch.Generator(device="cuda").manual_seed(17)
+    S = Q * T
+    n_slots = S + 3
+    # per sequence T state slots (ATOM's spec_state_indices), shuffled; the accepted counts of the last step
+    spec = (torch.randperm(n_slots - 3, generator=torch.Generator().manual_seed(5))[:S] + 2).view(Q, T)
+    n_acc = torch.tensor([1 + (3 * q + 1) % T for q in range(Q)], dtype=torch.int32)
+    conv_k = (0.5 * torch.randn(n_slots, T + 2, cfg.conv_dim, generator=gen, device="cuda")).to(torch.bfloat16)
+    ssm_k = (0.1 * torch.randn(n_slots, cfg.hv, cfg.linear_k_dim, cfg.linear_v_dim, generator=gen, device="cuda")).to(
+        torch.bfloat16
+    )
+    # the golden's per-sequence state: the window from n_accepted - 1 and the state after the last accepted token
+    win0 = torch.stack([conv_k[spec[q, 0], int(n_acc[q]) - 1 : int(n_acc[q]) + 2] for q in range(Q)])
+    conv_g = win0.clone()
+    ssm_g = torch.stack([ssm_k[spec[q, int(n_acc[q]) - 1]] for q in range(Q)]).clone()
+    sl = torch.arange(Q, dtype=torch.int32, device="cuda")
+    old_window = conv_k[spec[:, 0]].clone()
+    h = torch.randn(S, cfg.hidden, generator=gen, device="cuda").to(torch.bfloat16)
+    layer = Qwen35MonoKernel(W, S, tokens_per_seq=T)
+    try:
+        out = layer.forward(
+            h, gdn_state=(conv_k, ssm_k, n_acc.cuda(), spec.flatten().to(torch.int32).cuda().contiguous())
+        )
+        torch.cuda.synchronize()
+        got = layer.intermediates()
+        rows = torch.arange(Q) * T
+        for j in range(T):
+            ref = golden_layer(W, h[rows + j], lambda y: y, gdn_state=(conv_g, ssm_g, sl, sl))
+            errs = {
+                "conv": _rel(got["conv"][rows + j], ref["conv_out"]),
+                "gated": _rel(got["gated"][rows + j], ref["gated"].flatten(1)),
+                "a": _rel(got["a"][rows + j], ref["a"]),
+                "ssm_snapshot": _rel(ssm_k[spec[:, j]], ssm_g),
+            }
+            if torch.equal(got["sel"][rows + j].long(), ref["sel"].long()):
+                errs["x_out"] = _rel(out[rows + j], ref["x_out"])
+            print(f"MTP T={T} Q={Q} token {j}", {k: f"{v:.2e}" for k, v in errs.items()})
+            bad = {k: v for k, v in errs.items() if v > 2e-2}
+            assert not bad, f"token {j}: {bad} (all: {errs})"
+        # the window shifted by one: two kept inputs from n_accepted, then this launch's T inputs
+        new_window = conv_k[spec[:, 0]]
+        for q in range(Q):
+            na = int(n_acc[q])
+            assert torch.equal(new_window[q, :2], old_window[q, na : na + 2])
+        assert _rel(new_window[:, T - 1 :], conv_g) < 1e-2, "the last three inputs are the golden's conv state"
+    finally:
+        layer.close()
+
+
+MTP_POS = {1: [700], 2: [15, 300], 4: [62, 128, 1000, 33]}
+
+
+@pytest.mark.parametrize("T,Q", MTP_CASES)
+def test_qwen35_full_attention_mtp_verify_matches_sequential_golden(T, Q):
+    cfg = Q35Config(tp=4, rank=0)
+    W = make_weights(cfg, full=True)
+    gen = torch.Generator(device="cuda").manual_seed(19)
+    S = Q * T
+    pos0 = MTP_POS[Q]
+    max_seq = max(pos0) + T + 1
+    max_blocks = -(-max_seq // 16)
+    perm = torch.randperm(Q * max_blocks, generator=torch.Generator().manual_seed(3)).view(Q, max_blocks)
+    bt = perm.to(torch.int32).cuda().contiguous()
+    nb = Q * max_blocks
+    kc = torch.zeros(nb, 1, cfg.head_dim // 16, 16, 16, dtype=torch.float8_e4m3fn, device="cuda")
+    vc = torch.zeros(nb, 1, 1, cfg.head_dim, 16, dtype=torch.float8_e4m3fn, device="cuda")
+    ks = torch.zeros(nb, 1, 16, device="cuda")
+    vs = torch.zeros(nb, 1, 16, device="cuda")
+    k_g = torch.zeros(Q, max_seq, 1, cfg.head_dim, device="cuda")
+    v_g = torch.zeros_like(k_g)
+    for q in range(Q):
+        hist_k = torch.randn(pos0[q], 1, cfg.head_dim, generator=gen, device="cuda")
+        hist_v = torch.randn(pos0[q], 1, cfg.head_dim, generator=gen, device="cuda")
+        k_g[q, : pos0[q]] = kv_quant_dequant(hist_k)
+        v_g[q, : pos0[q]] = kv_quant_dequant(hist_v)
+        for p in range(pos0[q]):
+            paged_kv_write(kc, vc, ks, vs, bt[q].tolist(), p, hist_k[p], hist_v[p])
+    cos, sin = rope_tables(cfg, max_seq)
+    h = torch.randn(S, cfg.hidden, generator=gen, device="cuda").to(torch.bfloat16)
+    seq = torch.arange(S, device="cuda") // T
+    pos = (torch.tensor(pos0, device="cuda")[seq] + torch.arange(S, device="cuda") % T).to(torch.int32)
+    bt_rows = bt[seq].contiguous()
+    slots = (bt_rows[torch.arange(S), pos.long() // 16] * 16 + pos % 16).to(torch.int32)
+    layer = Qwen35MonoKernel(W, S, tokens_per_seq=T)
+    try:
+        out = layer.forward(h, kv=(kc, vc, ks, vs, pos, bt_rows, slots), rope=(cos, sin))
+        torch.cuda.synchronize()
+        got = layer.intermediates()
+        rows = torch.arange(Q, device="cuda") * T
+        for j in range(T):
+            ref = golden_layer(W, h[rows + j], lambda y: y, kv=(k_g, v_g, pos[rows + j]))
+            errs = {
+                "q": _rel(got["q"][rows + j], ref["q"]),
+                "gated": _rel(got["gated"][rows + j], ref["gated"].flatten(1)),
+                "a": _rel(got["a"][rows + j], ref["a"]),
+            }
+            if torch.equal(got["sel"][rows + j].long(), ref["sel"].long()):
+                errs["x_out"] = _rel(out[rows + j], ref["x_out"])
+            print(f"full MTP T={T} Q={Q} token {j}", {k: f"{v:.2e}" for k, v in errs.items()})
+            bad = {k: v for k, v in errs.items() if v > 2e-2}
+            assert not bad, f"token {j}: {bad} (all: {errs})"
+    finally:
+        layer.close()
+
+
 def _run_rank_tp(rank, npes, S=2, iters=3):
     import torch.distributed as dist
 
