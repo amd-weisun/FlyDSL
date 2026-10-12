@@ -239,7 +239,9 @@ def gdn_stages(ctx):
                     lds_st(outs, v_idx, ok.select(gated, fx.Float32(0.0)))
             gpu.barrier()
             if tid < V_DIM // 2:
-                put_bf(mb("gated"), s * VALUE_DIM + h * V_DIM + 2 * tid, [lds_ld(outs, 2 * tid), lds_ld(outs, 2 * tid + 1)])
+                put_bf(
+                    mb("gated"), s * VALUE_DIM + h * V_DIM + 2 * tid, [lds_ld(outs, 2 * tid), lds_ld(outs, 2 * tid + 1)]
+                )
             # the new state after the publish: out_proj waits on the gated row, not on this store
             if ok:
                 r_o = rsrc(ssm_state + (fx.Int64(so) * HV + fx.Int64(h)) * HEAD_BYTES)

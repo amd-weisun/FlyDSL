@@ -108,13 +108,13 @@ def _hf_layer(W, layer_idx):
             la + "norm.weight": t["g_norm"],
             la + "out_proj.weight": t["w_out"],
         }
-    n, I = cfg.n_experts, cfg.inter
+    n, inter = cfg.n_experts, cfg.inter
     sd |= {
         "mlp.gate.weight": t["w_r"],
         "mlp.experts.gate_up_proj": torch.stack([dequant(t["w_ug"][e], t["s_ug"][e], 128) for e in range(n)]),
         "mlp.experts.down_proj": torch.stack([dequant(t["w_dn"][e], t["s_dn"][e], 128) for e in range(n)]),
-        "mlp.shared_expert.gate_proj.weight": t["w_sh_ug"][:I],
-        "mlp.shared_expert.up_proj.weight": t["w_sh_ug"][I:],
+        "mlp.shared_expert.gate_proj.weight": t["w_sh_ug"][:inter],
+        "mlp.shared_expert.up_proj.weight": t["w_sh_ug"][inter:],
         "mlp.shared_expert.down_proj.weight": t["w_sh_dn"],
         "mlp.shared_expert_gate.weight": t["w_sg"],
     }
@@ -144,7 +144,9 @@ def test_qwen38_golden_matches_hf_prefill(full, exact, monkeypatch):
         ref = layer(x, position_embeddings=rotary(x, pos), attention_mask=causal, position_ids=pos)
     ref = (ref[0] if isinstance(ref, tuple) else ref)[0]
 
-    conv = torch.zeros(1, cfg.conv_kernel - 1, cfg.conv_dim, device="cuda", dtype=torch.float32 if exact else torch.bfloat16)
+    conv = torch.zeros(
+        1, cfg.conv_kernel - 1, cfg.conv_dim, device="cuda", dtype=torch.float32 if exact else torch.bfloat16
+    )
     ssm = torch.zeros(1, cfg.linear_v_heads, cfg.linear_k_dim, cfg.linear_v_dim, device="cuda")
     kc = torch.zeros(1, STEPS, cfg.kv_heads, cfg.head_dim, device="cuda")
     vc = torch.zeros_like(kc)

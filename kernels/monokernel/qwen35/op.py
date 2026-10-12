@@ -49,8 +49,21 @@ def pack_layer_weights(W: LayerWeights) -> dict:
         wq = t["w_q"].view(torch.uint8).view(H, 2, hd, -1)  # per head [q, gate] in the checkpoint
         sq = t["s_q"].view(H, 2, hd // 128, -1)
         mixer = dict(
-            w_qkvz=shuffle_fp8(torch.cat([wq[:, 1].reshape(H * hd, -1), wq[:, 0].reshape(H * hd, -1), t["w_k"].view(torch.uint8), t["w_v"].view(torch.uint8)])),
-            s_qkvz=torch.cat([sq[:, 1].reshape(H * hd // 128, -1), sq[:, 0].reshape(H * hd // 128, -1), t["s_k"], t["s_v"]]).float().contiguous(),
+            w_qkvz=shuffle_fp8(
+                torch.cat(
+                    [
+                        wq[:, 1].reshape(H * hd, -1),
+                        wq[:, 0].reshape(H * hd, -1),
+                        t["w_k"].view(torch.uint8),
+                        t["w_v"].view(torch.uint8),
+                    ]
+                )
+            ),
+            s_qkvz=torch.cat(
+                [sq[:, 1].reshape(H * hd // 128, -1), sq[:, 0].reshape(H * hd // 128, -1), t["s_k"], t["s_v"]]
+            )
+            .float()
+            .contiguous(),
             g_qn1=(1.0 + t["g_qn"].float()).contiguous(),
             g_kn1=(1.0 + t["g_kn"].float()).contiguous(),
             w_out=shuffle_fp8(t["w_o"]),
@@ -108,7 +121,14 @@ class Qwen35Variant:
         self.key = (samples, npes, full, timeline, tokens_per_seq, cfg.eps, cfg.rope_dim, tuple(sorted(dims.items())))
         if self.key not in Qwen35Variant._cache:
             Qwen35Variant._cache[self.key] = build_qwen35_kernel(
-                samples, npes, full, eps=cfg.eps, rope_dim=cfg.rope_dim, tokens_per_seq=tokens_per_seq, timeline=timeline, **dims
+                samples,
+                npes,
+                full,
+                eps=cfg.eps,
+                rope_dim=cfg.rope_dim,
+                tokens_per_seq=tokens_per_seq,
+                timeline=timeline,
+                **dims,
             )
         self.launch = Qwen35Variant._cache[self.key]
         # the step advance clears mailbox pairs; the plain-f32 "xqd" region sits last and is skipped

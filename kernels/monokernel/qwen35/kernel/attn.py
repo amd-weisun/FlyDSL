@@ -97,7 +97,11 @@ def attn_stages(ctx):
         # ATOM's row order: every local head's gate, then every head's q; mailbox qg holds [q, gate] per head
         if row < QG:
             hq = row % (QG // 2)
-            put(mb("qg"), s * QG + (hq // HD) * 2 * HD + (row < QG // 2).select(fx.Int32(HD), fx.Int32(0)) + hq % HD, bf16_round(v))
+            put(
+                mb("qg"),
+                s * QG + (hq // HD) * 2 * HD + (row < QG // 2).select(fx.Int32(HD), fx.Int32(0)) + hq % HD,
+                bf16_round(v),
+            )
         else:
             put(mb("kvr"), s * 2 * KVD + row - QG, bf16_round(v))
 
@@ -247,6 +251,7 @@ def attn_stages(ctx):
         a5 = fx.Float32(0.0)
         a6 = fx.Float32(0.0)
         a7 = fx.Float32(0.0)
+
         def tile_loads(kb_):
             """A tile's K fragments (this wave's row group and head-dim half), V fragments (dims 16 n + lane
             % 16, keys 32 ks + 8 g4 ..) and the lane's key scales: issued a tile ahead (blocks past the

@@ -200,8 +200,12 @@ def golden_qsa(W: LayerWeights, m, k_cache, v_cache, idx_cache, cmp_cache, posit
         n = (p + 1) // R
         scores = torch.relu(iq[s].float() @ cmp_cache[s, :n].float().T).sum(0) / D**0.5  # [n]
         order = torch.sort(scores, descending=True, stable=True).indices[: min(cfg.block_topk, n)]
-        toks = torch.cat([(order[:, None] * R + torch.arange(R, device=m.device)).flatten(),
-                          torch.arange(n * R, p + 1, device=m.device)])
+        toks = torch.cat(
+            [
+                (order[:, None] * R + torch.arange(R, device=m.device)).flatten(),
+                torch.arange(n * R, p + 1, device=m.device),
+            ]
+        )
         picked.append(order)
         keys, vals = k_cache[s, toks].float(), v_cache[s, toks].float()  # [T, KH, hd]
         kv_of = torch.arange(H, device=m.device) // (H // KH)
@@ -216,7 +220,7 @@ def golden_moe(W: LayerWeights, m: torch.Tensor, xq: torch.Tensor | None = None)
     """MoE on the sublayer input ``m`` [S, hidden] (bf16): routed FP8 experts (W8A8 when ``act_fp8``) plus the
     sigmoid-gated BF16 shared expert. ``xq`` overrides the routed experts' quantized input."""
     cfg, t = W.cfg, W.t
-    S, I = m.shape[0], cfg.inter
+    S, inter = m.shape[0], cfg.inter
     logits = bf(mm(m, t["w_r"]))
     sg = bf(mm(m, t["w_sg"]))[:, 0]
     xq_ref = act_quant(m) if cfg.act_fp8 else bf(m)
@@ -227,7 +231,7 @@ def golden_moe(W: LayerWeights, m: torch.Tensor, xq: torch.Tensor | None = None)
         idx, w = route(logits[s], cfg.top_k)
         for e, wgt in zip(idx.tolist(), w.tolist()):
             ug = dequant(t["w_ug"][e], t["s_ug"][e], 128) @ xq[s]
-            mid = F.silu(ug[:I]) * ug[I:]
+            mid = F.silu(ug[:inter]) * ug[inter:]
             mids.append(mid)
             mid = act_quant(mid) if cfg.act_fp8 else bf(mid)
             routed[s] += wgt * (dequant(t["w_dn"][e], t["s_dn"][e], 128) @ mid)
@@ -243,7 +247,7 @@ def golden_moe(W: LayerWeights, m: torch.Tensor, xq: torch.Tensor | None = None)
         xq=xq_ref,
         sel=torch.stack(sel),
         prob=torch.stack(prob),
-        mid=torch.stack(mids).view(S, cfg.top_k, I),
+        mid=torch.stack(mids).view(S, cfg.top_k, inter),
         routed=routed,
         shared=sh,
         y_moe=y,
