@@ -135,7 +135,8 @@ def test_qwen35_full_attention_layer_matches_golden(S):
             pos = torch.tensor([p + step for p in pos0], dtype=torch.int32, device="cuda")
             h = torch.randn(S, cfg.hidden, generator=gen, device="cuda").to(torch.bfloat16)
             ref = golden_layer(W, h, lambda y: y, kv=(k_g, v_g, pos))
-            out = layer.forward(h, kv=(kc, vc, ks, vs, pos, bt), rope=(cos, sin))
+            slots = (bt[torch.arange(S), pos.long() // 16] * 16 + pos % 16).to(torch.int32)
+            out = layer.forward(h, kv=(kc, vc, ks, vs, pos, bt, slots), rope=(cos, sin))
             torch.cuda.synchronize()
             got = layer.intermediates()
             new_k = torch.stack([paged_kv_read(kc, vc, ks, vs, bt[s].tolist(), int(pos[s]))[0] for s in range(S)])
@@ -245,3 +246,51 @@ def test_qwen35_gdn_layer_tp4(S):
     results = mp.Manager().dict()
     mp.spawn(_worker, args=(_run_rank_tp, 4, _free_port(), results, dict(S=S)), nprocs=4)
     assert all(results[r] for r in range(4))
+
+
+def test_qwen35_full_attention_padding_row_writes_nothing():
+    """A CUDA-graph padding row (ATOM: slot_mapping -1, a placeholder block table) must not write the
+    cache, whatever its block table points at; the live row is unaffected."""
+    cfg = Q35Config(tp=4, rank=0)
+    W = make_weights(cfg, full=True)
+    gen = torch.Generator(device="cuda").manual_seed(21)
+    S, pos0 = 2, 50
+    bt = torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32, device="cuda")  # row 1 aliases row 0
+    kc = torch.zeros(4, 1, cfg.head_dim // 16, 16, 16, dtype=torch.float8_e4m3fn, device="cuda")
+    vc = torch.zeros(4, 1, 1, cfg.head_dim, 16, dtype=torch.float8_e4m3fn, device="cuda")
+    ks, vs = torch.zeros(4, 1, 16, device="cuda"), torch.zeros(4, 1, 16, device="cuda")
+    k_g = torch.zeros(1, 64, 1, cfg.head_dim, device="cuda")
+    v_g = torch.zeros_like(k_g)
+    hist_k = torch.randn(pos0, 1, cfg.head_dim, generator=gen, device="cuda")
+    hist_v = torch.randn(pos0, 1, cfg.head_dim, generator=gen, device="cuda")
+    k_g[0, :pos0], v_g[0, :pos0] = kv_quant_dequant(hist_k), kv_quant_dequant(hist_v)
+    for p in range(pos0):
+        paged_kv_write(kc, vc, ks, vs, bt[0].tolist(), p, hist_k[p], hist_v[p])
+    before = (kc.clone(), vc.clone(), ks.clone(), vs.clone())
+    pos = torch.tensor([pos0, 7], dtype=torch.int32, device="cuda")  # the padding row points into live rows
+    slots = torch.tensor([pos0, -1], dtype=torch.int32, device="cuda")
+    h = torch.randn(S, cfg.hidden, generator=gen, device="cuda").to(torch.bfloat16)
+    cos, sin = rope_tables(cfg, 64)
+    layer = Qwen35MonoKernel(W, S)
+    try:
+        layer.forward(h, kv=(kc, vc, ks, vs, pos, bt, slots), rope=(cos, sin))
+        torch.cuda.synchronize()
+        got = layer.intermediates()
+    finally:
+        layer.close()
+    ref = golden_layer(W, h[:1], lambda y: y, kv=(k_g, v_g, pos[:1]))
+    # only the live row's slot changed
+    blk, t = pos0 // 16, pos0 % 16
+    for new, old in zip((kc, vc, ks, vs), before):
+        mask = torch.ones_like(new, dtype=torch.bool)
+        if new.dim() == 5 and new.shape[2] == cfg.head_dim // 16:
+            mask[blk, :, :, t, :] = False
+        elif new.dim() == 5:
+            mask[blk, :, 0, :, t] = False
+        else:
+            mask[blk, :, t] = False
+        assert torch.equal(
+            new[mask].view(torch.uint8) if new.dtype == torch.float8_e4m3fn else new[mask],
+            old[mask].view(torch.uint8) if old.dtype == torch.float8_e4m3fn else old[mask],
+        )
+    assert _rel(got["gated"][:1], ref["gated"].flatten(1)) < 2e-2

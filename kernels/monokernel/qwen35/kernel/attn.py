@@ -53,6 +53,7 @@ def attn_stages(ctx):
     SCALE = ctx["SCALE"]
     block_sum = ctx["block_sum"]
     block_tables = ctx["block_tables"]
+    slot_mapping = ctx["slot_mapping"]
     bt_stride = ctx["bt_stride"]
     g_kn1 = ctx["g_kn1"]
     g_qn1 = ctx["g_qn1"]
@@ -81,7 +82,7 @@ def attn_stages(ctx):
     w_qkv = ctx["w_qkv"]
     wave = ctx["wave"]
     xs = ctx["xs"]
-    r_pos, r_bt = rsrc(positions), rsrc(block_tables)
+    r_pos, r_bt, r_slot = rsrc(positions), rsrc(block_tables), rsrc(slot_mapping)
     r_kc, r_vc, r_ks, r_vs = rsrc(k_cache), rsrc(v_cache), rsrc(k_scale), rsrc(v_scale)
 
     def ld_pos(s):
@@ -155,19 +156,23 @@ def attn_stages(ctx):
         if is_kv:
             k8, ksc, kword = kv_quant(y, live)
             v8, vsc, vword = kv_quant(vraw, live)
-            blk = ld_block(s, pos // BS)
-            t = pos % BS
-            if live:
+            # the token's cache slot (block * BS + offset) is the engine's; -1 = a padding row: no write
+            slot = uniform(bo.buffer_load(r_slot, s, vec_width=1, dtype=T.i32))
+            blk = slot // BS
+            t = slot % BS
+            if live & (slot >= 0):
                 kb = arith.trunci(T.i8, fx.Int32(kword).ir_value())
                 vb = arith.trunci(T.i8, fx.Int32(vword).ir_value())
                 bo.buffer_store(kb, r_kc, ((blk * (HD // 16) + d // 16) * BS + t) * 16 + d % 16)
                 bo.buffer_store(vb, r_vc, ((blk * (BS // 16) + t // 16) * HD + d) * 16 + t % 16)
+            if live:
                 # this launch's row for the split tasks: other CTAs may not see the cache stores yet
                 put(mb("kvnew"), s * (2 * HD + 2) + d, k8)
                 put(mb("kvnew"), s * (2 * HD + 2) + HD + d, v8)
-            if tid == 0:
+            if (tid == 0) & (slot >= 0):
                 bo.buffer_store(ksc, r_ks, blk * BS + t)
                 bo.buffer_store(vsc, r_vs, blk * BS + t)
+            if tid == 0:
                 put(mb("kvnew"), s * (2 * HD + 2) + 2 * HD, ksc)
                 put(mb("kvnew"), s * (2 * HD + 2) + 2 * HD + 1, vsc)
         stamp("qk", tt, 4)

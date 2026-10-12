@@ -15,7 +15,7 @@ from kernels.monokernel.qwen35.kernel.plan import TL_COLS, layout, n_split, rout
 from kernels.monokernel.qwen35.reference import LayerWeights
 from kernels.monokernel.runtime import SymmetricPeerBuffer
 
-__all__ = ["Qwen35MonoKernel", "pack_layer_weights"]
+__all__ = ["Qwen35MonoKernel", "Qwen35Variant", "pack_layer_weights"]
 
 
 def shape_dims(cfg) -> dict:
@@ -75,50 +75,87 @@ def pack_layer_weights(W: LayerWeights) -> dict:
     )
 
 
-class Qwen35MonoKernel:
-    """One rank of one decoder layer: its packed weights, scratch and the compiled launch.
-
-    State belongs to the caller (ATOM's pools): a GDN layer's conv / recurrent state with per-sample
-    ``slots_in`` / ``slots_out``; a full-attention layer's paged FP8 K / V cache, its scales, block
-    tables and positions, and the RoPE tables."""
+class Qwen35Variant:
+    """The compiled launch, scratch, symmetric peer buffer and step counter that every layer of one kind
+    (GDN or full attention) shares at one sample count. Fresh epoch tags (``step * LAYER_SLOTS + layer
+    + 1``) keep layers apart in the shared scratch: one ``advance_step`` per decode step, distinct
+    ``layer`` values per launch."""
 
     _cache: dict = {}
     _adv_cache: dict = {}
 
-    def __init__(self, W: LayerWeights, samples: int, rank: int = 0, npes: int = 1, group=None, timeline=False):
-        cfg = W.cfg
-        if W.full and cfg.local_kv_heads != 1:
+    def __init__(self, cfg, samples: int, full: bool, rank: int = 0, npes: int = 1, group=None, timeline=False):
+        if full and cfg.local_kv_heads != 1:
             raise ValueError("the full-attention kernel holds one K / V head per rank")
-        self.W, self.S, self.rank, self.npes, self.full = W, samples, rank, npes, W.full
-        self.packed = pack_layer_weights(W)
+        self.cfg, self.S, self.full, self.rank, self.npes = cfg, samples, full, rank, npes
         dims = shape_dims(cfg)
         dev = torch.device("cuda", torch.cuda.current_device())
-        self.scr_layout, self.sym_layout = layout(samples, npes, W.full, **dims)
+        self.scr_layout, self.sym_layout = layout(samples, npes, full, **dims)
         self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
         self.peer_buffer = SymmetricPeerBuffer(self.sym_layout["_bytes"], rank=rank, npes=npes, group=group)
         self.sym, self.peers = self.peer_buffer.local_address, self.peer_buffer.addresses
         self.step = torch.zeros(1, dtype=torch.int32, device=dev)
-        key = (samples, npes, W.full, timeline, cfg.eps, cfg.rope_dim, tuple(sorted(dims.items())))
-        if key not in Qwen35MonoKernel._cache:
-            Qwen35MonoKernel._cache[key] = build_qwen35_kernel(
-                samples, npes, W.full, eps=cfg.eps, rope_dim=cfg.rope_dim, timeline=timeline, **dims
+        self.key = (samples, npes, full, timeline, cfg.eps, cfg.rope_dim, tuple(sorted(dims.items())))
+        if self.key not in Qwen35Variant._cache:
+            Qwen35Variant._cache[self.key] = build_qwen35_kernel(
+                samples, npes, full, eps=cfg.eps, rope_dim=cfg.rope_dim, timeline=timeline, **dims
             )
-        self.launch = Qwen35MonoKernel._cache[key]
+        self.launch = Qwen35Variant._cache[self.key]
         # the step advance clears mailbox pairs; the plain-f32 "xqd" region sits last and is skipped
         adv_key = (self.scr_layout["xqd"] // 8, self.sym_layout["_bytes"] // 8)
-        if adv_key not in Qwen35MonoKernel._adv_cache:
-            Qwen35MonoKernel._adv_cache[adv_key] = build_advance_step(*adv_key)
-        self._advance = Qwen35MonoKernel._adv_cache[adv_key]
-        self.stages = stage_tasks(samples, W.full, **dims)
+        if adv_key not in Qwen35Variant._adv_cache:
+            Qwen35Variant._adv_cache[adv_key] = build_advance_step(*adv_key)
+        self._advance = Qwen35Variant._adv_cache[adv_key]
+        self.stages = stage_tasks(samples, full, **dims)
         n_tasks = sum(n for _, n in self.stages)
         self.timeline = torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev) if timeline else None
+
+    def advance_step(self):
+        """``step += 1`` and clear a slice of stale mailbox pairs; graph-capturable."""
+        self._advance(self.step.data_ptr(), self.scratch.data_ptr(), self.sym, stream=torch.cuda.current_stream())
+
+    def close(self):
+        self.peer_buffer.close()
+
+
+class Qwen35MonoKernel:
+    """One rank of one decoder layer: its packed weights, run on a ``Qwen35Variant``.
+
+    State belongs to the caller (ATOM's pools): a GDN layer's conv / recurrent state with per-sample
+    ``slots_in`` / ``slots_out``; a full-attention layer's paged FP8 K / V cache, its scales, positions,
+    block tables and slot mapping, and the RoPE tables. ``packed`` shares another instance's packed
+    weights (one copy per layer for every sample count); ``variant`` shares a variant (its kind and
+    sample count must match)."""
+
+    def __init__(
+        self,
+        W: LayerWeights,
+        samples: int,
+        rank: int = 0,
+        npes: int = 1,
+        group=None,
+        timeline=False,
+        variant: "Qwen35Variant | None" = None,
+        packed: dict | None = None,
+    ):
+        self.W, self.S, self.rank, self.npes, self.full = W, samples, rank, npes, W.full
+        self.packed = pack_layer_weights(W) if packed is None else packed
+        self._owns_variant = variant is None
+        if variant is None:
+            variant = Qwen35Variant(W.cfg, samples, W.full, rank, npes, group, timeline)
+        elif (variant.S, variant.full, variant.npes, variant.rank) != (samples, W.full, npes, rank):
+            raise ValueError("the variant was built for another sample count, layer kind or rank")
+        self.variant = variant
+        self.scr_layout, self.scratch = variant.scr_layout, variant.scratch
+        self.stages, self.timeline = variant.stages, variant.timeline
 
     def forward(self, h, *, gdn_state=None, kv=None, rope=None, x_out=None, layer=0, advance=True):
         """One layer on the residual ``h`` [S, hidden] bf16; updates the state in place.
 
         GDN: ``gdn_state = (conv_state, ssm_state, slots_in, slots_out)``. Full attention: ``kv = (k_cache,
-        v_cache, k_scale, v_scale, positions, block_tables)`` in ATOM's MHA pool layout and ``rope = (cos,
-        sin)``, f32 ``[positions, rope_dim / 2]``."""
+        v_cache, k_scale, v_scale, positions, block_tables, slot_mapping)`` in ATOM's MHA pool layout (the
+        new token goes to cache slot ``slot_mapping[s]``, -1 = no write) and ``rope = (cos, sin)``, f32
+        ``[positions, rope_dim / 2]``."""
         cfg, S = self.W.cfg, self.S
         if tuple(h.shape) != (S, cfg.hidden) or h.dtype != torch.bfloat16 or not h.is_contiguous():
             raise ValueError(f"h must be contiguous bfloat16 {(S, cfg.hidden)}, got {tuple(h.shape)} {h.dtype}")
@@ -129,12 +166,13 @@ class Qwen35MonoKernel:
 
         z = torch.zeros(1, dtype=torch.int32, device=h.device)
         conv = ssm = sl_in = sl_out = z
-        kc = vc = ks = vs = pos = bt = cos = sin = z
+        kc = vc = ks = vs = pos = bt = slots = cos = sin = z
         bt_stride = 0
         if self.full:
-            kc, vc, ks, vs, pos, bt = kv
+            kc, vc, ks, vs, pos, bt, slots = kv
             cos, sin = rope
             i32("positions", pos, (S,))
+            i32("slot_mapping", slots, (S,))
             i32("block_tables", bt, (S,))
             if kc.dtype not in (torch.float8_e4m3fn, torch.uint8) or kc.shape[1:] != (1, cfg.head_dim // 16, 16, 16):
                 raise ValueError("k_cache must be FP8 [blocks, 1, head_dim / 16, 16, 16] (ATOM's MHA pool)")
@@ -157,7 +195,8 @@ class Qwen35MonoKernel:
         p = self.packed
         ptr = lambda x: x.data_ptr()  # noqa: E731
         ptr0 = lambda k: p[k].data_ptr() if k in p else 0  # noqa: E731
-        self.launch(
+        v = self.variant
+        v.launch(
             ptr(h),
             ptr(x_out),
             ptr(sl_in),
@@ -166,6 +205,7 @@ class Qwen35MonoKernel:
             ptr(ssm),
             ptr(pos),
             ptr(bt),
+            ptr(slots),
             ptr(kc),
             ptr(vc),
             ptr(ks),
@@ -190,11 +230,11 @@ class Qwen35MonoKernel:
             ptr(p["s_ug"]),
             ptr(p["w_dn"]),
             ptr(p["s_dn"]),
-            ptr(self.scratch),
-            self.sym,
-            ptr(self.peers),
-            0 if self.timeline is None else ptr(self.timeline),
-            ptr(self.step),
+            ptr(v.scratch),
+            v.sym,
+            ptr(v.peers),
+            0 if v.timeline is None else ptr(v.timeline),
+            ptr(v.step),
             self.rank,
             layer,
             bt_stride,
@@ -205,8 +245,7 @@ class Qwen35MonoKernel:
         return x_out
 
     def advance_step(self):
-        """``step += 1`` and clear a slice of stale mailbox pairs; graph-capturable."""
-        self._advance(self.step.data_ptr(), self.scratch.data_ptr(), self.sym, stream=torch.cuda.current_stream())
+        self.variant.advance_step()
 
     def debug(self, name: str, shape, dtype=torch.float32, bf2=False) -> torch.Tensor:
         """A scratch mailbox's values (``bf2``: two bf16 per value word)."""
@@ -270,4 +309,6 @@ class Qwen35MonoKernel:
         return "\n".join(rows)
 
     def close(self):
-        self.peer_buffer.close()
+        """Close the variant's IPC mappings if this layer created it; a shared variant is the caller's."""
+        if self._owns_variant:
+            self.variant.close()
