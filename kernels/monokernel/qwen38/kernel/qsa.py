@@ -20,7 +20,6 @@ from flydsl.expr.typing import T
 from kernels.common import buffer_ops as bo
 from kernels.monokernel.helpers import traced
 from kernels.monokernel.ops import (
-    bf2_f32,
     bf16_round,
     exp,
     ld_bf16,
@@ -95,7 +94,7 @@ def qsa_stages(ctx):
     wave = ctx["wave"]
     xs = ctx["xs"]
     NQH = NQ // KVH  # query heads per kv head
-    assert NQH <= 16 and HD % 64 == 0 and IHD <= THREADS and IH * IHD <= THREADS
+    assert NQH <= 16 and HD % 64 == 0 and IHD <= THREADS and IH * IHD <= THREADS and IH == 4
     QR, GR = NQ * HD, NQ * HD  # gate rows, then query rows
     KVR = 2 * KVH * HD
     r_pos, r_bt, r_slot = rsrc(positions), rsrc(block_tables), rsrc(slot_mapping)
@@ -206,9 +205,14 @@ def qsa_stages(ctx):
                     put(mb("cnew"), s * IHD + dd, c)
         stamp("qk", tt, 4)
 
-    # ================================ 3. indexer scores (only when more groups than the budget)
+    # ================================ 3. indexer scores (only when more groups than the budget), on the matrix
+    # cores: a wave's 64 groups as 4 x 16 A rows (compressed keys straight from the cache), the index heads as B
+    # columns; relu, then the heads summed across their lanes
     NSC = -(-MAXG // THREADS)
     ISCALE = IHD**-0.5
+    IQROW = IHD + 8  # bf16 elements per index-query row in kvt (heads >= IH stay zero)
+    CNB = 16 * IQROW  # kvt offset of this token's compressed key (bf16)
+    v8b_ = fx.Vector.make_type(8, fx.BFloat16)
     for tt in range(start("i_score"), S * NSC, G):
         tt = fx.Int32(tt)
         s = tt // NSC
@@ -218,33 +222,46 @@ def qsa_stages(ctx):
         n = (pos + 1) // RATIO
         if (n > SEL) & (sb * THREADS < n):
             gpu.barrier()
-            if tid < IH * IHD:
-                lds_st(xs, tid, poll([(mb("iq"), s * IH * IHD + tid, 1)])[0][0].bitcast(fx.Float32))
+            hq = tid // IHD
+            iqv = poll([(mb("iq"), s * IH * IHD + fx.min(tid, IH * IHD - 1), 1)])[0][0].bitcast(fx.Float32)
+            fx.ptr_store((tid < IH * IHD).select(iqv, fx.Float32(0.0)).to(fx.BFloat16), kvt + (hq * IQROW + tid % IHD))
+            for i in range_constexpr(-(-(16 - IH) * IHD // THREADS)):
+                z = fx.min(tid + i * THREADS, (16 - IH) * IHD - 1)
+                fx.ptr_store(fx.Float32(0.0).to(fx.BFloat16), kvt + ((IH + z // IHD) * IQROW + z % IHD))
             closing = (pos + 1) % RATIO == 0
             if closing & (tid < IHD):
-                lds_st(xs, IH * IHD + tid, poll([(mb("cnew"), s * IHD + tid, 1)])[0][0].bitcast(fx.Float32))
+                cv = poll([(mb("cnew"), s * IHD + tid, 1)])[0][0].bitcast(fx.Float32)
+                fx.ptr_store(cv.to(fx.BFloat16), kvt + (CNB + tid))
             gpu.barrier()
             stamp("i_score", tt, 2)
-            c = sb * THREADS + tid
-            cc = fx.min(c, n - 1)
-            use_new = closing & (cc == n - 1)
-            cb = ld_block(s, cc // (BS // RATIO))
-            base = (cb * (BS // RATIO) + cc % (BS // RATIO)) * IHD // 2
-            dots = [fx.Float32(0.0) for _ in range(IH)]
-            for i in range_constexpr(IHD // 8):
-                w4 = fx.Vector(bo.buffer_load(r_cc, base + 4 * i, vec_width=4, dtype=T.i32))
-                for e2 in range_constexpr(4):
-                    pair = bf2_f32(w4[e2])
-                    for e in range_constexpr(2):
-                        k_ = 8 * i + 2 * e2 + e
-                        kv = use_new.select(lds_ld(xs, IH * IHD + k_), pair[e])
-                        for h in range_constexpr(IH):
-                            dots[h] = dots[h] + kv * lds_ld(xs, h * IHD + k_)
-            sc = fx.Float32(0.0)
-            for h in range_constexpr(IH):
-                sc = sc + fx.max(dots[h], fx.Float32(0.0))
-            if c < n:
-                put(mb("isc"), s * MAXG + c, sc * ISCALE)
+            qbi = [
+                fx.Vector(fx.ptr_load(kvt + ((lane % 16) * IQROW + 32 * kb + 8 * (lane // 16)), result_type=v8b_))
+                for kb in range(IHD // 32)
+            ]
+            for rg in range_constexpr(4):
+                g0 = sb * THREADS + wave * 64 + 16 * rg
+                ga = fx.min(g0 + lane % 16, n - 1)  # this lane's A row (group)
+                use_new = closing & (ga == n - 1)
+                cb = ld_block(s, ga // (BS // RATIO))
+                base = (cb * (BS // RATIO) + ga % (BS // RATIO)) * IHD
+                c4 = fx.Vector.filled(4, 0.0, fx.Float32)
+                for kb in range_constexpr(IHD // 32):
+                    k0 = 32 * kb + 8 * (lane // 16)
+                    w4 = fx.Vector(bo.buffer_load(r_cc, (base + k0) // 2, vec_width=4, dtype=T.i32))
+                    nw = fx.Vector(fx.ptr_load(kvt + (CNB + k0), result_type=v8b_)).bitcast(fx.Int32)
+                    w4 = fx.Vector.from_elements([use_new.select(nw[e], w4[e]) for e in range(4)], fx.Int32)
+                    c4 = fx.Vector(
+                        rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [w4.bitcast(fx.BFloat16), qbi[kb], c4])
+                    )
+                # C[group 4 (lane // 16) + e][head lane % 16]: relu, sum the IH head lanes
+                for e in range_constexpr(4):
+                    v = fx.max(c4[e], fx.Float32(0.0))
+                    v = (lane % 16 < IH).select(v, fx.Float32(0.0))
+                    for o_ in (1, 2):
+                        v = v + xshfl(v, o_)
+                    g = g0 + 4 * (lane // 16) + e
+                    if (lane % 16 == 0) & (g < n):
+                        put(mb("isc"), s * MAXG + g, v * ISCALE)
         stamp("i_score", tt, 4)
 
     # ================================ 4. top-SEL groups (exact radix select; ties to the lower group id)
@@ -282,9 +299,9 @@ def qsa_stages(ctx):
                     put(mb("gsel"), s * SEL + e, e)
         else:
             keys = []
+            got = poll([(mb("isc"), s * MAXG + fx.min(tid * TRIPS + j, n - 1), 1) for j in range(TRIPS)])
             for j in range_constexpr(TRIPS):
-                c = fx.min(fx.Int32(j * THREADS) + tid, n - 1)
-                kb = poll([(mb("isc"), s * MAXG + c, 1)])[0][0]
+                kb = got[j][0]
                 keys.append((kb >= 0).select(kb ^ fx.Int32(MIN_I32), ~kb))
             stamp("i_topk", s, 2)
             pfx = fx.Int32(0)
@@ -297,7 +314,7 @@ def qsa_stages(ctx):
                     lds_st(hist, tid, fx.Int32(0))
                 gpu.barrier()
                 for j in range_constexpr(TRIPS):
-                    c = fx.Int32(j * THREADS) + tid
+                    c = tid * TRIPS + j
                     u = keys[j]
                     if (c < n) & (((u ^ pfx) & hi) == 0):
                         fx.atomic_add(hist + ((u >> sh) & 255), fx.Int32(1), syncscope=fx.rocdl.SyncScope.Workgroup)
@@ -314,22 +331,28 @@ def qsa_stages(ctx):
                 gt = gt + lds_ld(hist, 257)
                 gpu.barrier()
             thr = pfx ^ MIN_I32
-            # compaction in group order: above the threshold to [0, gt), the first ties to [gt, k_want)
-            na = fx.Int32(0)
-            nt = fx.Int32(0)
+            # compaction in group order (thread order, then j): above the threshold to [0, gt), the first ties
+            # to [gt, k_want); one scan per class over the per-thread counts
+            ca = fx.Int32(0)
+            ct = fx.Int32(0)
             for j in range_constexpr(TRIPS):
-                c = fx.Int32(j * THREADS) + tid
+                c = tid * TRIPS + j
+                sk = keys[j] ^ MIN_I32
+                ca = ca + ((c < n) & (sk > thr)).select(fx.Int32(1), fx.Int32(0))
+                ct = ct + ((c < n) & (sk == thr)).select(fx.Int32(1), fx.Int32(0))
+            pa, _ta = block_excl_scan(ca)
+            pt, _tt = block_excl_scan(ct)
+            for j in range_constexpr(TRIPS):
+                c = tid * TRIPS + j
                 sk = keys[j] ^ MIN_I32
                 is_a = (c < n) & (sk > thr)
                 is_t = (c < n) & (sk == thr)
-                pa, ta = block_excl_scan(is_a.select(fx.Int32(1), fx.Int32(0)))
-                pt, tt_ = block_excl_scan(is_t.select(fx.Int32(1), fx.Int32(0)))
                 if is_a:
-                    put(mb("gsel"), s * SEL + na + pa, c)
-                if is_t & (gt + nt + pt < k_want):
-                    put(mb("gsel"), s * SEL + gt + nt + pt, c)
-                na = na + ta
-                nt = nt + tt_
+                    put(mb("gsel"), s * SEL + pa, c)
+                if is_t & (gt + pt < k_want):
+                    put(mb("gsel"), s * SEL + gt + pt, c)
+                pa = pa + is_a.select(fx.Int32(1), fx.Int32(0))
+                pt = pt + is_t.select(fx.Int32(1), fx.Int32(0))
         if tid == 0:
             put(mb("gcnt"), s, k_want)
         stamp("i_topk", s, 4)
@@ -596,6 +619,8 @@ def qsa_stages(ctx):
             lds_st(outs, tid, bf16_round(o * bf16_round(sigmoid(gate))))
         gpu.barrier()
         if tid < MT // 2:
-            put_bf(mb("gated"), s * OUT_K + h * HD + dt * MT + 2 * tid, [lds_ld(outs, 2 * tid), lds_ld(outs, 2 * tid + 1)])
+            put_bf(
+                mb("gated"), s * OUT_K + h * HD + dt * MT + 2 * tid, [lds_ld(outs, 2 * tid), lds_ld(outs, 2 * tid + 1)]
+            )
         stamp("merge", tt, 4)
     return {}

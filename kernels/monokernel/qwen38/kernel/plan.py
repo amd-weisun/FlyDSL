@@ -69,7 +69,7 @@ def n_groups(dims: dict) -> int:
 def n_split(S: int, dims: dict) -> int:
     """Attention splits per (sample, kv head): about one task per CTA, at most one per tile."""
     max_tiles = -(-(dims["index_budget"] // dims["index_ratio"] + 1) // (KT // dims["index_ratio"]))
-    return max(1, min(max_tiles, 128 // (S * dims["kv_heads"])))
+    return max(1, min(max_tiles, 256 // (S * dims["kv_heads"])))
 
 
 def out_k(full: bool, dims: dict) -> int:
