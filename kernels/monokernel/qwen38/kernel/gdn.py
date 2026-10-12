@@ -55,7 +55,7 @@ def proj_stage_rows(ctx, name, mats, src, epilogue):
     n_rows = sum(r for _, r in mats)
     rg0 = mats[0][1] // 16
     assert mats[0][1] % 16 == 0 and len(mats) <= 2
-    batch = max(1, NKC // WAVES)
+    batch = UPW  # every unit of the task in flight before the input wait
     for t in range(start(name), -(-n_rows // ROWS), G):
         t = fx.Int32(t)
         stamp(name, t, 0)

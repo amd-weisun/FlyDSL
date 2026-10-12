@@ -139,12 +139,12 @@ def ffn_stages(ctx):
             kc = (wave % 4) * SH_UPW + c
             return unit_bf16_rows(r_shug, rg_s, kc, HIDDEN, (n_sel() * HIDDEN + kc * 64) // 2)
 
-        pre = [u_s(c) for c in range(SH_UPW // 2)]
+        pre = [u_s(c) for c in range(SH_UPW)]  # every unit in flight before the input wait
         gpu.barrier()
         stage_m()
         gpu.barrier()
         stamp("sh_ug", t, 2)
-        acc = run_units(u_s, SH_UPW, SH_UPW // 2, pre)
+        acc = run_units(u_s, SH_UPW, SH_UPW, pre)
         reduce_rows(2, acc, emit_out(32))
         gpu.barrier()
         if tid < S * SH_TILE // 2:
