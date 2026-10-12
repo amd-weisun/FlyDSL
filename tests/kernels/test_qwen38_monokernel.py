@@ -195,3 +195,129 @@ def test_qwen38_qsa_layer_matches_golden(S):
         print(f"QSA S={S} step {step} pos {pos.tolist()}", {k: f"{v:.2e}" for k, v in errs.items()})
         bad = {k: v for k, v in errs.items() if not v <= 2e-2}  # NaN fails too
         assert not bad, f"step {step}: {bad} (all: {errs})"
+
+
+# MTP verify: T tokens per sequence in one launch == T sequential decode steps of the golden
+MTP_CASES = [(2, 1), (2, 4), (3, 2), (4, 2)]  # (tokens per sequence, sequences)
+
+
+@pytest.mark.parametrize("T,Q", MTP_CASES)
+def test_qwen38_gdn_mtp_verify_matches_sequential_golden(T, Q):
+    cfg = Q38Config()
+    W = make_weights(cfg, full=False)
+    gen = torch.Generator(device="cuda").manual_seed(17)
+    S = Q * T
+    n_slots = S + 3
+    spec = (torch.randperm(n_slots - 3, generator=torch.Generator().manual_seed(5))[:S] + 2).view(Q, T)
+    n_acc = torch.tensor([1 + (3 * q + 1) % T for q in range(Q)], dtype=torch.int32)
+    conv_k = (0.5 * torch.randn(n_slots, T + 2, cfg.conv_dim, generator=gen, device="cuda")).to(torch.bfloat16)
+    ssm_k = 0.1 * torch.randn(n_slots, cfg.linear_v_heads, 128, 128, generator=gen, device="cuda")
+    conv_g = torch.stack([conv_k[spec[q, 0], int(n_acc[q]) - 1 : int(n_acc[q]) + 2] for q in range(Q)]).clone()
+    ssm_g = torch.stack([ssm_k[spec[q, int(n_acc[q]) - 1]] for q in range(Q)]).clone()
+    sl = torch.arange(Q, dtype=torch.int32, device="cuda")
+    old_window = conv_k[spec[:, 0]].clone()
+    X = torch.randn(S, cfg.streams, generator=gen, device="cuda").to(torch.bfloat16)
+    layer = Qwen38MonoKernel(W, S, tokens_per_seq=T)
+    out = layer.forward(X, gdn_state=(conv_k, ssm_k, n_acc.cuda(), spec.flatten().to(torch.int32).cuda().contiguous()))
+    torch.cuda.synchronize()
+    got = layer.intermediates()
+    rows = torch.arange(Q) * T
+    for j in range(T):
+        ref = golden_layer(W, X[rows + j], gdn_state=(conv_g, ssm_g, sl, sl))
+        errs = {
+            "conv": _rel(got["conv"][rows + j], ref["conv_out"]),
+            "gated": _rel(got["gated"][rows + j], ref["gated"].flatten(1)),
+            "x1_delta": _rel(got["x1"][rows + j] - X[rows + j].float(), ref["x1"] - X[rows + j].float()),
+            "ssm_snapshot": _rel(ssm_k[spec[:, j]], ssm_g),
+        }
+        print(f"GDN MTP T={T} Q={Q} token {j}", {k: f"{v:.2e}" for k, v in errs.items()})
+        bad = {k: v for k, v in errs.items() if not v <= 2e-2}
+        assert not bad, f"token {j}: {bad} (all: {errs})"
+    assert torch.isfinite(out.float()).all()
+    new_window = conv_k[spec[:, 0]]
+    for q in range(Q):
+        na = int(n_acc[q])
+        assert torch.equal(new_window[q, :2], old_window[q, na : na + 2])
+    assert _rel(new_window[:, T - 1 :], conv_g) < 1e-2, "the last three inputs are the golden's conv state"
+
+
+# per-sequence first positions: groups close inside the launch, dense and past the budget
+MTP_POS = {1: [2899], 2: [37, 2501], 4: [62, 1001, 2050, 2897]}
+
+
+@pytest.mark.parametrize("T,Q", MTP_CASES)
+def test_qwen38_qsa_mtp_verify_matches_sequential_golden(T, Q):
+    cfg = Q38Config()
+    W = make_weights(cfg, full=True)
+    t = W.t
+    gen = torch.Generator(device="cuda").manual_seed(19)
+    S = Q * T
+    pos0 = MTP_POS[Q]
+    nb = MAX_SEQ // 16
+    bt = torch.randperm(Q * nb, generator=torch.Generator().manual_seed(3)).view(Q, nb).to(torch.int32).cuda()
+    bfl = torch.bfloat16
+    kc = torch.zeros(Q * nb, 16, cfg.kv_heads, cfg.head_dim, dtype=bfl, device="cuda")
+    vc = torch.zeros_like(kc)
+    ic = torch.zeros(Q * nb, 16, 1, cfg.index_dim, dtype=bfl, device="cuda")
+    cc = torch.zeros(Q * nb, 4, 1, cfg.index_dim, dtype=bfl, device="cuda")
+    kg = torch.zeros(Q, MAX_SEQ, cfg.kv_heads, cfg.head_dim, device="cuda")
+    vg, ig = torch.zeros_like(kg), torch.zeros(Q, MAX_SEQ, cfg.index_dim, device="cuda")
+    cg = torch.zeros(Q, MAX_SEQ // 4, cfg.index_dim, device="cuda")
+    for q in range(Q):
+        p = pos0[q]
+        kg[q, :p] = torch.randn(p, cfg.kv_heads, cfg.head_dim, generator=gen, device="cuda").to(bfl).float()
+        vg[q, :p] = torch.randn(p, cfg.kv_heads, cfg.head_dim, generator=gen, device="cuda").to(bfl).float()
+        ig[q, :p] = torch.randn(p, cfg.index_dim, generator=gen, device="cuda").to(bfl).float()
+        ng = p // 4
+        pk = ig[q, : ng * 4].view(ng, 4, -1).mean(1).to(bfl).float()
+        c0, s0 = rope_cos_sin(torch.arange(ng, device="cuda") * 4, cfg)
+        cg[q, :ng] = apply_rope(rmsnorm1p(pk, t["g_ik"], cfg.eps).to(bfl).float()[:, None], c0, s0)[:, 0]
+        tok = torch.arange(p, device="cuda")
+        blk, off = bt[q, tok // 16].long(), tok % 16
+        kc[blk, off], vc[blk, off], ic[blk, off, 0] = kg[q, :p].to(bfl), vg[q, :p].to(bfl), ig[q, :p].to(bfl)
+        grp = torch.arange(ng, device="cuda")
+        cc[bt[q, grp // 4].long(), grp % 4, 0] = cg[q, :ng].to(bfl)
+    cos, sin = rope_tables(cfg, MAX_SEQ)
+    X = torch.randn(S, cfg.streams, generator=gen, device="cuda").to(bfl)
+    seq = torch.arange(S, device="cuda") // T
+    pos = (torch.tensor(pos0, device="cuda")[seq] + torch.arange(S, device="cuda") % T).to(torch.int32)
+    bt_rows = bt[seq].contiguous()
+    slots = (bt_rows[torch.arange(S), pos.long() // 16] * 16 + pos % 16).to(torch.int32)
+    layer = Qwen38MonoKernel(W, S, max_seq=MAX_SEQ, tokens_per_seq=T)
+    out = layer.forward(X, kv=(kc, vc, ic, cc, pos, bt_rows, slots), rope=(cos, sin))
+    torch.cuda.synchronize()
+    got = layer.intermediates()
+    assert torch.isfinite(out.float()).all()
+    rows = torch.arange(Q, device="cuda") * T
+    kv_of = torch.arange(cfg.heads, device="cuda") // (cfg.heads // cfg.kv_heads)
+    for j in range(T):
+        ref = golden_layer(W, X[rows + j], qsa_state=(kg, vg, ig, cg, pos[rows + j]))
+        errs = {"q": _rel(got["q"][rows + j], ref["q"]), "iq": _rel(got["iq"][rows + j], ref["iq"])}
+        gated_own = torch.zeros(Q, cfg.heads, cfg.head_dim, device="cuda")
+        for q in range(Q):
+            r_ = q * T + j
+            p = int(pos[r_])
+            ng = (p + 1) // 4
+            if (p + 1) % 4 == 0:  # the group this token closes, as the kernel wrote it
+                errs[f"ck{q}"] = _rel(cc[bt[q, (ng - 1) // 4], (ng - 1) % 4, 0], cg[q, ng - 1])
+            n_sel = int(got["gcnt"][r_])
+            assert n_sel == min(ng, cfg.block_topk)
+            sel = got["gsel"][r_, :n_sel].long()
+            if ng > cfg.block_topk:
+                sc = torch.relu(got["iq"][r_] @ cg[q, :ng].T).sum(0) / cfg.index_dim**0.5
+                out_ = torch.ones(ng, dtype=torch.bool, device="cuda")
+                out_[sel] = False
+                assert float(sc[sel].min()) >= float(sc[out_].max()) - 1e-4 * float(sc.abs().max())
+            toks = torch.cat(
+                [
+                    (sel[:, None] * 4 + torch.arange(4, device="cuda")).flatten(),
+                    torch.arange(ng * 4, p + 1, device="cuda"),
+                ]
+            )
+            lg = torch.einsum("hd,thd->ht", ref["q"][q], kg[q, toks][:, kv_of]) * cfg.head_dim**-0.5
+            o_ = torch.einsum("ht,thd->hd", torch.softmax(lg, -1), vg[q, toks][:, kv_of])
+            gated_own[q] = (o_.to(bfl).float() * torch.sigmoid(ref["gate"][q]).to(bfl).float()).to(bfl).float()
+        errs["gated_own_sel"] = _rel(got["gated"][rows + j], gated_own.flatten(1))
+        print(f"QSA MTP T={T} Q={Q} token {j}", {k: f"{v:.2e}" for k, v in errs.items()})
+        bad = {k: v for k, v in errs.items() if not v <= 2e-2}
+        assert not bad, f"token {j}: {bad} (all: {errs})"

@@ -58,7 +58,7 @@ from kernels.monokernel.qwen38.kernel.plan import (
 from kernels.monokernel.qwen38.kernel.qsa import qsa_stages
 
 ARGS = (
-    "h_in x_out slots_in slots_out conv_state ssm_state "
+    "h_in x_out slots_in slots_out n_accepted conv_state ssm_state "
     "positions block_tables slot_mapping k_cache v_cache i_cache c_cache rope_cos rope_sin g_qn1 g_kn1 g_iq1 g_ik1 "
     "w_qkv w_idx "
     "hca_g hca_down hca_up hca_inj hcm_g hcm_down hcm_up hcm_inj "
@@ -67,7 +67,7 @@ ARGS = (
 ).split()
 
 
-def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
+def build_qwen38_kernel(S: int, full: bool, *, timeline=False, tokens_per_seq=1, **dims):
     """Return the ``@flyc.jit`` launcher for one whole layer: QSA when ``full``, else Gated DeltaNet."""
     assert 1 <= S <= 8
     assert dims["k_dim"] == dims["v_dim"] == 128 and dims["hv"] % dims["hk"] == 0
@@ -78,7 +78,9 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
     assert HIDDEN % HC_KS == 0 and LOWRANK % 64 == 0 and HIDDEN % 32 == 0
     HK, HV, K_DIM, V_DIM = dims["hk"], dims["hv"], dims["k_dim"], dims["v_dim"]
     VPK = HV // HK
-    GDN_HPT = gdn_hpt(S, HV)
+    T_SEQ = tokens_per_seq
+    assert S % T_SEQ == 0
+    GDN_HPT = gdn_hpt(S // T_SEQ, HV)
     g = gdn_dims(dims)
     KEY_DIM, VALUE_DIM, CONV_DIM = g["key_dim"], g["value_dim"], g["conv_dim"]
     assert CONV_DIM % (PROJ_TILE * PROJ_GROUPS) == 0
@@ -110,7 +112,7 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
     G = BLOCKS
     SC = layout(S, full, **dims)
     SY = {"_bytes": 0}
-    stages = stage_tasks(S, full, **dims)
+    stages = stage_tasks(S, full, tokens_per_seq=T_SEQ, **dims)
     base, first, acc = {}, {}, 0
     for name, n in stages:
         first[name] = acc
@@ -155,6 +157,7 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
         x_out: Int64,
         slots_in: Int64,
         slots_out: Int64,
+        n_accepted: Int64,
         conv_state: Int64,
         ssm_state: Int64,
         positions: Int64,
@@ -239,6 +242,7 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
         x_out: Int64,
         slots_in: Int64,
         slots_out: Int64,
+        n_accepted: Int64,
         conv_state: Int64,
         ssm_state: Int64,
         positions: Int64,
@@ -289,6 +293,7 @@ def build_qwen38_kernel(S: int, full: bool, *, timeline=False, **dims):
             x_out,
             slots_in,
             slots_out,
+            n_accepted,
             conv_state,
             ssm_state,
             positions,

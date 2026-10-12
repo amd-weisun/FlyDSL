@@ -166,8 +166,8 @@ def layout(S: int, full: bool, **dims):
     return scratch
 
 
-def stage_tasks(S: int, full: bool, **dims):
-    """[(stage name, task count)] in execution order."""
+def stage_tasks(S: int, full: bool, tokens_per_seq: int = 1, **dims):
+    """[(stage name, task count)] in execution order (``tokens_per_seq``: MTP verify, a GDN task per sequence)."""
     H = dims["hidden"]
     KS, RR = hc_ksplit(dims), hc_rows(dims)
 
@@ -191,7 +191,7 @@ def stage_tasks(S: int, full: bool, **dims):
     else:
         mixer = [
             ("proj", -(-proj_rows(full, dims) // (PROJ_TILE * PROJ_GROUPS))),
-            ("gdn", S * dims["hv"] // gdn_hpt(S, dims["hv"])),
+            ("gdn", S // tokens_per_seq * dims["hv"] // gdn_hpt(S // tokens_per_seq, dims["hv"])),
         ]
     return (
         hc("a")

@@ -99,6 +99,7 @@ def gdn_stages(ctx):
     KEY_DIM = ctx["KEY_DIM"]
     K_DIM = ctx["K_DIM"]
     S = ctx["S"]
+    T_SEQ = ctx["T_SEQ"]
     VALUE_DIM = ctx["VALUE_DIM"]
     VPK = ctx["VPK"]
     V_DIM = ctx["V_DIM"]
@@ -108,6 +109,7 @@ def gdn_stages(ctx):
     g_norm = ctx["g_norm"]
     lane = ctx["lane"]
     mb = ctx["mb"]
+    n_accepted = ctx["n_accepted"]
     outs = ctx["outs"]
     poll = ctx["poll"]
     put = ctx["put"]
@@ -124,8 +126,13 @@ def gdn_stages(ctx):
     wave = ctx["wave"]
     xs = ctx["xs"]
 
-    r_si, r_so = rsrc(slots_in), rsrc(slots_out)
+    r_si, r_so, r_na = rsrc(slots_in), rsrc(slots_out), rsrc(n_accepted)
     r_conv, r_wc = rsrc(conv_state), rsrc(w_conv)
+    # MTP verify (T_SEQ > 1): rows q * T_SEQ + j are token j of sequence q; slots_out[row] = the state slot after
+    # the row's token (ATOM's spec_state_indices), n_accepted[q] = the tokens the last step accepted. The
+    # sequence's conv window lives in token 0's slot (CW = T_SEQ + 2 inputs, read from n_accepted - 1).
+    CW = T_SEQ + 2
+    ROWS = PROJ_TILE * PROJ_GROUPS
 
     # ================================ 1. [q | k | v | z | b | a] (BF16), conv fused
     def conv_epilogue(s, ch, v):
@@ -143,9 +150,31 @@ def gdn_stages(ctx):
                 bo.buffer_store(val.to(fx.BFloat16), r_conv, (so * 3 + j) * CONV_DIM + ch)
         put(mb("conv"), s * CONV_DIM + ch, ok.select(bf16_round(silu(acc)), fx.Float32(0.0)))
 
+    def conv_epilogue_mtp(s, ch, v):
+        """Channel ``ch`` of every token of sequence ``s // T_SEQ`` (on token 0's thread): the window [3 stored
+        inputs from n_accepted - 1, this launch's T_SEQ] -> T_SEQ outputs; the stored inputs shift by one (ATOM's
+        speculative causal_conv1d_update)."""
+        if s % T_SEQ == 0:
+            so = fx.Int32(bo.buffer_load(r_so, s, vec_width=1, dtype=T.i32))
+            na = fx.Int32(bo.buffer_load(r_na, s // T_SEQ, vec_width=1, dtype=T.i32))
+            ok = (so >= 0) & (na >= 1)
+            base = fx.max(so, 0) * CW + fx.max(na - 1, 0)
+            win = [ld_bf16(r_conv, (base + j) * CONV_DIM + ch) for j in range(3)]
+            win += [bf16_round(lds_ld(outs, (s + j) * ROWS + ch % ROWS)) for j in range(T_SEQ)]
+            wv = fx.Vector(bo.buffer_load(r_wc, ch * 4, vec_width=4, dtype=T.bf16)).to(fx.Float32)
+            for j in range_constexpr(T_SEQ):
+                acc = win[j] * wv[0] + win[j + 1] * wv[1] + win[j + 2] * wv[2] + win[j + 3] * wv[3]
+                put(mb("conv"), (s + j) * CONV_DIM + ch, ok.select(bf16_round(silu(acc)), fx.Float32(0.0)))
+            if ok:
+                for i in range_constexpr(CW):
+                    bo.buffer_store(win[i + 1].to(fx.BFloat16), r_conv, (fx.max(so, 0) * CW + i) * CONV_DIM + ch)
+
     def proj_epilogue(s, row, v):
         if row < CONV_DIM:
-            conv_epilogue(s, row, v)
+            if const_expr(T_SEQ == 1):
+                conv_epilogue(s, row, v)
+            else:
+                conv_epilogue_mtp(s, row, v)
         elif row < CONV_DIM + VALUE_DIM:
             put(mb("z"), s * VALUE_DIM + row - CONV_DIM, bf16_round(v))
         else:
@@ -172,108 +201,119 @@ def gdn_stages(ctx):
     XZ = XV + V_DIM
     XB = XZ + V_DIM
     lb = hl * REG
-    for tt in range(start("gdn"), S * HV // HPT, G):
+    for tt in range(start("gdn"), S // T_SEQ * HV // HPT, G):
         tt = fx.Int32(tt)
-        s = tt * HPT // HV
+        sq = tt * HPT // HV
         h0 = tt * HPT % HV
         h = h0 + hl
         stamp("gdn", tt, 0)
         gpu.barrier()
-        si = uniform(bo.buffer_load(r_si, s, vec_width=1, dtype=T.i32))
-        so = uniform(bo.buffer_load(r_so, s, vec_width=1, dtype=T.i32))
-        ok = (si >= 0) & (so >= 0)
+        if const_expr(T_SEQ == 1):
+            si = uniform(bo.buffer_load(r_si, sq, vec_width=1, dtype=T.i32))
+            live = si >= 0
+        else:
+            # MTP verify: the state after the last accepted token of the previous step
+            na = uniform(bo.buffer_load(r_na, sq, vec_width=1, dtype=T.i32))
+            si = uniform(bo.buffer_load(r_so, sq * T_SEQ + fx.max(na - 1, 0), vec_width=1, dtype=T.i32))
+            live = (si >= 0) & (na >= 1)
         # the state does not depend on this launch: issue its loads before waiting for the inputs
         r_in = rsrc(ssm_state + (fx.Int64(fx.max(si, 0)) * HV + fx.Int64(h)) * HEAD_BYTES)
         sv = [fx.Vector(bo.buffer_load(r_in, (k0_ + j) * V_DIM + v0_, vec_width=VPTH, dtype=T.f32)) for j in range(KPT)]
         alog = ld_f32(r_alog, h)
         dtb = ld_f32(r_dtb, h)
-        if tid < HPT * K_DIM:
-            hs = h0 + tid // K_DIM  # the staging thread's head
-            d = tid % K_DIM
-            got = poll(
-                [
-                    (mb("conv"), s * CONV_DIM + hs // VPK * K_DIM + d, 1),
-                    (mb("conv"), s * CONV_DIM + KEY_DIM + hs // VPK * K_DIM + d, 1),
-                    (mb("conv"), s * CONV_DIM + 2 * KEY_DIM + hs * V_DIM + d, 1),
-                    (mb("z"), s * VALUE_DIM + hs * V_DIM + d, 1),
-                ]
-            )
-            for j, off in ((0, XQ), (1, XK), (2, XV), (3, XZ)):
-                lds_st(xs, tid // K_DIM * REG + off + d, got[j][0].bitcast(fx.Float32))
-        if (tid >= HPT * K_DIM) & (tid < HPT * K_DIM + HPT):
-            jh = tid - HPT * K_DIM
-            got = poll([(mb("ba"), s * 2 * HV + h0 + jh, 1), (mb("ba"), s * 2 * HV + HV + h0 + jh, 1)])
-            lds_st(xs, jh * REG + XB, got[0][0].bitcast(fx.Float32))
-            lds_st(xs, jh * REG + XB + 1, got[1][0].bitcast(fx.Float32))
-        gpu.barrier()
-        stamp("gdn", tt, 2)
-        beta = sigmoid(lds_ld(xs, lb + XB))
-        x_sp = lds_ld(xs, lb + XB + 1) + dtb
-        softplus = (x_sp > 20.0).select(x_sp, fmath.log1p(exp(x_sp)))
-        decay = exp(-exp(alog) * softplus)
-        qx = [fx.Vector(fx.ptr_load(xs + (lb + XQ + k0_ + 4 * i), result_type=v4f)) for i in range(KPT // 4)]
-        kx = [fx.Vector(fx.ptr_load(xs + (lb + XK + k0_ + 4 * i), result_type=v4f)) for i in range(KPT // 4)]
-        qq = [qx[j // 4][j % 4] for j in range(KPT)]
-        kk = [kx[j // 4][j % 4] for j in range(KPT)]
-        qsq = fx.Float32(0.0)
-        ksq = fx.Float32(0.0)
-        kq = fx.Float32(0.0)
-        for j in range_constexpr(KPT):
-            qsq = qsq + qq[j] * qq[j]
-            ksq = ksq + kk[j] * kk[j]
-            kq = kq + kk[j] * qq[j]
-        q_scale = rsq(_sum8(qsq) + 1.0e-6) * (K_DIM**-0.5)
-        k_scale = rsq(_sum8(ksq) + 1.0e-6)
-        qq = [x * q_scale for x in qq]
-        kk = [x * k_scale for x in kk]
-        dot_kq = _sum8(kq) * q_scale * k_scale
-        dvec = fx.Vector.filled(VPTH, decay, fx.Float32)
-        skp = fx.Vector.filled(VPTH, 0.0, fx.Float32)
-        sqp = fx.Vector.filled(VPTH, 0.0, fx.Float32)
-        for j in range_constexpr(KPT):
-            sv[j] = sv[j] * dvec
-            skp = fx.math.fma(sv[j], fx.Vector.filled(VPTH, kk[j], fx.Float32), skp)
-            sqp = fx.math.fma(sv[j], fx.Vector.filled(VPTH, qq[j], fx.Float32), sqp)
-        vin = fx.Vector(fx.ptr_load(xs + (lb + XV + v0_), result_type=vvf))
-        delta = [(vin[e] - _sum8(skp[e])) * beta for e in range(VPTH)]
-        dv = fx.Vector.from_elements(delta, fx.Float32)
-        for j in range_constexpr(KPT):
-            sv[j] = fx.math.fma(fx.Vector.filled(VPTH, kk[j], fx.Float32), dv, sv[j])
-        outs_v = [bf16_round(_sum8(sqp[e]) + delta[e] * dot_kq) for e in range(VPTH)]
-        stamp("gdn", tt, 3)
-        # gated RMSNorm over the head's V_DIM outputs (lane kg 0 of each group holds its VPTH once), sigmoid gate;
-        # the sum over the head's WPH waves through LDS
-        ssq = fx.Float32(0.0)
-        for e in range_constexpr(VPTH):
-            ssq = ssq + outs_v[e] * outs_v[e]
-        wsq = wave_sum((kg == 0).select(ssq, fx.Float32(0.0)))
-        if lane == 0:
-            lds_st(red, wave, wsq)
-        gpu.barrier()
-        tot = fx.Float32(0.0)
-        for i in range_constexpr(WPH):
-            tot = tot + lds_ld(red, hl * WPH + i)
-        rstd = rsq(tot * (1.0 / V_DIM) + EPS)
-        if kg == 0:
-            for e in range_constexpr(VPTH):
-                v_idx = v0_ + e
-                nrm = bf16_round(outs_v[e] * rstd)
-                gated = bf16_round(bf16_round(nrm * ld_f32(r_gn, v_idx)) * sigmoid(lds_ld(xs, lb + XZ + v_idx)))
-                lds_st(outs, hl * V_DIM + v_idx, ok.select(gated, fx.Float32(0.0)))
-        gpu.barrier()
-        if tid < HPT * V_DIM // 2:
-            hp = tid // (V_DIM // 2)
-            jv = tid % (V_DIM // 2)
-            put_bf(
-                mb("gated"),
-                s * VALUE_DIM + (h0 + hp) * V_DIM + 2 * jv,
-                [lds_ld(outs, hp * V_DIM + 2 * jv), lds_ld(outs, hp * V_DIM + 2 * jv + 1)],
-            )
-        # the new state after the publish: out_proj waits on the gated row, not on this store
-        if ok:
-            r_o = rsrc(ssm_state + (fx.Int64(so) * HV + fx.Int64(h)) * HEAD_BYTES)
+        for tok in range_constexpr(T_SEQ):  # the sequence's tokens in order, the state in registers
+            s = sq * T_SEQ + tok
+            so = uniform(bo.buffer_load(r_so, s, vec_width=1, dtype=T.i32))
+            ok = live & (so >= 0)
+            if const_expr(tok > 0):
+                gpu.barrier()  # the previous token's LDS inputs and outputs are read
+            if tid < HPT * K_DIM:
+                hs = h0 + tid // K_DIM  # the staging thread's head
+                d = tid % K_DIM
+                got = poll(
+                    [
+                        (mb("conv"), s * CONV_DIM + hs // VPK * K_DIM + d, 1),
+                        (mb("conv"), s * CONV_DIM + KEY_DIM + hs // VPK * K_DIM + d, 1),
+                        (mb("conv"), s * CONV_DIM + 2 * KEY_DIM + hs * V_DIM + d, 1),
+                        (mb("z"), s * VALUE_DIM + hs * V_DIM + d, 1),
+                    ]
+                )
+                for j, off in ((0, XQ), (1, XK), (2, XV), (3, XZ)):
+                    lds_st(xs, tid // K_DIM * REG + off + d, got[j][0].bitcast(fx.Float32))
+            if (tid >= HPT * K_DIM) & (tid < HPT * K_DIM + HPT):
+                jh = tid - HPT * K_DIM
+                got = poll([(mb("ba"), s * 2 * HV + h0 + jh, 1), (mb("ba"), s * 2 * HV + HV + h0 + jh, 1)])
+                lds_st(xs, jh * REG + XB, got[0][0].bitcast(fx.Float32))
+                lds_st(xs, jh * REG + XB + 1, got[1][0].bitcast(fx.Float32))
+            gpu.barrier()
+            stamp("gdn", tt, 2)
+            beta = sigmoid(lds_ld(xs, lb + XB))
+            x_sp = lds_ld(xs, lb + XB + 1) + dtb
+            softplus = (x_sp > 20.0).select(x_sp, fmath.log1p(exp(x_sp)))
+            decay = exp(-exp(alog) * softplus)
+            qx = [fx.Vector(fx.ptr_load(xs + (lb + XQ + k0_ + 4 * i), result_type=v4f)) for i in range(KPT // 4)]
+            kx = [fx.Vector(fx.ptr_load(xs + (lb + XK + k0_ + 4 * i), result_type=v4f)) for i in range(KPT // 4)]
+            qq = [qx[j // 4][j % 4] for j in range(KPT)]
+            kk = [kx[j // 4][j % 4] for j in range(KPT)]
+            qsq = fx.Float32(0.0)
+            ksq = fx.Float32(0.0)
+            kq = fx.Float32(0.0)
             for j in range_constexpr(KPT):
-                bo.buffer_store(sv[j], r_o, (k0_ + j) * V_DIM + v0_)
+                qsq = qsq + qq[j] * qq[j]
+                ksq = ksq + kk[j] * kk[j]
+                kq = kq + kk[j] * qq[j]
+            q_scale = rsq(_sum8(qsq) + 1.0e-6) * (K_DIM**-0.5)
+            k_scale = rsq(_sum8(ksq) + 1.0e-6)
+            qq = [x * q_scale for x in qq]
+            kk = [x * k_scale for x in kk]
+            dot_kq = _sum8(kq) * q_scale * k_scale
+            dvec = fx.Vector.filled(VPTH, decay, fx.Float32)
+            skp = fx.Vector.filled(VPTH, 0.0, fx.Float32)
+            sqp = fx.Vector.filled(VPTH, 0.0, fx.Float32)
+            for j in range_constexpr(KPT):
+                sv[j] = sv[j] * dvec
+                skp = fx.math.fma(sv[j], fx.Vector.filled(VPTH, kk[j], fx.Float32), skp)
+                sqp = fx.math.fma(sv[j], fx.Vector.filled(VPTH, qq[j], fx.Float32), sqp)
+            vin = fx.Vector(fx.ptr_load(xs + (lb + XV + v0_), result_type=vvf))
+            delta = [(vin[e] - _sum8(skp[e])) * beta for e in range(VPTH)]
+            dv = fx.Vector.from_elements(delta, fx.Float32)
+            for j in range_constexpr(KPT):
+                sv[j] = fx.math.fma(fx.Vector.filled(VPTH, kk[j], fx.Float32), dv, sv[j])
+            outs_v = [bf16_round(_sum8(sqp[e]) + delta[e] * dot_kq) for e in range(VPTH)]
+            stamp("gdn", tt, 3)
+            # gated RMSNorm over the head's V_DIM outputs (lane kg 0 of each group holds its VPTH once), sigmoid gate;
+            # the sum over the head's WPH waves through LDS
+            ssq = fx.Float32(0.0)
+            for e in range_constexpr(VPTH):
+                ssq = ssq + outs_v[e] * outs_v[e]
+            wsq = wave_sum((kg == 0).select(ssq, fx.Float32(0.0)))
+            if lane == 0:
+                lds_st(red, wave, wsq)
+            gpu.barrier()
+            tot = fx.Float32(0.0)
+            for i in range_constexpr(WPH):
+                tot = tot + lds_ld(red, hl * WPH + i)
+            rstd = rsq(tot * (1.0 / V_DIM) + EPS)
+            if kg == 0:
+                for e in range_constexpr(VPTH):
+                    v_idx = v0_ + e
+                    nrm = bf16_round(outs_v[e] * rstd)
+                    gated = bf16_round(bf16_round(nrm * ld_f32(r_gn, v_idx)) * sigmoid(lds_ld(xs, lb + XZ + v_idx)))
+                    lds_st(outs, hl * V_DIM + v_idx, ok.select(gated, fx.Float32(0.0)))
+            gpu.barrier()
+            if tid < HPT * V_DIM // 2:
+                hp = tid // (V_DIM // 2)
+                jv = tid % (V_DIM // 2)
+                put_bf(
+                    mb("gated"),
+                    s * VALUE_DIM + (h0 + hp) * V_DIM + 2 * jv,
+                    [lds_ld(outs, hp * V_DIM + 2 * jv), lds_ld(outs, hp * V_DIM + 2 * jv + 1)],
+                )
+            # the new state after the publish: out_proj waits on the gated row, not on this store
+            if ok:
+                r_o = rsrc(ssm_state + (fx.Int64(so) * HV + fx.Int64(h)) * HEAD_BYTES)
+                for j in range_constexpr(KPT):
+                    bo.buffer_store(sv[j], r_o, (k0_ + j) * V_DIM + v0_)
         stamp("gdn", tt, 4)
 
     return {}

@@ -58,6 +58,7 @@ def qsa_stages(ctx):
     ROPE = ctx["ROPE"]
     S = ctx["S"]
     SEL = ctx["SEL"]
+    T_SEQ = ctx["T_SEQ"]
     block_sum = ctx["block_sum"]
     block_tables = ctx["block_tables"]
     bt_stride = ctx["bt_stride"]
@@ -94,6 +95,7 @@ def qsa_stages(ctx):
     wave = ctx["wave"]
     xs = ctx["xs"]
     NQH = NQ // KVH  # query heads per kv head
+    assert T_SEQ <= RATIO, "at most one group closes inside an MTP verify launch"
     assert NQH <= 16 and HD % 64 == 0 and IHD <= THREADS and IH * IHD <= THREADS and IH == 4
     QR, GR = NQ * HD, NQ * HD  # gate rows, then query rows
     KVR = 2 * KVH * HD
@@ -192,9 +194,14 @@ def qsa_stages(ctx):
             if (pos + 1) % RATIO == 0:
                 # this token closes group pos // RATIO: mean of its raw keys (earlier ones from the cache)
                 tot = x
+                pos0 = pos - s % T_SEQ  # this launch's first position of the sequence (MTP verify)
                 for i in range_constexpr(1, RATIO):
                     pi = fx.max(pos - i, 0)
-                    tot = tot + ld_bf16(r_ic, (ld_block(s, pi // BS) * BS + pi % BS) * IHD + dd)
+                    cached = ld_bf16(r_ic, (ld_block(s, pi // BS) * BS + pi % BS) * IHD + dd)
+                    if const_expr(i < T_SEQ):  # an earlier token of this launch: its raw key from the mailbox
+                        mine = poll([(mb("rkr"), fx.max(s - i, 0) * IHD + dd, 1)])[0][0].bitcast(fx.Float32)
+                        cached = (pi >= pos0).select(mine, cached)
+                    tot = tot + cached
                 pk = bf16_round(tot * (1.0 / RATIO))
                 c = norm_rope(pk, live, IHD, r_gik, pos - (RATIO - 1), dd)
                 grp = pos // RATIO
@@ -228,9 +235,12 @@ def qsa_stages(ctx):
             for i in range_constexpr(-(-(16 - IH) * IHD // THREADS)):
                 z = fx.min(tid + i * THREADS, (16 - IH) * IHD - 1)
                 fx.ptr_store(fx.Float32(0.0).to(fx.BFloat16), kvt + ((IH + z // IHD) * IQROW + z % IHD))
-            closing = (pos + 1) % RATIO == 0
+            # the group this launch closes (at most one per sequence): its key from the closing row's mailbox
+            pos0 = pos - s % T_SEQ
+            p_star = pos0 + (RATIO - 1 - pos0 % RATIO)
+            closing = p_star <= pos
             if closing & (tid < IHD):
-                cv = poll([(mb("cnew"), s * IHD + tid, 1)])[0][0].bitcast(fx.Float32)
+                cv = poll([(mb("cnew"), (s - (pos - p_star)) * IHD + tid, 1)])[0][0].bitcast(fx.Float32)
                 fx.ptr_store(cv.to(fx.BFloat16), kvt + (CNB + tid))
             gpu.barrier()
             stamp("i_score", tt, 2)
@@ -241,7 +251,7 @@ def qsa_stages(ctx):
             for rg in range_constexpr(4):
                 g0 = sb * THREADS + wave * 64 + 16 * rg
                 ga = fx.min(g0 + lane % 16, n - 1)  # this lane's A row (group)
-                use_new = closing & (ga == n - 1)
+                use_new = closing & (ga == p_star // RATIO)
                 cb = ld_block(s, ga // (BS // RATIO))
                 base = (cb * (BS // RATIO) + ga % (BS // RATIO)) * IHD
                 c4 = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -380,11 +390,11 @@ def qsa_stages(ctx):
     def mfma(a, b, c):
         return fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
 
-    def key_token(e_val, r, pos):
-        """(token, live) of key r of entry value ``e_val`` (a group id, -1 = none); this launch's token is not
-        live (it comes from kvnew)."""
+    def key_token(e_val, r, pos, pos0):
+        """(token, live) of key r of entry value ``e_val`` (a group id, -1 = none); this launch's tokens (pos0 on)
+        are not live (they come from kvnew)."""
         tok = e_val * RATIO + r
-        return tok, (e_val >= 0) & (tok <= pos) & (tok != pos)
+        return tok, (e_val >= 0) & (tok <= pos) & (tok < pos0)
 
     def kv_row(s, tok, kvh):
         """Element offset of token ``tok``'s row of kv head ``kvh`` (NHD paged cache)."""
@@ -399,6 +409,7 @@ def qsa_stages(ctx):
         stamp("split", tt, 0)
         gpu.barrier()
         pos = ld_pos(s)
+        pos0 = pos - s % T_SEQ  # keys from pos0 on are this launch's (earlier MTP tokens and this one)
         n = (pos + 1) // RATIO
         cnt = uniform(poll([(mb("gcnt"), s, 1)])[0][0])
         n_ent = cnt + 1  # + the causal tail (group n, tokens n * RATIO .. pos)
@@ -408,7 +419,7 @@ def qsa_stages(ctx):
         ntl = fx.max(fx.min(t0 + span, ntile) - t0, 0)
         e0 = t0 * EPT
         # this split's entries -> LDS: group ids, the tail as group n, -1 past the end
-        own = fx.Int32(0)
+        owns = [fx.Int32(0) for _ in range(T_SEQ)]
         for i in range_constexpr(-(-MAX_SPAN * EPT // THREADS)):
             q = tid + i * THREADS
             e = e0 + q
@@ -418,10 +429,12 @@ def qsa_stages(ctx):
                     gv = poll([(mb("gsel"), s * SEL + e, 1)])[0][0]
                 gv = ((q < ntl * EPT) & (e == cnt)).select(n, gv)
                 lds_st(ent, q, gv)
-                # this launch's token belongs to this split: its group was selected, or it is in the tail
-                mine = ((gv == pos // RATIO) & (gv >= 0)).select(fx.Int32(1), fx.Int32(0))
-                own = own + mine
-        own_p = block_sum(fx.Float32(own)) > 0.5
+                # a token of this launch belongs to this split: its group was selected, or it is in the tail
+                for tk in range_constexpr(T_SEQ):
+                    kp = pos0 + tk
+                    mine = ((gv == kp // RATIO) & (gv >= 0) & (kp <= pos)).select(fx.Int32(1), fx.Int32(0))
+                    owns[tk] = owns[tk] + mine
+        own_ps = [block_sum(fx.Float32(o_)) > 0.5 for o_ in owns]
         # q -> kvt as bf16 [16 rows][QROWE]; rows >= NQH are zero, and so are P rows >= NQH
         for i in range_constexpr(-(-16 * HD // THREADS)):
             idx = tid + i * THREADS
@@ -452,7 +465,7 @@ def qsa_stages(ctx):
         for it in range(0, ntl):
             # S^T partial: keys of row group WRG x heads, half WKH of the head dim
             kq = 16 * WRG + lane % 16
-            tok, ok = key_token(lds_ld(ent, it * EPT + kq // RATIO), kq % RATIO, pos)
+            tok, ok = key_token(lds_ld(ent, it * EPT + kq // RATIO), kq % RATIO, pos, pos0)
             row = kv_row(s, ok.select(tok, fx.Int32(0)), kvh)
             c4 = v4z
             for c in range_constexpr(KSTEPS):
@@ -466,7 +479,7 @@ def qsa_stages(ctx):
                 # lanes take consecutive keys: each store instruction writes one vt row's 64 keys (no bank conflicts)
                 kk2 = ch % KT
                 dc = ch // KT
-                tk2, ok2 = key_token(lds_ld(ent, it * EPT + kk2 // RATIO), kk2 % RATIO, pos)
+                tk2, ok2 = key_token(lds_ld(ent, it * EPT + kk2 // RATIO), kk2 % RATIO, pos, pos0)
                 vrow = kv_row(s, ok2.select(tk2, fx.Int32(0)), kvh)
                 w4 = fx.Vector(bo.buffer_load(r_vc, (vrow + 8 * dc) // 2, vec_width=4, dtype=T.i32))
                 vb = w4.bitcast(fx.BFloat16)
@@ -475,7 +488,7 @@ def qsa_stages(ctx):
             gpu.barrier()
             # softmax over the tile: lane = key; head wave (pass 0) and wave + 8 (pass 1)
             kk = lane % 16
-            tk_l, ok_l = key_token(lds_ld(ent, it * EPT + lane // RATIO), lane % RATIO, pos)
+            tk_l, ok_l = key_token(lds_ld(ent, it * EPT + lane // RATIO), lane % RATIO, pos, pos0)
             for pss in range_constexpr(2):
                 hh = wave + 8 * pss
                 src = (fx.min(hh, 15) + 16 * (kk // 4)) * 4 + kk % 4
@@ -514,46 +527,52 @@ def qsa_stages(ctx):
             a0, a1, a2, a3 = acc[0][0], acc[0][1], acc[0][2], acc[0][3]
             a4, a5, a6, a7 = acc[1][0], acc[1][1], acc[1][2], acc[1][3]
             gpu.barrier()
-        # this launch's token: one more key, in the split that holds it
-        if own_p:
-            if tid < 2 * HD:
-                nv = poll([(mb("kvnew"), (s * KVH + kvh) * 2 * HD + tid, 1)])[0][0].bitcast(fx.Float32)
-                lds_st(xs, XN + tid, nv)
-            gpu.barrier()
-            for pss in range_constexpr(2):
-                hh = wave + 8 * pss
-                part = fx.Float32(0.0)
-                for e in range_constexpr(HD // 64):
-                    dd = lane * (HD // 64) + e
-                    qd = fx.Float32(fx.ptr_load(kvt + (fx.min(hh, 15) * QROWE + dd)))
-                    part = part + qd * lds_ld(xs, XN + dd)
-                s_new = wave_sum(part) * SCALE
-                mo = m0 if pss == 0 else m1
-                lo = l0 if pss == 0 else l1
-                m_new = fx.max(mo, s_new)
-                corr = exp(mo - m_new)
-                p_new = exp(s_new - m_new)
-                l_new = lo * corr + p_new
-                if (hh < NQH) & (lane == 0):
-                    lds_st(xs, XC + hh, corr)
-                    lds_st(xs, XC + 16 + hh, p_new)
-                if const_expr(pss == 0):
-                    m0 = m_new
-                    l0 = l_new
-                else:
-                    m1 = (hh < NQH).select(m_new, m1)
-                    l1 = (hh < NQH).select(l_new, l1)
-            gpu.barrier()
-            cr = fx.Vector.from_elements([lds_ld(xs, XC + fx.min(4 * g4 + e, NQH - 1)) for e in range(4)], fx.Float32)
-            pn = fx.Vector.from_elements(
-                [lds_ld(xs, XC + 16 + fx.min(4 * g4 + e, NQH - 1)) for e in range(4)], fx.Float32
-            )
-            vd0 = fx.Vector.filled(4, lds_ld(xs, XN + HD + (wave * NG) * 16 + lane % 16), fx.Float32)
-            vd1 = fx.Vector.filled(4, lds_ld(xs, XN + HD + (wave * NG + 1) * 16 + lane % 16), fx.Float32)
-            n0 = fx.Vector.from_elements([a0, a1, a2, a3], fx.Float32) * cr + pn * vd0
-            n1 = fx.Vector.from_elements([a4, a5, a6, a7], fx.Float32) * cr + pn * vd1
-            a0, a1, a2, a3 = n0[0], n0[1], n0[2], n0[3]
-            a4, a5, a6, a7 = n1[0], n1[1], n1[2], n1[3]
+        # this launch's tokens of the sequence that this split holds: one more key each
+        for tk in range_constexpr(T_SEQ):
+            krow = s - s % T_SEQ + tk
+            if const_expr(tk > 0):
+                gpu.barrier()  # the previous key's LDS row is read
+            if own_ps[tk]:
+                if tid < 2 * HD:
+                    nv = poll([(mb("kvnew"), (krow * KVH + kvh) * 2 * HD + tid, 1)])[0][0].bitcast(fx.Float32)
+                    lds_st(xs, XN + tid, nv)
+                gpu.barrier()
+                for pss in range_constexpr(2):
+                    hh = wave + 8 * pss
+                    part = fx.Float32(0.0)
+                    for e in range_constexpr(HD // 64):
+                        dd = lane * (HD // 64) + e
+                        qd = fx.Float32(fx.ptr_load(kvt + (fx.min(hh, 15) * QROWE + dd)))
+                        part = part + qd * lds_ld(xs, XN + dd)
+                    s_new = wave_sum(part) * SCALE
+                    mo = m0 if pss == 0 else m1
+                    lo = l0 if pss == 0 else l1
+                    m_new = fx.max(mo, s_new)
+                    corr = exp(mo - m_new)
+                    p_new = exp(s_new - m_new)
+                    l_new = lo * corr + p_new
+                    if (hh < NQH) & (lane == 0):
+                        lds_st(xs, XC + hh, corr)
+                        lds_st(xs, XC + 16 + hh, p_new)
+                    if const_expr(pss == 0):
+                        m0 = m_new
+                        l0 = l_new
+                    else:
+                        m1 = (hh < NQH).select(m_new, m1)
+                        l1 = (hh < NQH).select(l_new, l1)
+                gpu.barrier()
+                cr = fx.Vector.from_elements(
+                    [lds_ld(xs, XC + fx.min(4 * g4 + e, NQH - 1)) for e in range(4)], fx.Float32
+                )
+                pn = fx.Vector.from_elements(
+                    [lds_ld(xs, XC + 16 + fx.min(4 * g4 + e, NQH - 1)) for e in range(4)], fx.Float32
+                )
+                vd0 = fx.Vector.filled(4, lds_ld(xs, XN + HD + (wave * NG) * 16 + lane % 16), fx.Float32)
+                vd1 = fx.Vector.filled(4, lds_ld(xs, XN + HD + (wave * NG + 1) * 16 + lane % 16), fx.Float32)
+                n0 = fx.Vector.from_elements([a0, a1, a2, a3], fx.Float32) * cr + pn * vd0
+                n1 = fx.Vector.from_elements([a4, a5, a6, a7], fx.Float32) * cr + pn * vd1
+                a0, a1, a2, a3 = n0[0], n0[1], n0[2], n0[3]
+                a4, a5, a6, a7 = n1[0], n1[1], n1[2], n1[3]
         # publish: rows 4 g4 + e < NQH are this kv head's query heads
         accs = [a0, a1, a2, a3, a4, a5, a6, a7]
         for ng in range_constexpr(NG):

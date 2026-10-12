@@ -106,22 +106,26 @@ class Qwen38Variant:
     _cache: dict = {}
     _adv_cache: dict = {}
 
-    def __init__(self, cfg, samples: int, full: bool, timeline=False, max_seq: int = 4096):
-        self.cfg, self.S, self.full = cfg, samples, full
+    def __init__(self, cfg, samples: int, full: bool, timeline=False, max_seq: int = 4096, tokens_per_seq: int = 1):
+        if samples % tokens_per_seq:
+            raise ValueError("an MTP verify launch holds whole sequences of tokens_per_seq rows")
+        self.cfg, self.S, self.full, self.T = cfg, samples, full, tokens_per_seq
         dims = shape_dims(cfg, max_seq)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.scr_layout = layout(samples, full, **dims)
         self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
         self.step = torch.zeros(1, dtype=torch.int32, device=dev)
-        self.key = (samples, full, timeline, tuple(sorted(dims.items())))
+        self.key = (samples, full, timeline, tokens_per_seq, tuple(sorted(dims.items())))
         if self.key not in Qwen38Variant._cache:
-            Qwen38Variant._cache[self.key] = build_qwen38_kernel(samples, full, timeline=timeline, **dims)
+            Qwen38Variant._cache[self.key] = build_qwen38_kernel(
+                samples, full, timeline=timeline, tokens_per_seq=tokens_per_seq, **dims
+            )
         self.launch = Qwen38Variant._cache[self.key]
         adv_key = self.scr_layout["xqd"] // 8
         if adv_key not in Qwen38Variant._adv_cache:
             Qwen38Variant._adv_cache[adv_key] = build_advance_step(adv_key, 0)
         self._advance = Qwen38Variant._adv_cache[adv_key]
-        self.stages = stage_tasks(samples, full, **dims)
+        self.stages = stage_tasks(samples, full, tokens_per_seq=tokens_per_seq, **dims)
         n_tasks = sum(n for _, n in self.stages)
         self.timeline = torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev) if timeline else None
 
@@ -134,12 +138,14 @@ class Qwen38MonoKernel:
     """One decoder layer: its weights (``packed``, ATOM's tensors in serving) on a ``Qwen38Variant``. State belongs
     to the caller: a GDN layer's conv / fp32 recurrent state with per-sample ``slots_in`` / ``slots_out``."""
 
-    def __init__(self, W: LayerWeights, samples: int, timeline=False, variant=None, packed=None, max_seq=4096):
+    def __init__(
+        self, W: LayerWeights, samples: int, timeline=False, variant=None, packed=None, max_seq=4096, tokens_per_seq=1
+    ):
         self.W, self.S, self.full = W, samples, W.full
         self.packed = pack_layer_weights(W) if packed is None else packed
         if variant is None:
-            variant = Qwen38Variant(W.cfg, samples, W.full, timeline, max_seq)
-        elif (variant.S, variant.full) != (samples, W.full):
+            variant = Qwen38Variant(W.cfg, samples, W.full, timeline, max_seq, tokens_per_seq)
+        elif (variant.S, variant.full, variant.T) != (samples, W.full, tokens_per_seq):
             raise ValueError("the variant was built for another sample count or layer kind")
         self.variant = variant
         self.scr_layout, self.scratch = variant.scr_layout, variant.scratch
@@ -188,10 +194,18 @@ class Qwen38MonoKernel:
                 bt_stride=bt.stride(0),
             )
         else:
-            conv, ssm, sl_in, sl_out = gdn_state
-            sl_out = sl_in if sl_out is None else sl_out
-            if conv.dtype != torch.bfloat16 or tuple(conv.shape[1:]) != (cfg.conv_kernel - 1, cfg.conv_dim):
-                raise ValueError(f"conv_state must be bf16 [slots, {cfg.conv_kernel - 1}, {cfg.conv_dim}]")
+            T = self.variant.T
+            if T == 1:
+                conv, ssm, sl_in, sl_out = gdn_state
+                sl_out = sl_in if sl_out is None else sl_out
+            else:  # MTP verify: (conv, ssm, n_accepted [S / T], spec_slots [S] -- the state slot after each token)
+                conv, ssm, n_acc, sl_out = gdn_state
+                sl_in = sl_out
+                i32("n_accepted", n_acc, (S // T,))
+                a.update(n_accepted=n_acc)
+            width = cfg.conv_kernel - 1 if T == 1 else T + 2
+            if conv.dtype != torch.bfloat16 or tuple(conv.shape[1:]) != (width, cfg.conv_dim):
+                raise ValueError(f"conv_state must be bf16 [slots, {width}, {cfg.conv_dim}]")
             if ssm.dtype != torch.float32 or tuple(ssm.shape[1:]) != (
                 cfg.linear_v_heads,
                 cfg.linear_k_dim,
