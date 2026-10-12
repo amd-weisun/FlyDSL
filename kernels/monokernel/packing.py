@@ -36,6 +36,17 @@ def pack_fp8(q: torch.Tensor) -> torch.Tensor:
     return w8.permute(*order).contiguous().view(-1)
 
 
+def shuffle_fp8(q: torch.Tensor) -> torch.Tensor:
+    """FP8 ``[..., N, K]`` in aiter's ``shuffle_weight(layout=(16, 16))`` order, the layout ATOM holds its
+    FP8 GEMM / MoE weights in: 16-row, 32-K tiles of two 16-K halves, each 16 rows x 16 contiguous K."""
+
+    *lead, rows, k = q.shape
+    if rows % 16 or k % 64:
+        raise ValueError(f"FP8 matrix dimensions must be divisible by (16, 64), got {(rows, k)}")
+    w8 = q.view(torch.uint8).reshape(-1, rows // 16, 16, k // 32, 2, 16)
+    return w8.permute(0, 1, 3, 4, 2, 5).contiguous().view(-1)
+
+
 def pack_mxfp8_weight(q: torch.Tensor) -> torch.Tensor:
     """Preshuffle row-major MXFP8 weights for gfx950 scaled MFMA GEMM."""
 

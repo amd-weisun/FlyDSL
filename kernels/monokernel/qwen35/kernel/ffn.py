@@ -333,7 +333,7 @@ def ffn_stages(ctx):
             blk = wave + b * WAVES
             if blk < DN_BLK:
                 q0, q1, qs = quant_floor(mids[b][0], mids[b][1])
-                st_f8(blk * 128 + lane * 2, q0, q1)
+                st_f8(blk * 128 + lane * 2, q0, q1, natural=True)
                 if lane == 0:
                     lds_st(misc, blk, qs * lds_ld(dnw, blk // (INTER // 128)))
         gpu.barrier()

@@ -93,8 +93,10 @@ def attn_stages(ctx):
 
     # ================================ 1. q | gate, k, v projection (FP8)
     def qkv_epilogue(s, row, v):
+        # ATOM's row order: every local head's gate, then every head's q; mailbox qg holds [q, gate] per head
         if row < QG:
-            put(mb("qg"), s * QG + row, bf16_round(v))
+            hq = row % (QG // 2)
+            put(mb("qg"), s * QG + (hq // HD) * 2 * HD + (row < QG // 2).select(fx.Int32(HD), fx.Int32(0)) + hq % HD, bf16_round(v))
         else:
             put(mb("kvr"), s * 2 * KVD + row - QG, bf16_round(v))
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 import torch
 
 from kernels.monokernel.dsv4.kernel import build_advance_step
-from kernels.monokernel.packing import pack_bf16, pack_fp8
+from kernels.monokernel.packing import pack_bf16, shuffle_fp8
 from kernels.monokernel.qwen35.kernel import build_qwen35_kernel
 from kernels.monokernel.qwen35.kernel.plan import TL_COLS, layout, n_split, router_rows, stage_tasks
 from kernels.monokernel.qwen35.reference import LayerWeights
@@ -35,32 +35,37 @@ def shape_dims(cfg) -> dict:
 
 
 def pack_layer_weights(W: LayerWeights) -> dict:
-    """The kernel's layouts of a layer's weights (FP8 / BF16 MFMA tiles, f32 Gemma gammas ``1 + w``).
-    The full-attention layer's q | gate, k, v matrix takes the GDN qkvz slot, its o_proj the out slot."""
+    """The kernel's layouts of a layer's weights: FP8 matrices as ATOM holds them (aiter's
+    ``shuffle_weight`` (16, 16), f32 128 x 128 block scales), BF16 MFMA tiles, f32 Gemma gammas ``1 + w``.
+    The full-attention layer's gate, q, k, v matrix (ATOM's row order: every head's gate, then every
+    head's q) takes the GDN qkvz slot, its o_proj the out slot."""
     cfg, t = W.cfg, W.t
     rr = router_rows(cfg.n_experts)
     w_r = torch.zeros(rr, cfg.hidden, dtype=torch.bfloat16, device=t["w_r"].device)
     w_r[: cfg.n_experts] = t["w_r"]
     w_r[cfg.n_experts] = t["w_sg"][0]
     if W.full:
+        H, hd = cfg.local_heads, cfg.head_dim
+        wq = t["w_q"].view(torch.uint8).view(H, 2, hd, -1)  # per head [q, gate] in the checkpoint
+        sq = t["s_q"].view(H, 2, hd // 128, -1)
         mixer = dict(
-            w_qkvz=pack_fp8(torch.cat([t["w_q"], t["w_k"], t["w_v"]])),
-            s_qkvz=torch.cat([t["s_q"], t["s_k"], t["s_v"]]).float().contiguous(),
+            w_qkvz=shuffle_fp8(torch.cat([wq[:, 1].reshape(H * hd, -1), wq[:, 0].reshape(H * hd, -1), t["w_k"].view(torch.uint8), t["w_v"].view(torch.uint8)])),
+            s_qkvz=torch.cat([sq[:, 1].reshape(H * hd // 128, -1), sq[:, 0].reshape(H * hd // 128, -1), t["s_k"], t["s_v"]]).float().contiguous(),
             g_qn1=(1.0 + t["g_qn"].float()).contiguous(),
             g_kn1=(1.0 + t["g_kn"].float()).contiguous(),
-            w_out=pack_fp8(t["w_o"]),
+            w_out=shuffle_fp8(t["w_o"]),
             s_out=t["s_o"].float().contiguous(),
         )
     else:
         mixer = dict(
-            w_qkvz=pack_fp8(torch.cat([t["w_qkv"], t["w_z"]])),
+            w_qkvz=shuffle_fp8(torch.cat([t["w_qkv"], t["w_z"]])),
             s_qkvz=torch.cat([t["s_qkv"], t["s_z"]]).float().contiguous(),
             w_ba=pack_bf16(t["w_ba"]),
             w_conv=t["w_conv"].to(torch.bfloat16).contiguous(),
             a_log=t["a_log"].float().contiguous(),
             dt_bias=t["dt_bias"].float().contiguous(),
             g_norm=t["g_norm"].to(torch.bfloat16).float().contiguous(),  # the bf16 weight, as the model applies it
-            w_out=pack_fp8(t["w_out"]),
+            w_out=shuffle_fp8(t["w_out"]),
             s_out=t["s_out"].float().contiguous(),
         )
     return dict(
@@ -68,9 +73,9 @@ def pack_layer_weights(W: LayerWeights) -> dict:
         g_in1=(1.0 + t["g_in"].float()).contiguous(),
         g_post1=(1.0 + t["g_post"].float()).contiguous(),
         w_r=pack_bf16(w_r),
-        w_ug=pack_fp8(t["w_ug"]),
+        w_ug=shuffle_fp8(t["w_ug"]),
         s_ug=t["s_ug"].float().contiguous(),
-        w_dn=pack_fp8(t["w_dn"]),
+        w_dn=shuffle_fp8(t["w_dn"]),
         s_dn=t["s_dn"].float().contiguous(),
     )
 

@@ -299,18 +299,21 @@ def block_sum(st, v):
 # --------------------------------------------------------------------------------- MFMA GEMV units
 
 
-def unit_fp8(st, w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word, coef=None, ln=None):
+def unit_fp8(st, w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word, coef=None, ln=None, shuffled=False):
     """Issue one 64-k chunk of row group ``rg`` of a packed FP8 matrix; the
-    bf16 activation chunk starts at LDS word ``b_word``."""
+    bf16 activation chunk starts at LDS word ``b_word``. ``shuffled``: the matrix is in
+    aiter's ``shuffle_weight`` (16, 16) layout (lane ``16 * kq + r`` holds K 16 * kq ..
+    16 * kq + 15 of row r) instead of ``pack_fp8``'s."""
     lane = st.lane
     ln = lane if ln is None else ln
     wv = fx.Vector(bo.buffer_load(w_rsrc, ((rg * NKC + kc) * 64 + ln) * 4, vec_width=4, dtype=T.i32))
     s = ld_f32(s_rsrc, (rg * 16 // SCALE_BM) * (K // BK) + kc * 64 // BK)
+    fmt, bw = ("fp8s", b_word + (lane // 16) * 8) if shuffled else ("fp8", b_word + (lane // 16) * 4)
     if const_expr(callable(coef)):  # factor known only after a later wait
-        return ("fp8", [wv], lambda: s * coef(), b_word + (lane // 16) * 4)
+        return (fmt, [wv], lambda: s * coef(), bw)
     if const_expr(coef is not None):
         s = s * coef
-    return ("fp8", [wv], s, b_word + (lane // 16) * 4)
+    return (fmt, [wv], s, bw)
 
 
 def unit_fp8x2(st, w_rsrc, s_rsrc, rg, kc, NKC, K, b_word, coef=None, ln=None, scale_rows=SCALE_BM):
@@ -473,13 +476,13 @@ def mma_units(st, acc, units):
             else 2 if unit_format not in ("f8f8", "mxfp4_rows_fp8", "mxfp4_rows_bf16") else 0
         )
         for sp in range_constexpr(nsp):
-            if const_expr(unit_format in ("fp8", "fp8x2")):
+            if const_expr(unit_format in ("fp8", "fp8x2", "fp8s")):
                 wh = sp // 2 if unit_format == "fp8x2" else 0
                 ws = sp % 2 if unit_format == "fp8x2" else sp
                 a = fp8_to_bf16x8(wv[wh][ws * 2], wv[wh][ws * 2 + 1])
             else:
                 a = wv[sp].bitcast(fx.BFloat16)
-            b = fx.ptr_load(xs + (bw + sp * 16), result_type=v4f).bitcast(fx.BFloat16)
+            b = fx.ptr_load(xs + (bw + sp * (4 if unit_format == "fp8s" else 16)), result_type=v4f).bitcast(fx.BFloat16)
             c = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b, c]))
         if const_expr(coef is None):
             acc = [acc[e] + c[e] for e in range(4)]
@@ -658,15 +661,16 @@ def quant_scaled(st, a0, a1):
 
 
 @traced
-def st_f8(st, k, q0, q1):
+def st_f8(st, k, q0, q1, natural=False):
     """LDS FP8 activation bytes k, k + 1 (k even, held by this lane; lane ^ 1 holds
-    k ^ 2) in ``f8_word`` order.  Call from the whole wave."""
+    k ^ 2) in ``f8_word`` order, or in K order when ``natural`` (the order aiter's
+    ``shuffle_weight`` (16, 16) matrices take).  Call from the whole wave."""
     lane = st.lane
     xs = st.xs
     w = fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, q0, q1, fx.Int32(0), False)) & 0xFFFF
     nb = xshfl(w, 1)
     if lane % 2 == 0:
-        lds_st(xs, f8_word(k), (w | (nb << 16)).bitcast(fx.Float32))
+        lds_st(xs, k // 4 if natural else f8_word(k), (w | (nb << 16)).bitcast(fx.Float32))
 
 
 def load_bias(st):

@@ -13,7 +13,6 @@ from kernels.monokernel.helpers import SHARED_SOURCE_KEY, LaunchState, traced
 from kernels.monokernel.ops import (
     bf16_pair,
     exp,
-    f8_word,
     lds_st,
     rcp,
     read_lane_i32,
@@ -149,7 +148,7 @@ def common_defs(ctx):
         return rstds, vals, gs, ks
 
     def stage_moe_input(samples):
-        """LDS FP8 MoE inputs (``f8_word`` order) and their block scales (misc[MOE_MISC + ...])."""
+        """LDS FP8 MoE inputs (K order) and their block scales (misc[MOE_MISC + ...])."""
         nq = HIDDEN // 4
         full = nq // 512
         xk = [tid + i * 512 for i in range(full)]
@@ -162,7 +161,7 @@ def common_defs(ctx):
         )
         for j in range_constexpr(len(samples)):
             for i in range_constexpr(nxw):
-                lds_st(xs, j * nq + f8_word(xk[i] * 4), got[j * nxw + i][0].bitcast(fx.Float32))
+                lds_st(xs, j * nq + xk[i], got[j * nxw + i][0].bitcast(fx.Float32))
             if tid < XQ_BLOCKS:
                 lds_st(misc, MOE_MISC + j * XQ_BLOCKS + tid, got[len(samples) * nxw + j][0].bitcast(fx.Float32))
 

@@ -63,7 +63,7 @@ def mixer_defs(ctx):
                 bw = (n_sel() * HIDDEN + kc * 64) // 2
                 if const_expr(bf16_w):
                     return unit_bf16(r_w, rg, kc, NKC, bw)
-                return unit_fp8(r_w, r_s, rg, kc, NKC, HIDDEN, 128, bw)
+                return unit_fp8(r_w, r_s, rg, kc, NKC, HIDDEN, 128, bw, shuffled=True)
 
             pre = [u(c) for c in range(batch)]
             stage_x_gemma(ld_h, HIDDEN, g_in1)
@@ -120,7 +120,7 @@ def out_stages(ctx):
 
         def u_o(c):
             kc = (wave % OUT_WPR) * OUT_UPW + c
-            return unit_fp8(r_wo, r_so, rg, kc, OUT_NKC, OUT_K, 128, (n_sel() * OUT_K + kc * 64) // 2)
+            return unit_fp8(r_wo, r_so, rg, kc, OUT_NKC, OUT_K, 128, (n_sel() * OUT_K + kc * 64) // 2, shuffled=True)
 
         pre = [u_o(c) for c in range(OUT_UPW)]
         gpu.barrier()
