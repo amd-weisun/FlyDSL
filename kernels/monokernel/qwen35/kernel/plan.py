@@ -122,7 +122,8 @@ def stage_tasks(S: int, full: bool, *, hidden, hk, hv, k_dim, v_dim, heads, head
         ]
     return mixer + [
         ("out", hidden // ROW_TILE),
-        ("router", S * (router_rows(n_experts) // ROUTER_TILE) // router_spt(S, n_experts)),
+        # SPT samples per task; an odd S leaves the last task a sample short (masked)
+        ("router", -(-S // router_spt(S, n_experts)) * (router_rows(n_experts) // ROUTER_TILE)),
         # one tile per (routed slot, 8 intermediates); the first inter / UG8 also carry the shared expert
         ("ug", S * top_k * (inter // UG8)),
         ("down", hidden // dn_tile(S, hidden)),

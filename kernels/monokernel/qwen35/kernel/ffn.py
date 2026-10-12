@@ -87,7 +87,8 @@ def ffn_stages(ctx):
     r_wr = rsrc(w_r)
     R_NKC = HIDDEN // 64
     SPT = router_spt(S, N_EXPERTS)
-    for tt in range(start("router"), S * N_ROUTER // SPT, G):
+    # tasks cover ceil(S / SPT) sample groups; a group's samples past S read sample S - 1 and publish nothing
+    for tt in range(start("router"), -(-S // SPT) * N_ROUTER, G):
         tt = fx.Int32(tt)
         t = tt % N_ROUTER
         rs0 = (tt // N_ROUTER) * SPT
@@ -115,8 +116,8 @@ def ffn_stages(ctx):
         def ld_a(sks):
             # sks = (local sample s, k) pairs; local sample s is sample rs0 + s
             n4 = len(sks)
-            specs = [(mb("a"), ((rs0 + s) * HIDDEN + k) // 2, 2) for s, k in sks]
-            specs += [(mb("a"), ((rs0 + s) * HIDDEN + xk) // 2, 1) for s in range(SPT)]
+            specs = [(mb("a"), (fx.min(rs0 + s, S - 1) * HIDDEN + k) // 2, 2) for s, k in sks]
+            specs += [(mb("a"), (fx.min(rs0 + s, S - 1) * HIDDEN + xk) // 2, 1) for s in range(SPT)]
             v = poll(specs, batch=len(specs))
             for s in range_constexpr(SPT):
                 xa.append(bf2_f32(v[n4 + s][0]))
@@ -125,7 +126,7 @@ def ffn_stages(ctx):
         rstds = stage_x_gemma(ld_a, HIDDEN, g_post1, count=SPT)[0]
         stamp("router", tt, 2)
         for s_l in range_constexpr(SPT):
-            if x_ok:
+            if x_ok & (rs0 + s_l < S):
                 x_s = rs0 + s_l
                 a0, a1 = xa[s_l]
                 # the expert input is the bf16 normed activation, block-quantized to FP8
@@ -146,7 +147,7 @@ def ffn_stages(ctx):
         fx.ptr_store(fx.Vector.from_elements(acc, fx.Float32), red + (wave * 64 + lane) * 4)
         gpu.barrier()
         stamp("router", tt, 3)
-        if tid < ROUTER_TILE * SPT:
+        if (tid < ROUTER_TILE * SPT) & (rs0 + tid // ROUTER_TILE < S):
             r = tid % ROUTER_TILE
             n = tid // ROUTER_TILE
             logit = fx.Float32(0.0)

@@ -50,7 +50,8 @@ def _states(cfg, n_slots, gen):
     return conv, ssm
 
 
-@pytest.mark.parametrize("S", [1, 2, 8])
+# 5 and 7: an engine captures every batch size, and an odd S leaves a router task a sample short
+@pytest.mark.parametrize("S", [1, 2, 5, 7, 8])
 @pytest.mark.parametrize("shift", [False, True], ids=["in_place", "new_slots"])
 def test_qwen35_gdn_layer_matches_golden(S, shift):
     cfg = Q35Config(tp=4, rank=0)
@@ -100,10 +101,10 @@ def test_qwen35_gdn_layer_matches_golden(S, shift):
 
 
 # per-sample positions of the first step: a partial block, block / tile edges, many splits
-FULL_POS = {1: [1000], 2: [37, 300], 8: [5, 15, 16, 63, 64, 200, 777, 2049]}
+FULL_POS = {1: [1000], 2: [37, 300], 5: [3, 100, 129, 640, 1500], 8: [5, 15, 16, 63, 64, 200, 777, 2049]}
 
 
-@pytest.mark.parametrize("S", [1, 2, 8])
+@pytest.mark.parametrize("S", [1, 2, 5, 8])
 def test_qwen35_full_attention_layer_matches_golden(S):
     cfg = Q35Config(tp=4, rank=0)
     W = make_weights(cfg, full=True)
