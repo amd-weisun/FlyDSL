@@ -14,7 +14,6 @@ from kernels.monokernel.qwen35.kernel.plan import (  # noqa: F401
     TL_COLS,
     UG8,
     WAVES,
-    dn_tile,
 )
 
 HC_KS = 512  # K of one hyper-connection down task (8 chunks of 64, inside one stream)
@@ -24,6 +23,11 @@ SH_TILE = 16  # shared-expert intermediates per up/gate task
 KT = 64  # keys per attention tile (16 entries of 4 tokens)
 BS = 16  # tokens per KV-cache block (ATOM's kv_cache_block_size)
 QSA_TASKS = ("q", "kv", "iq", "rk")  # norm / RoPE / cache-write tasks per sample: heads, kv heads, index heads, key
+
+
+def dn_tile(S: int, hidden: int) -> int:
+    """Hidden rows per expert-down task: 16 (a row group) -- at TP1 even S = 1 has 2560 rows for 256 CTAs."""
+    return 16
 
 
 def dn_parts(S: int) -> int:
