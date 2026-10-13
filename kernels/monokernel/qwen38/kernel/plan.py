@@ -22,6 +22,7 @@ OUT_TILE = 16  # out_proj rows per task
 SH_TILE = 16  # shared-expert intermediates per up/gate task
 KT = 64  # keys per attention tile (16 entries of 4 tokens)
 BS = 16  # tokens per KV-cache block (ATOM's kv_cache_block_size)
+I_PART = 4096  # groups per first-level top-k part (long contexts: each part's top budget / 4, then a merge)
 QSA_TASKS = ("q", "kv", "iq", "rk")  # norm / RoPE / cache-write tasks per sample: heads, kv heads, index heads, key
 
 
@@ -81,6 +82,17 @@ def n_groups(dims: dict) -> int:
     return dims["max_seq"] // dims["index_ratio"]
 
 
+def score_tasks(S: int, groups: int) -> int:
+    """Indexer-score tasks per sample, each looping over its share of the live 512-group chunks: about one task
+    per CTA (a long build's idle chunks then cost nothing, and samples' busy chunks land on distinct CTAs)."""
+    return min(-(-groups // THREADS), max(1, BLOCKS // S))
+
+
+def n_parts(dims: dict) -> int:
+    """First-level top-k parts: one (a single select over every group) up to ``I_PART`` groups."""
+    return -(-n_groups(dims) // I_PART)
+
+
 def n_split(S: int, dims: dict) -> int:
     """Attention splits per (sample, kv head): about one task per CTA, at most one per tile."""
     max_tiles = -(-(dims["index_budget"] // dims["index_ratio"] + 1) // (KT // dims["index_ratio"]))
@@ -131,6 +143,7 @@ def layout(S: int, full: bool, **dims):
             ("iq", S * ih * idim * pr),
             ("cnew", S * idim * pr),  # the compressed key this token closes
             ("isc", S * n_groups(dims) * pr),  # indexer scores
+            ("pcand", S * n_parts(dims) * dims["index_budget"] // dims["index_ratio"] * 2 * pr),  # (key, group)
             ("gsel", S * dims["index_budget"] // dims["index_ratio"] * pr),  # selected groups
             ("gcnt", S * pr),
             ("sp_acc", S * ns * nq * hd * pr),
@@ -187,7 +200,10 @@ def stage_tasks(S: int, full: bool, tokens_per_seq: int = 1, **dims):
         mixer = [
             ("proj", -(-proj_rows(full, dims) // (PROJ_TILE * PROJ_GROUPS))),
             ("qk", S * qk_tasks(dims)),
-            ("i_score", S * -(-n_groups(dims) // THREADS)),
+            ("i_score", S * score_tasks(S, n_groups(dims))),
+        ]
+        mixer += [("i_part", S * n_parts(dims))] if n_parts(dims) > 1 else []
+        mixer += [
             ("i_topk", S),
             ("split", S * dims["kv_heads"] * ns),
             ("merge", S * dims["heads"] * (dims["head_dim"] // 64)),

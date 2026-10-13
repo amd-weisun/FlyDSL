@@ -36,7 +36,7 @@ from kernels.monokernel.ops import (
 )
 from kernels.monokernel.qwen35.kernel.common import sigmoid
 from kernels.monokernel.qwen38.kernel.gdn import proj_stage_rows
-from kernels.monokernel.qwen38.kernel.plan import BS, KT, THREADS, WAVES
+from kernels.monokernel.qwen38.kernel.plan import BS, I_PART, KT, THREADS, WAVES, score_tasks
 
 NEG = -1.0e30
 MIN_I32 = -(2**31)
@@ -215,7 +215,7 @@ def qsa_stages(ctx):
     # ================================ 3. indexer scores (only when more groups than the budget), on the matrix
     # cores: a wave's 64 groups as 4 x 16 A rows (compressed keys straight from the cache), the index heads as B
     # columns; relu, then the heads summed across their lanes
-    NSC = -(-MAXG // THREADS)
+    NSC = score_tasks(S, MAXG)
     ISCALE = IHD**-0.5
     IQROW = IHD + 8  # bf16 elements per index-query row in kvt (heads >= IH stay zero)
     CNB = 16 * IQROW  # kvt offset of this token's compressed key (bf16)
@@ -227,7 +227,7 @@ def qsa_stages(ctx):
         stamp("i_score", tt, 0)
         pos = ld_pos(s)
         n = (pos + 1) // RATIO
-        if (n > SEL) & (sb * THREADS < n):
+        if (n > SEL) & (sb * THREADS < n):  # chunks sb, sb + NSC, ... of 512 groups
             gpu.barrier()
             hq = tid // IHD
             iqv = poll([(mb("iq"), s * IH * IHD + fx.min(tid, IH * IHD - 1), 1)])[0][0].bitcast(fx.Float32)
@@ -248,30 +248,31 @@ def qsa_stages(ctx):
                 fx.Vector(fx.ptr_load(kvt + ((lane % 16) * IQROW + 32 * kb + 8 * (lane // 16)), result_type=v8b_))
                 for kb in range(IHD // 32)
             ]
-            for rg in range_constexpr(4):
-                g0 = sb * THREADS + wave * 64 + 16 * rg
-                ga = fx.min(g0 + lane % 16, n - 1)  # this lane's A row (group)
-                use_new = closing & (ga == p_star // RATIO)
-                cb = ld_block(s, ga // (BS // RATIO))
-                base = (cb * (BS // RATIO) + ga % (BS // RATIO)) * IHD
-                c4 = fx.Vector.filled(4, 0.0, fx.Float32)
-                for kb in range_constexpr(IHD // 32):
-                    k0 = 32 * kb + 8 * (lane // 16)
-                    w4 = fx.Vector(bo.buffer_load(r_cc, (base + k0) // 2, vec_width=4, dtype=T.i32))
-                    nw = fx.Vector(fx.ptr_load(kvt + (CNB + k0), result_type=v8b_)).bitcast(fx.Int32)
-                    w4 = fx.Vector.from_elements([use_new.select(nw[e], w4[e]) for e in range(4)], fx.Int32)
-                    c4 = fx.Vector(
-                        rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [w4.bitcast(fx.BFloat16), qbi[kb], c4])
-                    )
-                # C[group 4 (lane // 16) + e][head lane % 16]: relu, sum the IH head lanes
-                for e in range_constexpr(4):
-                    v = fx.max(c4[e], fx.Float32(0.0))
-                    v = (lane % 16 < IH).select(v, fx.Float32(0.0))
-                    for o_ in (1, 2):
-                        v = v + xshfl(v, o_)
-                    g = g0 + 4 * (lane // 16) + e
-                    if (lane % 16 == 0) & (g < n):
-                        put(mb("isc"), s * MAXG + g, v * ISCALE)
+            for ch in range(sb, (n + THREADS - 1) // THREADS, NSC):
+                for rg in range_constexpr(4):
+                    g0 = ch * THREADS + wave * 64 + 16 * rg
+                    ga = fx.min(g0 + lane % 16, n - 1)  # this lane's A row (group)
+                    use_new = closing & (ga == p_star // RATIO)
+                    cb = ld_block(s, ga // (BS // RATIO))
+                    base = (cb * (BS // RATIO) + ga % (BS // RATIO)) * IHD
+                    c4 = fx.Vector.filled(4, 0.0, fx.Float32)
+                    for kb in range_constexpr(IHD // 32):
+                        k0 = 32 * kb + 8 * (lane // 16)
+                        w4 = fx.Vector(bo.buffer_load(r_cc, (base + k0) // 2, vec_width=4, dtype=T.i32))
+                        nw = fx.Vector(fx.ptr_load(kvt + (CNB + k0), result_type=v8b_)).bitcast(fx.Int32)
+                        w4 = fx.Vector.from_elements([use_new.select(nw[e], w4[e]) for e in range(4)], fx.Int32)
+                        c4 = fx.Vector(
+                            rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [w4.bitcast(fx.BFloat16), qbi[kb], c4])
+                        )
+                    # C[group 4 (lane // 16) + e][head lane % 16]: relu, sum the IH head lanes
+                    for e in range_constexpr(4):
+                        v = fx.max(c4[e], fx.Float32(0.0))
+                        v = (lane % 16 < IH).select(v, fx.Float32(0.0))
+                        for o_ in (1, 2):
+                            v = v + xshfl(v, o_)
+                        g = g0 + 4 * (lane // 16) + e
+                        if (lane % 16 == 0) & (g < n):
+                            put(mb("isc"), s * MAXG + g, v * ISCALE)
         stamp("i_score", tt, 4)
 
     # ================================ 4. top-SEL groups (exact radix select; ties to the lower group id)
@@ -295,7 +296,125 @@ def qsa_stages(ctx):
         gpu.barrier()
         return fx.Int32(pre), fx.Int32(tot)
 
-    TRIPS = -(-MAXG // THREADS)
+    def radix_select(keys, ok, k_want, emit):
+        """The top ``k_want`` of the valid ``keys`` (order-preserving uint32 bits; candidate order = thread, then
+        list index): ``emit(slot, j)`` for each; above the threshold to [0, gt), the first ties to [gt, k_want)."""
+        pfx = fx.Int32(0)
+        gt = fx.Int32(0)
+        for dg in range_constexpr(4):
+            sh = 24 - 8 * dg
+            mk = (~((1 << (sh + 8)) - 1)) & 0xFFFFFFFF
+            hi = fx.Int32(mk - (1 << 32) if mk >= (1 << 31) else mk)
+            if tid < 256:
+                lds_st(hist, tid, fx.Int32(0))
+            gpu.barrier()
+            for j in range_constexpr(len(keys)):
+                u = keys[j]
+                if ok[j] & (((u ^ pfx) & hi) == 0):
+                    fx.atomic_add(hist + ((u >> sh) & 255), fx.Int32(1), syncscope=fx.rocdl.SyncScope.Workgroup)
+            gpu.barrier()
+            need = k_want - gt
+            bn = 255 - fx.min(tid, 255)
+            cnt = (tid < 256).select(lds_ld(hist, bn), fx.Int32(0))
+            above, _t = block_excl_scan(cnt)
+            if (tid < 256) & (above < need) & ((above + cnt) >= need):
+                lds_st(hist, 256, bn)
+                lds_st(hist, 257, above)
+            gpu.barrier()
+            pfx = pfx | (lds_ld(hist, 256) << sh)
+            gt = gt + lds_ld(hist, 257)
+            gpu.barrier()
+        thr = pfx ^ MIN_I32
+        # compaction in candidate order; one scan per class over the per-thread counts
+        ca = fx.Int32(0)
+        ct = fx.Int32(0)
+        for j in range_constexpr(len(keys)):
+            sk = keys[j] ^ MIN_I32
+            ca = ca + (ok[j] & (sk > thr)).select(fx.Int32(1), fx.Int32(0))
+            ct = ct + (ok[j] & (sk == thr)).select(fx.Int32(1), fx.Int32(0))
+        pa, _ta = block_excl_scan(ca)
+        pt, _tt = block_excl_scan(ct)
+        for j in range_constexpr(len(keys)):
+            sk = keys[j] ^ MIN_I32
+            is_a = ok[j] & (sk > thr)
+            is_t = ok[j] & (sk == thr)
+            if is_a:
+                emit(pa, j)
+            if is_t & (gt + pt < k_want):
+                emit(gt + pt, j)
+            pa = pa + is_a.select(fx.Int32(1), fx.Int32(0))
+            pt = pt + is_t.select(fx.Int32(1), fx.Int32(0))
+
+    def score_keys(s, c0, cnt, trips):
+        """Order-preserving keys of groups c0 + tid * trips + j (j < trips) of sample s; valid below c0 + cnt."""
+        got = poll([(mb("isc"), s * MAXG + c0 + fx.min(tid * trips + j, cnt - 1), 1) for j in range(trips)])
+        keys = []
+        for j in range_constexpr(trips):
+            kb = got[j][0]
+            keys.append((kb >= 0).select(kb ^ fx.Int32(MIN_I32), ~kb))
+        return keys, [tid * trips + j < cnt for j in range(trips)]
+
+    # past I_PART groups: parts of I_PART groups each keep their top SEL as (key, group) candidates, in group order
+    # within a class; their union holds the overall top SEL (a group outside its part's top SEL has SEL groups
+    # ahead of it), and the merge below keeps the tie order (part, then group). Up to I_PART: one select.
+    NP = -(-MAXG // I_PART)
+    if const_expr(NP > 1):
+        TRP = I_PART // THREADS
+        for tt in range(start("i_part"), S * NP, G):
+            tt = fx.Int32(tt)
+            s = tt // NP
+            p = tt % NP
+            stamp("i_part", tt, 0)
+            n = (ld_pos(s) + 1) // RATIO
+            c0 = p * I_PART
+            cnt = fx.min(n - c0, fx.Int32(I_PART))
+            if (n > I_PART) & (cnt > 0):
+                keys, ok = score_keys(s, c0, cnt, TRP)
+                stamp("i_part", tt, 2)
+                pbase = (s * NP + p) * SEL
+
+                def emit_part(slot, j):
+                    put2(
+                        mb("pcand"),
+                        2 * (pbase + slot),
+                        keys[j].bitcast(fx.Float32),
+                        fx.Int32(c0 + tid * TRP + j).bitcast(fx.Float32),
+                    )
+
+                if cnt <= SEL:
+                    for j in range_constexpr(TRP):
+                        if ok[j]:
+                            emit_part(tid * TRP + j, j)
+                else:
+                    radix_select(keys, ok, fx.Int32(SEL), emit_part)
+            stamp("i_part", tt, 4)
+
+    TRIPS = -(-min(MAXG, I_PART) // THREADS)  # a single select's candidates per thread
+    TRM = NP * SEL // THREADS  # the merge's
+
+    def select_scores(s, n, k_want):
+        keys, ok = score_keys(s, fx.Int32(0), n, TRIPS)
+        stamp("i_topk", s, 2)
+
+        def emit(slot, j):
+            put(mb("gsel"), s * SEL + slot, tid * TRIPS + j)
+
+        radix_select(keys, ok, k_want, emit)
+
+    def select_merge(s, n, k_want):
+        # candidate q = part q // SEL, rank q % SEL (that part holds min(SEL, its groups) of them)
+        qs = [tid * TRM + j for j in range(TRM)]
+        ok = [q % SEL < fx.min(n - q // SEL * I_PART, fx.Int32(SEL)) for q in qs]
+        got = poll(
+            [(mb("pcand"), 2 * (s * NP * SEL + ok[j].select(fx.Int32(qs[j]), fx.Int32(0))), 2) for j in range(TRM)]
+        )
+        stamp("i_topk", s, 2)
+
+        def emit(slot, j):
+            put(mb("gsel"), s * SEL + slot, got[j][1])
+
+        radix_select([got[j][0] for j in range(TRM)], ok, k_want, emit)
+
     for s in range(start("i_topk"), S, G):
         s = fx.Int32(s)
         stamp("i_topk", s, 0)
@@ -308,61 +427,13 @@ def qsa_stages(ctx):
                 if e < n:
                     put(mb("gsel"), s * SEL + e, e)
         else:
-            keys = []
-            got = poll([(mb("isc"), s * MAXG + fx.min(tid * TRIPS + j, n - 1), 1) for j in range(TRIPS)])
-            for j in range_constexpr(TRIPS):
-                kb = got[j][0]
-                keys.append((kb >= 0).select(kb ^ fx.Int32(MIN_I32), ~kb))
-            stamp("i_topk", s, 2)
-            pfx = fx.Int32(0)
-            gt = fx.Int32(0)
-            for dg in range_constexpr(4):
-                sh = 24 - 8 * dg
-                mk = (~((1 << (sh + 8)) - 1)) & 0xFFFFFFFF
-                hi = fx.Int32(mk - (1 << 32) if mk >= (1 << 31) else mk)
-                if tid < 256:
-                    lds_st(hist, tid, fx.Int32(0))
-                gpu.barrier()
-                for j in range_constexpr(TRIPS):
-                    c = tid * TRIPS + j
-                    u = keys[j]
-                    if (c < n) & (((u ^ pfx) & hi) == 0):
-                        fx.atomic_add(hist + ((u >> sh) & 255), fx.Int32(1), syncscope=fx.rocdl.SyncScope.Workgroup)
-                gpu.barrier()
-                need = k_want - gt
-                bn = 255 - fx.min(tid, 255)
-                cnt = (tid < 256).select(lds_ld(hist, bn), fx.Int32(0))
-                above, _t = block_excl_scan(cnt)
-                if (tid < 256) & (above < need) & ((above + cnt) >= need):
-                    lds_st(hist, 256, bn)
-                    lds_st(hist, 257, above)
-                gpu.barrier()
-                pfx = pfx | (lds_ld(hist, 256) << sh)
-                gt = gt + lds_ld(hist, 257)
-                gpu.barrier()
-            thr = pfx ^ MIN_I32
-            # compaction in group order (thread order, then j): above the threshold to [0, gt), the first ties
-            # to [gt, k_want); one scan per class over the per-thread counts
-            ca = fx.Int32(0)
-            ct = fx.Int32(0)
-            for j in range_constexpr(TRIPS):
-                c = tid * TRIPS + j
-                sk = keys[j] ^ MIN_I32
-                ca = ca + ((c < n) & (sk > thr)).select(fx.Int32(1), fx.Int32(0))
-                ct = ct + ((c < n) & (sk == thr)).select(fx.Int32(1), fx.Int32(0))
-            pa, _ta = block_excl_scan(ca)
-            pt, _tt = block_excl_scan(ct)
-            for j in range_constexpr(TRIPS):
-                c = tid * TRIPS + j
-                sk = keys[j] ^ MIN_I32
-                is_a = (c < n) & (sk > thr)
-                is_t = (c < n) & (sk == thr)
-                if is_a:
-                    put(mb("gsel"), s * SEL + pa, c)
-                if is_t & (gt + pt < k_want):
-                    put(mb("gsel"), s * SEL + gt + pt, c)
-                pa = pa + is_a.select(fx.Int32(1), fx.Int32(0))
-                pt = pt + is_t.select(fx.Int32(1), fx.Int32(0))
+            if const_expr(NP == 1):
+                select_scores(s, n, k_want)
+            else:
+                if n <= I_PART:
+                    select_scores(s, n, k_want)
+                else:
+                    select_merge(s, n, k_want)
         if tid == 0:
             put(mb("gcnt"), s, k_want)
         stamp("i_topk", s, 4)

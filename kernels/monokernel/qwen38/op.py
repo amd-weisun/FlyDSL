@@ -12,7 +12,7 @@ from kernels.monokernel.dsv4.kernel import build_advance_step
 from kernels.monokernel.packing import shuffle_fp8
 from kernels.monokernel.qwen38.kernel import build_qwen38_kernel
 from kernels.monokernel.qwen38.kernel.build import ARGS
-from kernels.monokernel.qwen38.kernel.plan import TL_COLS, layout, router_rows, stage_tasks
+from kernels.monokernel.qwen38.kernel.plan import TL_COLS, layout, n_groups, router_rows, stage_tasks
 from kernels.monokernel.qwen38.reference import LayerWeights, rope_cos_sin
 
 __all__ = ["Qwen38MonoKernel", "Qwen38Variant", "pack_layer_weights"]
@@ -111,6 +111,7 @@ class Qwen38Variant:
             raise ValueError("an MTP verify launch holds whole sequences of tokens_per_seq rows")
         self.cfg, self.S, self.full, self.T = cfg, samples, full, tokens_per_seq
         dims = shape_dims(cfg, max_seq)
+        self.n_groups = n_groups(dims)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.scr_layout = layout(samples, full, **dims)
         self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
@@ -253,6 +254,7 @@ class Qwen38MonoKernel:
                     iq=self.debug("iq", (S, cfg.index_heads, cfg.index_dim)),
                     gsel=self.debug("gsel", (S, cfg.block_topk), torch.int32),
                     gcnt=self.debug("gcnt", (S,), torch.int32),
+                    isc=self.debug("isc", (S, self.variant.n_groups)),
                     gated=self.debug("gated", (S, cfg.heads * cfg.head_dim), bf2=True),
                 )
                 if self.full

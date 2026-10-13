@@ -104,15 +104,19 @@ def test_qwen38_gdn_layer_matches_golden(S):
 # per-sample first positions: dense (<= 2051 tokens), the budget edge, sparse (top 512 of > 512 groups)
 QSA_POS = {1: [2900], 2: [37, 2500], 5: [3, 100, 2046, 2051, 2900], 8: [5, 15, 16, 63, 600, 2047, 2700, 3100]}
 MAX_SEQ = 4096
+# long contexts: the top-k runs per part of I_PART groups, then merges; (S, max_seq) -> positions, and the sample
+# whose compressed keys are mostly one repeated key (the budget then ends inside a tie that spans parts)
+QSA_LONG = {(8, 32768): ([5, 2047, 2900, 9000, 16383, 16390, 25000, 32700], 6), (2, 262144): ([70000, 262000], 0)}
 
 
-@pytest.mark.parametrize("S", [1, 2, 5, 8])
-def test_qwen38_qsa_layer_matches_golden(S):
+@pytest.mark.parametrize("S,max_seq", [(1, MAX_SEQ), (2, MAX_SEQ), (5, MAX_SEQ), (8, MAX_SEQ), *QSA_LONG])
+def test_qwen38_qsa_layer_matches_golden(S, max_seq):
+    MAX_SEQ = max_seq
+    pos0, tie = QSA_LONG.get((S, max_seq), (QSA_POS.get(S), None))
     cfg = Q38Config()
     W = make_weights(cfg, full=True)
     t = W.t
     gen = torch.Generator(device="cuda").manual_seed(13)
-    pos0 = QSA_POS[S]
     nb = MAX_SEQ // 16
     bt = torch.randperm(S * nb, generator=torch.Generator().manual_seed(3)).view(S, nb).to(torch.int32).cuda()
     bfl = torch.bfloat16
@@ -134,6 +138,10 @@ def test_qwen38_qsa_layer_matches_golden(S):
             pk = ig[s, : ng * 4].view(ng, 4, -1).mean(1).to(bfl).float()
             c0, s0 = rope_cos_sin(torch.arange(ng, device="cuda") * 4, cfg)
             cg[s, :ng] = apply_rope(rmsnorm1p(pk, t["g_ik"], cfg.eps).to(bfl).float()[:, None], c0, s0)[:, 0]
+        if s == tie:  # every group but each 50th (and the last few, closed during the steps) one key
+            rep = torch.ones(ng, dtype=torch.bool, device="cuda")
+            rep[::50], rep[-8:] = False, False
+            cg[s, :ng][rep] = cg[s, 1].clone()
         tok = torch.arange(p, device="cuda")
         blk, off = bt[s, tok // 16].long(), tok % 16
         kc[blk, off], vc[blk, off], ic[blk, off, 0] = kg[s, :p].to(bfl), vg[s, :p].to(bfl), ig[s, :p].to(bfl)
@@ -170,6 +178,13 @@ def test_qwen38_qsa_layer_matches_golden(S):
             sel = got["gsel"][s, :n_sel].long()
             assert len(set(sel.tolist())) == n_sel and int(sel.min()) >= 0 and int(sel.max()) < ng
             if ng > cfg.block_topk:
+                # exact against the kernel's own scores: the top n_sel by (score desc, group asc)
+                order = torch.sort(-got["isc"][s, :ng], stable=True).indices[:n_sel]
+                assert torch.equal(sel.sort().values, order.sort().values), f"sample {s}: not the top-{n_sel}"
+                if s == tie:  # the budget ends inside the tie: only its lower groups are taken
+                    isc = got["isc"][s, :ng]
+                    at = isc == isc[order[-1]]
+                    assert 0 < int(at[sel].sum()) < int(at.sum()), f"sample {s}: no tie at the threshold"
                 sc = torch.relu(got["iq"][s] @ cg[s, :ng].T).sum(0) / cfg.index_dim**0.5
                 out_ = torch.ones(ng, dtype=torch.bool, device="cuda")
                 out_[sel] = False
@@ -304,6 +319,9 @@ def test_qwen38_qsa_mtp_verify_matches_sequential_golden(T, Q):
             assert n_sel == min(ng, cfg.block_topk)
             sel = got["gsel"][r_, :n_sel].long()
             if ng > cfg.block_topk:
+                # exact against the kernel's own scores: the top n_sel by (score desc, group asc)
+                order = torch.sort(-got["isc"][r_, :ng], stable=True).indices[:n_sel]
+                assert torch.equal(sel.sort().values, order.sort().values), f"row {r_}: not the top-{n_sel}"
                 sc = torch.relu(got["iq"][r_] @ cg[q, :ng].T).sum(0) / cfg.index_dim**0.5
                 out_ = torch.ones(ng, dtype=torch.bool, device="cuda")
                 out_[sel] = False
