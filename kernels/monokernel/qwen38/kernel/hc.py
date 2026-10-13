@@ -187,6 +187,12 @@ def hc_stages(ctx, side, from_mailbox):
             return unit_bf16_rows(r_up, rg_u, kc, LOWRANK, (n_sel() * LOWRANK + kc * 64) // 2)
 
         pre = [u_up(kc) for kc in range(UP_NKC)]
+        # the epilogue's bundle and gamma values do not depend on the reduce: load them before waiting
+        n_e = fx.min(tid // 16, S - 1)
+        cp_e = (tid % 16) * 2
+        col_e = t * 32 + cp_e
+        xv = x_pairs([(n_e * W4 + st * HIDDEN + col_e) // 2 for st in range(HC)])
+        gv = [[ld_f32(r_g, st * HIDDEN + col_e + e) for e in range(2)] for st in range(HC)]
         gpu.barrier()
         for i in range_constexpr(-(-NP_SD // THREADS)):
             p = fx.min(tid + i * THREADS, NP_SD - 1)
@@ -200,16 +206,15 @@ def hc_stages(ctx, side, from_mailbox):
         gpu.barrier()
         stamp(f"hcu_{side}", t, 3)
         if tid < S * 16:
-            n = tid // 16
-            cp = (tid % 16) * 2
-            col = t * 32 + cp
+            n = n_e
+            cp = cp_e
+            col = col_e
             rs = poll([(mb(f"hrs_{side}"), n * HC + st, 1) for st in range(HC)])
-            xv = x_pairs([(n * W4 + st * HIDDEN + col) // 2 for st in range(HC)])
             m = [fx.Float32(0.0), fx.Float32(0.0)]
             for st in range_constexpr(HC):
                 rstd = rs[st][0].bitcast(fx.Float32)
                 for e in range_constexpr(2):
-                    xn = bf16_round(xv[st][e] * rstd * ld_f32(r_g, st * HIDDEN + col + e))
+                    xn = bf16_round(xv[st][e] * rstd * gv[st][e])
                     u_ = bf16_round(lds_ld(outs, n * WAVES * 16 + st * 32 + cp + e))
                     m[e] = m[e] + sigmoid(u_) * xn
             put_bf(mb(f"m_{side}"), n * HIDDEN + col, [bf16_round(m[0] * (1.0 / HC)), bf16_round(m[1] * (1.0 / HC))])
