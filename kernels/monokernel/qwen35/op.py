@@ -128,6 +128,8 @@ class Qwen35Variant:
         self.peer_buffer = SymmetricPeerBuffer(self.sym_layout["_bytes"], rank=rank, npes=npes, group=group)
         self.sym, self.peers = self.peer_buffer.local_address, self.peer_buffer.addresses
         self.step = torch.zeros(1, dtype=torch.int32, device=dev)
+        # the unused pointer arguments' target: one buffer, not a fill kernel in every launch's graph
+        self.zero = torch.zeros(1, dtype=torch.int32, device=dev)
         self.key = (
             samples,
             npes,
@@ -228,7 +230,7 @@ class Qwen35MonoKernel:
             if tuple(t.shape[: len(shape)]) != shape or t.dtype != torch.int32 or t.stride(-1) != 1:
                 raise ValueError(f"{name} must be int32 {shape} with unit-stride rows")
 
-        z = torch.zeros(1, dtype=torch.int32, device=h.device)
+        z = self.variant.zero
         conv = ssm = sl_in = sl_out = n_acc = z
         wpos = rk = ru = rg = z
         kc = vc = ks = vs = pos = bt = slots = cos = sin = z
