@@ -51,7 +51,8 @@ def _states(cfg, n_slots, gen):
 
 
 # 5 and 7: an engine captures every batch size, and an odd S leaves a router task a sample short
-@pytest.mark.parametrize("S", [1, 2, 5, 7, 8])
+# 12 and 16: past the 8 waves (two samples a wave in the router of the MoE, chunked staging)
+@pytest.mark.parametrize("S", [1, 2, 5, 7, 8, 12, 16])
 @pytest.mark.parametrize("shift", [False, True], ids=["in_place", "new_slots"])
 def test_qwen35_gdn_layer_matches_golden(S, shift):
     cfg = Q35Config(tp=4, rank=0)
@@ -101,10 +102,16 @@ def test_qwen35_gdn_layer_matches_golden(S, shift):
 
 
 # per-sample positions of the first step: a partial block, block / tile edges, many splits
-FULL_POS = {1: [1000], 2: [37, 300], 5: [3, 100, 129, 640, 1500], 8: [5, 15, 16, 63, 64, 200, 777, 2049]}
+FULL_POS = {
+    1: [1000],
+    2: [37, 300],
+    5: [3, 100, 129, 640, 1500],
+    8: [5, 15, 16, 63, 64, 200, 777, 2049],
+    16: [5, 15, 16, 63, 64, 200, 777, 2049, 1, 31, 32, 127, 128, 300, 1023, 1500],
+}
 
 
-@pytest.mark.parametrize("S", [1, 2, 5, 8])
+@pytest.mark.parametrize("S", [1, 2, 5, 8, 16])
 def test_qwen35_full_attention_layer_matches_golden(S):
     cfg = Q35Config(tp=4, rank=0)
     W = make_weights(cfg, full=True)
@@ -167,7 +174,7 @@ def test_qwen35_full_attention_layer_matches_golden(S):
 
 
 # MTP verify: T tokens per sequence in one launch == T sequential decode steps of the golden
-MTP_CASES = [(2, 1), (2, 4), (3, 2), (4, 2)]  # (tokens per sequence, sequences)
+MTP_CASES = [(2, 1), (2, 4), (3, 2), (4, 2), (4, 4)]  # (tokens per sequence, sequences)
 
 
 @pytest.mark.parametrize("T,Q", MTP_CASES)
@@ -226,7 +233,7 @@ def test_qwen35_gdn_mtp_verify_matches_sequential_golden(T, Q):
 # CAP records (k, u, g) a v-head; (tokens per sequence, sequences, write_pos): no fold (h + 2 T <= CAP), a
 # fold (the checkpoint absorbs the h records, this step writes from 0), the prefill sentinel -1
 REPLAY_CAP = 16
-REPLAY_CASES = [(2, 1, 5), (4, 1, 3), (4, 2, 9), (4, 2, -1), (2, 4, 13)]
+REPLAY_CASES = [(2, 1, 5), (4, 1, 3), (4, 2, 9), (4, 2, -1), (2, 4, 13), (4, 4, 9)]
 
 
 def _rebuild(ck, k, u, g, n):
@@ -317,7 +324,7 @@ def test_qwen35_gdn_replay_verify_matches_sequential_golden(T, Q, wp):
         layer.close()
 
 
-MTP_POS = {1: [700], 2: [15, 300], 4: [62, 128, 1000, 33]}
+MTP_POS = {1: [700], 2: [15, 300], 4: [62, 128, 1000, 33]}  # (4, 4): 16 rows
 
 
 @pytest.mark.parametrize("T,Q", MTP_CASES)

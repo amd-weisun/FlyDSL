@@ -83,7 +83,7 @@ def build_qwen35_kernel(
     an MTP verify step, rows ``q * tokens_per_seq + j`` = token j of sequence q (consecutive positions).
     ``replay_cap`` > 0: the verify runs on ReplaySSM GDN state (a checkpoint per request and ``replay_cap``
     records of (k, u, g) a v-head), as ATOM keeps it by default under speculative decoding."""
-    assert 1 <= S <= 8, "dn_route routes sample s on wave s; the samples sit in the MFMA's B columns"
+    assert 1 <= S <= 16, "the samples sit in the MFMA's 16 B columns"
     assert k_dim == v_dim == 128, "the recurrence maps 8 K lanes x 4 values and 64 V rows per pass"
     assert hv % hk == 0
     assert n_experts % 64 == 0 and top_k < 16

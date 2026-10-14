@@ -52,6 +52,8 @@ def mixer_defs(ctx):
         PROJ_GROUPS per task; ``epilogue(s, row, value)`` takes each output (``tid`` < S * rows)."""
         r_w, r_s = rsrc(w), (None if bf16_w else rsrc(sc))
         batch = max(1, NKC // WAVES // (4 if bf16_w else 1))  # units in flight per wave
+        if const_expr(S > 8):  # past 8 samples the staged activations need the room
+            batch = max(1, batch // 2)
         for t in range(start(name), n_groups // PROJ_GROUPS, G):
             t = fx.Int32(t)
             stamp(name, t, 0)

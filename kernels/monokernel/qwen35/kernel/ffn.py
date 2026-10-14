@@ -123,7 +123,7 @@ def ffn_stages(ctx):
                 xa.append(bf2_f32(v[n4 + s][0]))
             return [list(bf2_f32(w[0])) + list(bf2_f32(w[1])) for w in v[:n4]]
 
-        rstds = stage_x_gemma(ld_a, HIDDEN, g_post1, count=SPT)[0]
+        rstds = stage_x_gemma(ld_a, HIDDEN, g_post1, count=SPT)
         stamp("router", tt, 2)
         for s_l in range_constexpr(SPT):
             if x_ok & (rs0 + s_l < S):
@@ -159,15 +159,17 @@ def ffn_stages(ctx):
         stamp("router", tt, 4)
 
     def dn_route():
-        """Wave s routes sample s: slot 0 the shared expert (weight sigmoid(gate)), slots 1..TOP_K the
-        picks -> keys[s * MOE_SLOTS + slot], dnw[...]; the scores must have landed."""
-        if wave < S:
-            e, w = route_softmax(wave)
-            sg = sigmoid(getf(mb("scores"), wave * ROUTER_ROWS + N_EXPERTS))
-            if lane < MOE_SLOTS:
-                q = wave * MOE_SLOTS + (lane + 1) % MOE_SLOTS
-                lds_st(keys, q, (lane == TOP_K).select(fx.Int32(SHARED_EXPERT), e))
-                lds_st(dnw, q, (lane == TOP_K).select(sg, w))
+        """Wave w routes samples w, w + WAVES, ..: slot 0 the shared expert (weight sigmoid(gate)),
+        slots 1..TOP_K the picks -> keys[s * MOE_SLOTS + slot], dnw[...]; the scores must have landed."""
+        for j in range_constexpr(-(-S // WAVES)):
+            s_ = wave + j * WAVES
+            if s_ < S:
+                e, w = route_softmax(s_)
+                sg = sigmoid(getf(mb("scores"), s_ * ROUTER_ROWS + N_EXPERTS))
+                if lane < MOE_SLOTS:
+                    q = s_ * MOE_SLOTS + (lane + 1) % MOE_SLOTS
+                    lds_st(keys, q, (lane == TOP_K).select(fx.Int32(SHARED_EXPERT), e))
+                    lds_st(dnw, q, (lane == TOP_K).select(sg, w))
 
     # ================================ 6. expert up/gate + SiLU (W8A8)
     UG_NKC = HIDDEN // 64
@@ -283,7 +285,10 @@ def ffn_stages(ctx):
     DN_BLK = S * MOE_SLOTS * INTER // 128
     DN_W_BYTES = HIDDEN * INTER
     DN_S_BYTES = HIDDEN // 128 * (INTER // 128) * 4
-    DN_BATCH = 9  # 128-k chunks per wave in flight / prefetched before the mid wait
+    # 128-k chunks per wave in flight / prefetched before the mid wait (fewer past S = 8: register room)
+    DN_BATCH = 9 if S <= 8 else 6
+    DN_MID_BLOCKS = (DN_BLK + WAVES - 1) // WAVES  # mid blocks a lane quantizes
+    DN_MID_ROUND = 22  # of them in flight at once: all of them up to S = 8
     for t in range(start("down"), N_DN_TILES, G):
         t = fx.Int32(t)
         stamp("down", t, 0)
@@ -322,20 +327,22 @@ def ffn_stages(ctx):
         # the experts are known: stream their down weights while up/gate finishes
         pre = [u_dn(cc) for cc in range(min(DN_BATCH, DN_UPW))]
         hint_wait(0, None, mark=("down", t))
-        mids = get2_many(
-            [
-                (mb("mid"), fx.min(wave + b * WAVES, DN_BLK - 1) * 128 + lane * 2)
-                for b in range((DN_BLK + WAVES - 1) // WAVES)
-            ]
-        )
-        stamp("down", t, 2)
-        for b in range_constexpr((DN_BLK + WAVES - 1) // WAVES):
-            blk = wave + b * WAVES
-            if blk < DN_BLK:
-                q0, q1, qs = quant_floor(mids[b][0], mids[b][1])
-                st_f8(blk * 128 + lane * 2, q0, q1, natural=True)
-                if lane == 0:
-                    lds_st(misc, blk, qs * lds_ld(dnw, blk // (INTER // 128)))
+        # the mids in rounds of at most DN_MID_ROUND blocks a lane (S <= 8 is one round): at S = 16 all
+        # of them in flight next to the prefetched weights spill
+        for r0 in range_constexpr(0, DN_MID_BLOCKS, DN_MID_ROUND):
+            rb = min(DN_MID_ROUND, DN_MID_BLOCKS - r0)
+            mids = get2_many(
+                [(mb("mid"), fx.min(wave + b * WAVES, DN_BLK - 1) * 128 + lane * 2) for b in range(r0, r0 + rb)]
+            )
+            if const_expr(r0 == 0):
+                stamp("down", t, 2)
+            for b in range_constexpr(rb):
+                blk = wave + (r0 + b) * WAVES
+                if blk < DN_BLK:
+                    q0, q1, qs = quant_floor(mids[b][0], mids[b][1])
+                    st_f8(blk * 128 + lane * 2, q0, q1, natural=True)
+                    if lane == 0:
+                        lds_st(misc, blk, qs * lds_ld(dnw, blk // (INTER // 128)))
         gpu.barrier()
         acc = run_units(u_dn, DN_UPW, DN_BATCH, pre)
 

@@ -11,8 +11,10 @@ from kernels.common import buffer_ops as bo
 from kernels.monokernel.dsv4.kernel.common import sort_network
 from kernels.monokernel.helpers import SHARED_SOURCE_KEY, LaunchState, traced
 from kernels.monokernel.ops import (
+    bf2_f32,
     bf16_pair,
     exp,
+    lds_ld,
     lds_st,
     rcp,
     read_lane_i32,
@@ -113,6 +115,8 @@ def common_defs(ctx):
     block_sums = st.block_sums
     rmsnorm_tail_ks = st.rmsnorm_tail_ks
 
+    SX_CHUNK = 4  # past 8 samples: the samples whose x a thread holds at once while staging
+
     def stage_x_gemma(ld4s, n, gamma, count=None):
         """LDS bf16 X[s][0:n] = bf16(rmsnorm(x_s) * gamma) for ``count`` samples, ``gamma`` an f32
         vector (the Gemma ``1 + w``, formed on the host); ld4s([(s, k)]) -> [(x_s[k], .., x_s[k+3])]."""
@@ -124,28 +128,52 @@ def common_defs(ctx):
         for k in ks:
             g = fx.Vector(bo.buffer_load(rg_, k, vec_width=4, dtype=T.f32))
             gs.append([g[j] for j in range(4)])
-        vals = ld4s([(s, k) for s in range(count) for k in ks])
-        sss = []
-        for s in range_constexpr(count):
+
+        def sumsq(vs, s):
             ss = fx.Float32(0.0)
             for i in range_constexpr(per):
-                for a in vals[s * per + i]:
+                for a in vs[s * per + i]:
                     term = a * a
                     if const_expr(active is not None and i == per - 1):
                         term = active.select(term, fx.Float32(0.0))
                     ss = ss + term
-            sss.append(ss)
+            return ss
+
+        if const_expr(count <= 8):
+            vals = ld4s([(s, k) for s in range(count) for k in ks])
+            sss = [sumsq(vals, s) for s in range(count)]
+            rstds = [rsq(tot * (1.0 / n) + EPS) for tot in block_sums(sss)]
+            for s in range_constexpr(count):
+                for i in range_constexpr(per):
+                    a = vals[s * per + i]
+                    for j in range_constexpr(2):
+                        lds_st(
+                            xs,
+                            (s * n + ks[i]) // 2 + j,
+                            bf16_pair(a[2 * j] * rstds[s] * gs[i][2 * j], a[2 * j + 1] * rstds[s] * gs[i][2 * j + 1]),
+                        )
+            return rstds
+        # more samples than registers hold at once: chunks of SX_CHUNK park their raw bf16 x in LDS
+        # (lossless: x is bf16) while their sums of squares accumulate; one block reduction; then each
+        # thread normalizes its own words in place
+        sss = []
+        for c0 in range_constexpr(0, count, SX_CHUNK):
+            cn = min(SX_CHUNK, count - c0)
+            vals = ld4s([(c0 + s, k) for s in range(cn) for k in ks])
+            for s in range_constexpr(cn):
+                sss.append(sumsq(vals, s))
+                for i in range_constexpr(per):
+                    a = vals[s * per + i]
+                    for j in range_constexpr(2):
+                        lds_st(xs, ((c0 + s) * n + ks[i]) // 2 + j, bf16_pair(a[2 * j], a[2 * j + 1]))
         rstds = [rsq(tot * (1.0 / n) + EPS) for tot in block_sums(sss)]
         for s in range_constexpr(count):
             for i in range_constexpr(per):
-                a = vals[s * per + i]
                 for j in range_constexpr(2):
-                    lds_st(
-                        xs,
-                        (s * n + ks[i]) // 2 + j,
-                        bf16_pair(a[2 * j] * rstds[s] * gs[i][2 * j], a[2 * j + 1] * rstds[s] * gs[i][2 * j + 1]),
-                    )
-        return rstds, vals, gs, ks
+                    w = (s * n + ks[i]) // 2 + j
+                    a0, a1 = bf2_f32(lds_ld(xs, w).bitcast(fx.Int32))
+                    lds_st(xs, w, bf16_pair(a0 * rstds[s] * gs[i][2 * j], a1 * rstds[s] * gs[i][2 * j + 1]))
+        return rstds
 
     def stage_moe_input(samples):
         """LDS FP8 MoE inputs (K order) and their block scales (misc[MOE_MISC + ...])."""
