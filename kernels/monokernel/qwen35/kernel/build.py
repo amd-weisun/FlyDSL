@@ -75,11 +75,14 @@ def build_qwen35_kernel(
     eps,
     rope_dim,
     tokens_per_seq=1,
+    replay_cap=0,
     timeline=False,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer: full attention when ``full``, else
     Gated DeltaNet. ``heads`` / ``inter`` are this rank's (one K / V head per rank). ``tokens_per_seq`` > 1:
-    an MTP verify step, rows ``q * tokens_per_seq + j`` = token j of sequence q (consecutive positions)."""
+    an MTP verify step, rows ``q * tokens_per_seq + j`` = token j of sequence q (consecutive positions).
+    ``replay_cap`` > 0: the verify runs on ReplaySSM GDN state (a checkpoint per request and ``replay_cap``
+    records of (k, u, g) a v-head), as ATOM keeps it by default under speculative decoding."""
     assert 1 <= S <= 8, "dn_route routes sample s on wave s; the samples sit in the MFMA's B columns"
     assert k_dim == v_dim == 128, "the recurrence maps 8 K lanes x 4 values and 64 V rows per pass"
     assert hv % hk == 0
@@ -88,6 +91,9 @@ def build_qwen35_kernel(
     HIDDEN = hidden
     T_SEQ = tokens_per_seq
     assert S % T_SEQ == 0
+    REPLAY = replay_cap > 0
+    CAP = replay_cap
+    assert not REPLAY or (not full and CAP >= 2 * T_SEQ), "two verify windows fit the record buffer"
     HK, HV, K_DIM, V_DIM = hk, hv, k_dim, v_dim
     VPK = HV // HK
     g = gdn_dims(dict(hk=hk, hv=hv, k_dim=k_dim, v_dim=v_dim))
@@ -183,6 +189,10 @@ def build_qwen35_kernel(
         slots_in: Int64,
         slots_out: Int64,
         n_accepted: Int64,
+        write_pos: Int64,
+        rec_k: Int64,
+        rec_u: Int64,
+        rec_g: Int64,
         conv_state: Int64,
         ssm_state: Int64,
         positions: Int64,
@@ -261,6 +271,10 @@ def build_qwen35_kernel(
         slots_in: Int64,
         slots_out: Int64,
         n_accepted: Int64,
+        write_pos: Int64,
+        rec_k: Int64,
+        rec_u: Int64,
+        rec_g: Int64,
         conv_state: Int64,
         ssm_state: Int64,
         positions: Int64,
@@ -306,6 +320,10 @@ def build_qwen35_kernel(
             slots_in,
             slots_out,
             n_accepted,
+            write_pos,
+            rec_k,
+            rec_u,
+            rec_g,
             conv_state,
             ssm_state,
             positions,

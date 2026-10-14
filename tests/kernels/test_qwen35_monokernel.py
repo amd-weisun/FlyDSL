@@ -222,6 +222,101 @@ def test_qwen35_gdn_mtp_verify_matches_sequential_golden(T, Q):
         layer.close()
 
 
+# ReplaySSM verify (ATOM's default GDN state under speculative decoding): a checkpoint per request plus
+# CAP records (k, u, g) a v-head; (tokens per sequence, sequences, write_pos): no fold (h + 2 T <= CAP), a
+# fold (the checkpoint absorbs the h records, this step writes from 0), the prefill sentinel -1
+REPLAY_CAP = 16
+REPLAY_CASES = [(2, 1, 5), (4, 1, 3), (4, 2, 9), (4, 2, -1), (2, 4, 13)]
+
+
+def _rebuild(ck, k, u, g, n):
+    """A v-head stack's state from a checkpoint [hv, K, V] and the first ``n`` records (ATOM's replay)."""
+    S = ck.float()
+    if n == 0:
+        return S
+    gg = g[:, :n].float()
+    c = gg.cumsum(1)
+    ctot = c[:, -1:]
+    w = torch.exp(ctot - c)
+    S = S * torch.exp(ctot)[:, :, None]
+    return S + torch.einsum("hjk,hjv->hkv", k[:, :n].float() * w[:, :, None], u[:, :n].float())
+
+
+@pytest.mark.parametrize("T,Q,wp", REPLAY_CASES)
+def test_qwen35_gdn_replay_verify_matches_sequential_golden(T, Q, wp):
+    from kernels.monokernel.qwen35.op import Qwen35Variant
+
+    cfg = Q35Config(tp=4, rank=0)
+    W = make_weights(cfg, full=False)
+    gen = torch.Generator(device="cuda").manual_seed(23)
+    S, cap, hv = Q * T, REPLAY_CAP, cfg.hv
+    n_slots = Q + 3
+    slot = (torch.randperm(n_slots, generator=torch.Generator().manual_seed(7))[:Q]).to(torch.int32)
+    n_acc = torch.tensor([1 + (3 * q + 1) % T for q in range(Q)], dtype=torch.int32)
+    conv_k = (0.5 * torch.randn(n_slots, T + 2, cfg.conv_dim, generator=gen, device="cuda")).to(torch.bfloat16)
+    ckpt = (0.1 * torch.randn(n_slots, hv, cfg.linear_k_dim, cfg.linear_v_dim, generator=gen, device="cuda")).to(
+        torch.bfloat16
+    )
+    rk = torch.randn(n_slots, hv, cap, cfg.linear_k_dim, generator=gen, device="cuda")
+    rk = (rk * torch.rsqrt(rk.square().sum(-1, keepdim=True))).to(torch.bfloat16)
+    ru = (0.1 * torch.randn(n_slots, hv, cap, cfg.linear_v_dim, generator=gen, device="cuda")).to(torch.bfloat16)
+    rg = -0.05 - 0.4 * torch.rand(n_slots, hv, cap, generator=gen, device="cuda")
+    wpos = torch.zeros(n_slots, dtype=torch.int32, device="cuda")
+    wpos[slot.long()] = wp
+    hp = max(wp, 0)
+    flush = hp + 2 * T > cap
+    base = 0 if flush else hp
+    ck0 = ckpt.clone()
+    # the golden's per-sequence state: the window from n_accepted - 1 and the replayed state S_h (f32)
+    conv_g = torch.stack([conv_k[slot[q], int(n_acc[q]) - 1 : int(n_acc[q]) + 2] for q in range(Q)]).clone()
+    ssm_g = torch.stack([_rebuild(ckpt[slot[q]], rk[slot[q]], ru[slot[q]], rg[slot[q]], hp) for q in range(Q)])
+    s_h = ssm_g.clone()
+    sl = torch.arange(Q, dtype=torch.int32, device="cuda")
+    old_window = conv_k[slot.long()].clone()
+    h = torch.randn(S, cfg.hidden, generator=gen, device="cuda").to(torch.bfloat16)
+    variant = Qwen35Variant(cfg, S, False, tokens_per_seq=T, replay_cap=cap)
+    layer = Qwen35MonoKernel(W, S, variant=variant, tokens_per_seq=T)
+    conv_rows = slot.repeat_interleave(T).cuda().contiguous()
+    try:
+        out = layer.forward(
+            h,
+            gdn_state=(conv_k, ckpt, n_acc.cuda(), conv_rows, slot.cuda(), wpos, rk, ru, rg),
+        )
+        torch.cuda.synchronize()
+        got = layer.intermediates()
+        rows = torch.arange(Q) * T
+        for j in range(T):
+            ref = golden_layer(W, h[rows + j], lambda y: y, gdn_state=(conv_g, ssm_g, sl, sl))
+            errs = {
+                "conv": _rel(got["conv"][rows + j], ref["conv_out"]),
+                "gated": _rel(got["gated"][rows + j], ref["gated"].flatten(1)),
+                "a": _rel(got["a"][rows + j], ref["a"]),
+            }
+            if torch.equal(got["sel"][rows + j].long(), ref["sel"].long()):
+                errs["x_out"] = _rel(out[rows + j], ref["x_out"])
+            print(f"replay T={T} Q={Q} wp={wp} token {j}", {k: f"{v:.2e}" for k, v in errs.items()})
+            bad = {k: v for k, v in errs.items() if not v <= 2e-2}
+            assert not bad, f"token {j}: {bad} (all: {errs})"
+        assert torch.equal(wpos[slot.long()], torch.full((Q,), wp, dtype=torch.int32, device="cuda")), "cursor moved"
+        for q in range(Q):
+            s_ = int(slot[q])
+            if flush:  # the checkpoint absorbed the h records
+                e = _rel(ckpt[s_], s_h[q])
+                assert e < 1e-2, f"sequence {q}: folded checkpoint {e:.2e}"
+            else:
+                assert torch.equal(ckpt[s_], ck0[s_]), f"sequence {q}: checkpoint written without a fold"
+            # the checkpoint and the records through this step's replay to the golden's final state
+            e = _rel(_rebuild(ckpt[s_], rk[s_], ru[s_], rg[s_], base + T), ssm_g[q])
+            print(f"replay T={T} Q={Q} wp={wp} sequence {q}: replayed final state {e:.2e}")
+            assert e < 1e-2, f"sequence {q}: replayed final state {e:.2e}"
+        new_window = conv_k[slot.long()]
+        for q in range(Q):
+            na = int(n_acc[q])
+            assert torch.equal(new_window[q, :2], old_window[q, na : na + 2])
+    finally:
+        layer.close()
+
+
 MTP_POS = {1: [700], 2: [15, 300], 4: [62, 128, 1000, 33]}
 
 

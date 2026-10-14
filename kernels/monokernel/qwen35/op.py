@@ -103,7 +103,16 @@ class Qwen35Variant:
     _adv_cache: dict = {}
 
     def __init__(
-        self, cfg, samples: int, full: bool, rank: int = 0, npes: int = 1, group=None, timeline=False, tokens_per_seq=1
+        self,
+        cfg,
+        samples: int,
+        full: bool,
+        rank: int = 0,
+        npes: int = 1,
+        group=None,
+        timeline=False,
+        tokens_per_seq=1,
+        replay_cap=0,
     ):
         if full and cfg.local_kv_heads != 1:
             raise ValueError("the full-attention kernel holds one K / V head per rank")
@@ -111,6 +120,7 @@ class Qwen35Variant:
             raise ValueError("an MTP verify launch holds whole sequences of tokens_per_seq rows")
         self.cfg, self.S, self.full, self.rank, self.npes = cfg, samples, full, rank, npes
         self.T = tokens_per_seq
+        self.replay_cap = replay_cap
         dims = shape_dims(cfg)
         dev = torch.device("cuda", torch.cuda.current_device())
         self.scr_layout, self.sym_layout = layout(samples, npes, full, **dims)
@@ -118,7 +128,17 @@ class Qwen35Variant:
         self.peer_buffer = SymmetricPeerBuffer(self.sym_layout["_bytes"], rank=rank, npes=npes, group=group)
         self.sym, self.peers = self.peer_buffer.local_address, self.peer_buffer.addresses
         self.step = torch.zeros(1, dtype=torch.int32, device=dev)
-        self.key = (samples, npes, full, timeline, tokens_per_seq, cfg.eps, cfg.rope_dim, tuple(sorted(dims.items())))
+        self.key = (
+            samples,
+            npes,
+            full,
+            timeline,
+            tokens_per_seq,
+            replay_cap,
+            cfg.eps,
+            cfg.rope_dim,
+            tuple(sorted(dims.items())),
+        )
         if self.key not in Qwen35Variant._cache:
             Qwen35Variant._cache[self.key] = build_qwen35_kernel(
                 samples,
@@ -127,6 +147,7 @@ class Qwen35Variant:
                 eps=cfg.eps,
                 rope_dim=cfg.rope_dim,
                 tokens_per_seq=tokens_per_seq,
+                replay_cap=replay_cap,
                 timeline=timeline,
                 **dims,
             )
@@ -192,7 +213,10 @@ class Qwen35MonoKernel:
         GDN: ``gdn_state = (conv_state, ssm_state, slots_in, slots_out)``; an MTP verify variant
         (``tokens_per_seq`` T > 1) takes ``(conv_state, ssm_state, n_accepted, spec_slots)``: per sequence the
         tokens accepted last step, per row the state slot after its token (ATOM's ``spec_state_indices``,
-        flattened), the conv window [slots, T + 2, conv_dim] in each sequence's first slot. Full attention: ``kv = (k_cache,
+        flattened), the conv window [slots, T + 2, conv_dim] in each sequence's first slot. A ReplaySSM variant
+        (``replay_cap`` > 0) takes ``(conv_state, ckpt, n_accepted, conv_slots, slot_idx, write_pos, rec_k,
+        rec_u, rec_g)``: per row the conv slot, per sequence the checkpoint slot, ATOM's per-slot record
+        cursor and record buffers (k, u: bf16 [slots, hv, cap, 128]; g: f32 [slots, hv, cap]). Full attention: ``kv = (k_cache,
         v_cache, k_scale, v_scale, positions, block_tables, slot_mapping)`` in ATOM's MHA pool layout (the
         new token goes to cache slot ``slot_mapping[s]``, -1 = no write) and ``rope = (cos, sin)``, f32
         ``[positions, rope_dim / 2]``."""
@@ -206,6 +230,7 @@ class Qwen35MonoKernel:
 
         z = torch.zeros(1, dtype=torch.int32, device=h.device)
         conv = ssm = sl_in = sl_out = n_acc = z
+        wpos = rk = ru = rg = z
         kc = vc = ks = vs = pos = bt = slots = cos = sin = z
         bt_stride = 0
         if self.full:
@@ -221,7 +246,24 @@ class Qwen35MonoKernel:
             bt_stride = bt.stride(0)
         else:
             T = self.variant.T
-            if T == 1:
+            cap = self.variant.replay_cap
+            if cap:
+                conv, ssm, n_acc, sl_out, sl_in, wpos, rk, ru, rg = gdn_state
+                i32("n_accepted", n_acc, (S // T,))
+                if wpos.dtype != torch.int32 or not wpos.is_contiguous():
+                    raise ValueError("write_pos must be contiguous int32 [slots]")
+                rec = (cfg.hv, cap)
+                if (
+                    rk.dtype != torch.bfloat16
+                    or ru.dtype != torch.bfloat16
+                    or rg.dtype != torch.float32
+                    or tuple(rk.shape[1:]) != rec + (cfg.linear_k_dim,)
+                    or tuple(ru.shape[1:]) != rec + (cfg.linear_v_dim,)
+                    or tuple(rg.shape[1:]) != rec
+                    or not (rk.is_contiguous() and ru.is_contiguous() and rg.is_contiguous())
+                ):
+                    raise ValueError(f"record buffers must be contiguous bf16 / f32 [slots, {cfg.hv}, {cap}, ...]")
+            elif T == 1:
                 conv, ssm, sl_in, sl_out = gdn_state
                 sl_out = sl_in if sl_out is None else sl_out
             else:
@@ -235,7 +277,7 @@ class Qwen35MonoKernel:
                 raise ValueError(
                     f"ssm_state must be bf16 [slots, {cfg.hv}, {cfg.linear_k_dim}, {cfg.linear_v_dim}] (K-major, as ATOM)"
                 )
-            i32("slots_in", sl_in, (S,))
+            i32("slots_in", sl_in, (S // T if cap else S,))
             i32("slots_out", sl_out, (S,))
         if x_out is None:
             x_out = torch.empty_like(h)
@@ -249,6 +291,10 @@ class Qwen35MonoKernel:
             ptr(sl_in),
             ptr(sl_out),
             ptr(n_acc),
+            ptr(wpos),
+            ptr(rk),
+            ptr(ru),
+            ptr(rg),
             ptr(conv),
             ptr(ssm),
             ptr(pos),

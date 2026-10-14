@@ -30,6 +30,7 @@ def _sum8(v):
 @traced
 def gdn_stages(ctx):
     """1-3. qkv|z and b|a projections (conv fused), recurrence + gated norm."""
+    CAP = ctx["CAP"]
     CONV_DIM = ctx["CONV_DIM"]
     EPS = ctx["EPS"]
     G = ctx["G"]
@@ -37,6 +38,7 @@ def gdn_stages(ctx):
     KEY_DIM = ctx["KEY_DIM"]
     K_DIM = ctx["K_DIM"]
     S = ctx["S"]
+    REPLAY = ctx["REPLAY"]
     T_SEQ = ctx["T_SEQ"]
     VALUE_DIM = ctx["VALUE_DIM"]
     VPK = ctx["VPK"]
@@ -54,6 +56,9 @@ def gdn_stages(ctx):
     proj_stage = ctx["proj_stage"]
     put = ctx["put"]
     put_bf = ctx["put_bf"]
+    rec_g = ctx["rec_g"]
+    rec_k = ctx["rec_k"]
+    rec_u = ctx["rec_u"]
     s_qkvz = ctx["s_qkvz"]
     slots_in = ctx["slots_in"]
     slots_out = ctx["slots_out"]
@@ -65,6 +70,7 @@ def gdn_stages(ctx):
     w_conv = ctx["w_conv"]
     w_qkvz = ctx["w_qkvz"]
     wave = ctx["wave"]
+    write_pos = ctx["write_pos"]
     xs = ctx["xs"]
 
     r_si, r_so, r_na = rsrc(slots_in), rsrc(slots_out), rsrc(n_accepted)
@@ -73,6 +79,12 @@ def gdn_stages(ctx):
     # after the row's token (ATOM's spec_state_indices), n_accepted[q] = the tokens the last step accepted.
     # The sequence's conv window lives in token 0's slot (CW = T_SEQ + 2 inputs, read from n_accepted - 1).
     CW = T_SEQ + 2
+    # ReplaySSM (REPLAY, a verify step): the request's state is a checkpoint (slot slots_in[q], the
+    # ssm_state pool) plus the first h = write_pos[slot] of CAP records (k, u, g) a v-head, the state
+    # S_h = e^{C} S_0 + sum_j e^{C - C_j} k_j u_j^T (C_j the running sum of the log-decays g). A step
+    # whose window might not fit (h + 2 T_SEQ > CAP) first folds them into the checkpoint and writes its
+    # records from 0; its tokens append theirs, the cursor advanced by ATOM (``replayssm_commit``).
+    r_wp = rsrc(write_pos)
     ROWS = PROJ_TILE * PROJ_GROUPS
 
     # ================================ 1. qkv | z (FP8) and b | a (BF16) projections
@@ -149,7 +161,15 @@ def gdn_stages(ctx):
         kh = h // VPK
         stamp("gdn", tt, 0)
         gpu.barrier()
-        if const_expr(T_SEQ == 1):
+        if const_expr(REPLAY):
+            si = uniform(bo.buffer_load(r_si, sq, vec_width=1, dtype=T.i32))
+            live = si >= 0
+            # the prefill sentinel -1 (commit not yet run): no records, write from 0
+            hp = fx.max(uniform(bo.buffer_load(r_wp, fx.max(si, 0), vec_width=1, dtype=T.i32)), 0)
+            flush = hp + 2 * T_SEQ > CAP
+            rbase = flush.select(fx.Int32(0), hp)
+            rec0 = (fx.Int64(fx.max(si, 0)) * HV + fx.Int64(h)) * CAP  # this v-head's record 0
+        elif const_expr(T_SEQ == 1):
             si = uniform(bo.buffer_load(r_si, sq, vec_width=1, dtype=T.i32))
             live = si >= 0
         else:
@@ -163,12 +183,50 @@ def gdn_stages(ctx):
             fx.Vector(bo.buffer_load(r_in, (k0_ + j) * V_DIM + v0_, vec_width=VPT, dtype=T.bf16)).to(fx.Float32)
             for j in range(KPT)
         ]
+        if const_expr(REPLAY):
+            # S_h: the checkpoint decayed by e^{C}, plus each record weighted by e^{C - C_j}; fp32, as ATOM's
+            # replay. The gates are wave-uniform (scalar registers); the records run as a loop over the h live
+            # ones, the state carried: unrolled over all CAP, their loads hoisted together spill at S = 8.
+            r_g0 = rsrc(rec_g + rec0 * 4)
+
+            def gate(j):
+                return uniform(bo.buffer_load(r_g0, j, vec_width=1, dtype=T.i32)).bitcast(fx.Float32)
+
+            c = fx.Float32(0.0)
+            for j in range_constexpr(CAP):
+                c = c + (fx.Int32(j) < hp).select(gate(j), fx.Float32(0.0))
+            dec0 = fx.Vector.filled(VPT, exp(c), fx.Float32)
+            for j in range_constexpr(KPT):
+                sv[j] = sv[j] * dec0
+            r_k0 = rsrc(rec_k + rec0 * (K_DIM * 2))
+            r_u0 = rsrc(rec_u + rec0 * (V_DIM * 2))
+            for jr, acc in range(0, hp, fx.Int32(1), init=sv + [fx.Float32(0.0)]):
+                jj = fx.Int32(jr)
+                cj = fx.Float32(acc[KPT]) + gate(jj)
+                w = exp(c - cj)
+                kr = [
+                    fx.Vector(bo.buffer_load(r_k0, jj * K_DIM + k0_ + 8 * p, vec_width=8, dtype=T.bf16)).to(fx.Float32)
+                    for p in range(KPT // 8)
+                ]
+                ur = fx.Vector(bo.buffer_load(r_u0, jj * V_DIM + v0_, vec_width=VPT, dtype=T.bf16)).to(fx.Float32)
+                st = [
+                    fx.math.fma(fx.Vector.filled(VPT, kr[i // 8][i % 8] * w, fx.Float32), ur, fx.Vector(acc[i]))
+                    for i in range(KPT)
+                ]
+                res = yield st + [cj]
+            sv = [fx.Vector(res[i]) for i in range(KPT)]
+            if flush & live:
+                r_ck = rsrc(ssm_state + (fx.Int64(fx.max(si, 0)) * HV + fx.Int64(h)) * HEAD_BYTES)
+                for j in range_constexpr(KPT):
+                    bo.buffer_store(sv[j].to(fx.BFloat16), r_ck, (k0_ + j) * V_DIM + v0_)
         alog = ld_f32(r_alog, h)
         dtb = ld_f32(r_dtb, h)
         for tok in range_constexpr(T_SEQ):  # the sequence's tokens in order, the state in registers
             s = sq * T_SEQ + tok
             so = uniform(bo.buffer_load(r_so, s, vec_width=1, dtype=T.i32))
             ok = live & (so >= 0)
+            if const_expr(REPLAY):
+                ok = live
             if const_expr(tok > 0):
                 gpu.barrier()  # the previous token's LDS inputs are read
             if tid < K_DIM:
@@ -193,7 +251,8 @@ def gdn_stages(ctx):
             beta = sigmoid(b_in)
             x_sp = a_in + dtb
             softplus = (x_sp > 20.0).select(x_sp, fmath.log1p(exp(x_sp)))
-            decay = exp(-exp(alog) * softplus)
+            g_log = -exp(alog) * softplus
+            decay = exp(g_log)
             # this thread's KPT q / k (L2-normalized over the head: sums over the KL lanes)
             qx = [fx.Vector(fx.ptr_load(xs + (XQ + k0_ + 4 * i), result_type=v4f)) for i in range(KPT // 4)]
             kx = [fx.Vector(fx.ptr_load(xs + (XK + k0_ + 4 * i), result_type=v4f)) for i in range(KPT // 4)]
@@ -243,7 +302,21 @@ def gdn_stages(ctx):
                     mb("gated"), s * VALUE_DIM + h * V_DIM + 2 * tid, [lds_ld(outs, 2 * tid), lds_ld(outs, 2 * tid + 1)]
                 )
             # the new state after the publish: out_proj waits on the gated row, not on this store
-            if ok:
+            if const_expr(REPLAY):
+                # this token's record (k normalized, u = beta (v - S^T k), the log-decay g) at rbase + tok
+                rp = rbase + tok
+                if ok & (v0_ == 0):  # the KL lanes of v pair 0 hold every k once
+                    for p in range_constexpr(KPT // 8):
+                        bo.buffer_store(
+                            fx.Vector.from_elements(kk[8 * p : 8 * p + 8], fx.Float32).to(fx.BFloat16),
+                            rsrc(rec_k + rec0 * (K_DIM * 2)),
+                            rp * K_DIM + k0_ + 8 * p,
+                        )
+                if ok & (kg == 0):
+                    bo.buffer_store(dv.to(fx.BFloat16), rsrc(rec_u + rec0 * (V_DIM * 2)), rp * V_DIM + v0_)
+                if ok & (tid == 0):
+                    bo.buffer_store(g_log, rsrc(rec_g + rec0 * 4), rp)
+            elif ok:
                 r_o = rsrc(ssm_state + (fx.Int64(so) * HV + fx.Int64(h)) * HEAD_BYTES)
                 for j in range_constexpr(KPT):
                     bo.buffer_store(sv[j].to(fx.BFloat16), r_o, (k0_ + j) * V_DIM + v0_)
