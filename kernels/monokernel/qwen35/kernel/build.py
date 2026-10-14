@@ -74,6 +74,7 @@ def build_qwen35_kernel(
     inter,
     eps,
     rope_dim,
+    weights="fp8",
     tokens_per_seq=1,
     replay_cap=0,
     timeline=False,
@@ -102,6 +103,10 @@ def build_qwen35_kernel(
     assert (2 * HV) % (PROJ_TILE * PROJ_GROUPS) == 0, "b | a rows must fill whole proj tasks"
     assert VALUE_DIM % 256 == 0 and HIDDEN % ROW_TILE == 0
     N_EXPERTS, TOP_K, INTER = n_experts, top_k, inter
+    # "mxfp4": BF16 projections, MXFP4 routed experts on MXFP4 activations (A4W4), a BF16 shared expert
+    WFMT = weights
+    MX = WFMT == "mxfp4"
+    assert WFMT in ("fp8", "mxfp4")
     EPS = eps
     MOE_SLOTS = TOP_K + 1
     SHARED_EXPERT = N_EXPERTS
@@ -150,6 +155,7 @@ def build_qwen35_kernel(
         n_experts=n_experts,
         top_k=top_k,
         inter=inter,
+        weights=weights,
     )
     SC, SY = layout(S, W, full, **dims)
     stages = stage_tasks(S, full, tokens_per_seq=T_SEQ, **dims)
@@ -222,6 +228,8 @@ def build_qwen35_kernel(
         s_ug: Int64,
         w_dn: Int64,
         s_dn: Int64,
+        w_sh_ug: Int64,
+        w_sh_dn: Int64,
         scratch: Int64,
         sym: Int64,
         peers: Int64,
@@ -304,6 +312,8 @@ def build_qwen35_kernel(
         s_ug: Int64,
         w_dn: Int64,
         s_dn: Int64,
+        w_sh_ug: Int64,
+        w_sh_dn: Int64,
         scratch: Int64,
         sym: Int64,
         peers: Int64,
@@ -353,6 +363,8 @@ def build_qwen35_kernel(
             s_ug,
             w_dn,
             s_dn,
+            w_sh_ug,
+            w_sh_dn,
             scratch,
             sym,
             peers,

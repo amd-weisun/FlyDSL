@@ -40,6 +40,24 @@ def _rel(a, b):
     return float((a - b).norm() / b.norm().clamp_min(1e-12))
 
 
+def _mx_down_err(W, got, out):
+    """MXFP4 checkpoint: the kernel's MoE increment against the down projection from its OWN mids (routed:
+    per-32 MXFP4 of bf16(mid) on the MXFP4 bank; shared: bf16(mid) on the BF16 expert), so the 4-bit
+    roundings the mids' last-ulp differences flip do not enter: the down stage, routing weights and the
+    shared expert's own path, near the bf16 floor of the output."""
+    from kernels.monokernel.qwen35.reference import bf, mxfp4_dequant, mxfp4_qd, mxfp4_unpack
+
+    cfg, t = W.cfg, W.t
+    S = out.shape[0]
+    w_dn = mxfp4_dequant(mxfp4_unpack(t["w_dn"]), t["s_dn"])
+    y = torch.zeros(S, cfg.hidden, device=out.device)
+    for s in range(S):
+        for j in range(cfg.top_k + 1):
+            e, wgt, m = int(got["sel"][s, j]), float(got["prob"][s, j]), got["mid"][s, j]
+            y[s] += wgt * (bf(m) @ t["w_sh_dn"].float().T if j == 0 else w_dn[e] @ mxfp4_qd(bf(m)))
+    return _rel(out.float() - got["a"].float(), y)
+
+
 def _states(cfg, n_slots, gen):
     conv = (0.5 * torch.randn(n_slots, cfg.conv_kernel - 1, cfg.conv_dim, generator=gen, device="cuda")).to(
         torch.bfloat16
@@ -54,8 +72,11 @@ def _states(cfg, n_slots, gen):
 # 12 and 16: past the 8 waves (two samples a wave in the router of the MoE, chunked staging)
 @pytest.mark.parametrize("S", [1, 2, 5, 7, 8, 12, 16])
 @pytest.mark.parametrize("shift", [False, True], ids=["in_place", "new_slots"])
-def test_qwen35_gdn_layer_matches_golden(S, shift):
-    cfg = Q35Config(tp=4, rank=0)
+@pytest.mark.parametrize("weights", ["fp8", "mxfp4"])
+def test_qwen35_gdn_layer_matches_golden(S, shift, weights):
+    if weights == "mxfp4" and S not in (1, 8, 16):
+        pytest.skip("the MXFP4 checkpoint's paths at 1, 8 and 16 samples")
+    cfg = Q35Config(tp=4, rank=0, weights=weights)
     W = make_weights(cfg, full=False)
     gen = torch.Generator(device="cuda").manual_seed(7)
     n_slots = 2 * S + 1
@@ -91,8 +112,15 @@ def test_qwen35_gdn_layer_matches_golden(S, shift):
                 errs["mid"] = _rel(got["mid"], own["mid"])
                 errs["x_out_own"] = _rel(out, own["x_out"])
                 errs["x_out"] = _rel(out, ref["x_out"])
-            print(f"S={S} shift={shift} step {step} pick={same_pick}", {k: f"{v:.2e}" for k, v in errs.items()})
-            bad = {k: v for k, v in errs.items() if v > 2e-2}
+                if weights == "mxfp4":
+                    errs["down_own_mid"] = _mx_down_err(W, got, out)
+            print(
+                f"{weights} S={S} shift={shift} step {step} pick={same_pick}", {k: f"{v:.2e}" for k, v in errs.items()}
+            )
+            # A4W4: the residual's ~5e-4 difference flips 4-bit roundings of the MoE input, so the end-to-end
+            # x_out against the golden's own input is reported, and the experts are held to the kernel's input
+            checked = {k: v for k, v in errs.items() if not (weights == "mxfp4" and k == "x_out")}
+            bad = {k: v for k, v in checked.items() if not v <= 2e-2}
             assert not bad, f"step {step}: {bad} (all: {errs})"
         # with new slots the input slots were only read: the kernel must not have written them
         if shift:
@@ -112,8 +140,11 @@ FULL_POS = {
 
 
 @pytest.mark.parametrize("S", [1, 2, 5, 8, 16])
-def test_qwen35_full_attention_layer_matches_golden(S):
-    cfg = Q35Config(tp=4, rank=0)
+@pytest.mark.parametrize("weights", ["fp8", "mxfp4"])
+def test_qwen35_full_attention_layer_matches_golden(S, weights):
+    if weights == "mxfp4" and S not in (1, 8, 16):
+        pytest.skip("the MXFP4 checkpoint's paths at 1, 8 and 16 samples")
+    cfg = Q35Config(tp=4, rank=0, weights=weights)
     W = make_weights(cfg, full=True)
     gen = torch.Generator(device="cuda").manual_seed(13)
     pos0 = FULL_POS[S]

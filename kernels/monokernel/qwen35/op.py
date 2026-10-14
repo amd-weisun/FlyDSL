@@ -31,6 +31,7 @@ def shape_dims(cfg) -> dict:
         n_experts=cfg.n_experts,
         top_k=cfg.top_k,
         inter=cfg.local_inter,
+        weights=cfg.weights,
     )
 
 
@@ -44,6 +45,8 @@ def pack_layer_weights(W: LayerWeights) -> dict:
     w_r = torch.zeros(rr, cfg.hidden, dtype=torch.bfloat16, device=t["w_r"].device)
     w_r[: cfg.n_experts] = t["w_r"]
     w_r[cfg.n_experts] = t["w_sg"][0]
+    if cfg.weights == "mxfp4":
+        return _pack_mxfp4_layer(W, w_r)
     if W.full:
         H, hd = cfg.local_heads, cfg.head_dim
         wq = t["w_q"].view(torch.uint8).view(H, 2, hd, -1)  # per head [q, gate] in the checkpoint
@@ -90,6 +93,71 @@ def pack_layer_weights(W: LayerWeights) -> dict:
         s_ug=t["s_ug"].float().contiguous(),
         w_dn=shuffle_fp8(t["w_dn"]),
         s_dn=t["s_dn"].float().contiguous(),
+    )
+
+
+def pack_mxfp4(q: torch.Tensor) -> torch.Tensor:
+    """An MXFP4 bank [E, N, K / 2] in ATOM's gfx950 layout for gate / up NOT interleaved (aiter
+    ``moe_shuffle_weight(is_guinterleave=False)``: a [gate | up] bank shuffles as plain rows)."""
+    q = q.view(torch.uint8)
+    e, n, kp = q.shape
+    if n % 16 or kp % 64:
+        raise ValueError(f"MXFP4 bank dimensions must be divisible by (16, 128), got {(n, kp * 2)}")
+    return q.view(e, n // 16, 16, kp // 64, 4, 16).permute(0, 1, 3, 4, 2, 5).contiguous().view(e, n, kp)
+
+
+def pack_mxfp4_scales(s: torch.Tensor) -> torch.Tensor:
+    """E8M0 scales [E, N, K / 32] in ATOM's gfx950 layout (aiter ``moe_shuffle_scale``,
+    ``is_guinterleave=False``); K / 32 padded to a multiple of 8 with 1.0 (0x7F)."""
+    s = s.view(torch.uint8)
+    e, n, kb = s.shape
+    kb8 = -(-kb // 8) * 8
+    if kb8 != kb:
+        s = torch.cat([s, torch.full((e, n, kb8 - kb), 0x7F, dtype=torch.uint8, device=s.device)], dim=-1)
+    return s.view(e, n // 32, 2, 16, kb8 // 8, 2, 4).permute(0, 1, 4, 6, 3, 5, 2).contiguous().view(e, n, kb8)
+
+
+def _pack_mxfp4_layer(W: LayerWeights, w_r: torch.Tensor) -> dict:
+    """The MXFP4 checkpoint's layer: BF16 projections row-major (ATOM's unshuffled layout; the attention's
+    [gate | q | k | v] row order), the MXFP4 bank in ATOM's layout, the BF16 shared expert row-major.
+    The unused scale slots hold a 1-element placeholder."""
+    cfg, t = W.cfg, W.t
+    bfl = torch.bfloat16
+    z = torch.zeros(1, dtype=torch.float32, device=w_r.device)
+    if W.full:
+        H, hd = cfg.local_heads, cfg.head_dim
+        wq = t["w_q"].view(H, 2, hd, -1)  # per head [q, gate] in the checkpoint
+        mixer = dict(
+            w_qkvz=torch.cat([wq[:, 1].reshape(H * hd, -1), wq[:, 0].reshape(H * hd, -1), t["w_k"], t["w_v"]])
+            .to(bfl)
+            .contiguous(),
+            g_qn1=(1.0 + t["g_qn"].float()).contiguous(),
+            g_kn1=(1.0 + t["g_kn"].float()).contiguous(),
+            w_out=t["w_o"].to(bfl).contiguous(),
+        )
+    else:
+        mixer = dict(
+            w_qkvz=torch.cat([t["w_qkv"], t["w_z"]]).to(bfl).contiguous(),
+            w_ba=pack_bf16(t["w_ba"]),
+            w_conv=t["w_conv"].to(bfl).contiguous(),
+            a_log=t["a_log"].float().contiguous(),
+            dt_bias=t["dt_bias"].float().contiguous(),
+            g_norm=t["g_norm"].to(bfl).float().contiguous(),
+            w_out=t["w_out"].to(bfl).contiguous(),
+        )
+    return dict(
+        mixer,
+        s_qkvz=z,
+        s_out=z,
+        g_in1=(1.0 + t["g_in"].float()).contiguous(),
+        g_post1=(1.0 + t["g_post"].float()).contiguous(),
+        w_r=pack_bf16(w_r),
+        w_ug=pack_mxfp4(t["w_ug"]),
+        s_ug=pack_mxfp4_scales(t["s_ug"]),
+        w_dn=pack_mxfp4(t["w_dn"]),
+        s_dn=pack_mxfp4_scales(t["s_dn"]),
+        w_sh_ug=t["w_sh_ug"].to(bfl).contiguous(),
+        w_sh_dn=t["w_sh_dn"].to(bfl).contiguous(),
     )
 
 
@@ -326,6 +394,8 @@ class Qwen35MonoKernel:
             ptr(p["s_ug"]),
             ptr(p["w_dn"]),
             ptr(p["s_dn"]),
+            ptr0("w_sh_ug"),
+            ptr0("w_sh_dn"),
             ptr(v.scratch),
             v.sym,
             ptr(v.peers),

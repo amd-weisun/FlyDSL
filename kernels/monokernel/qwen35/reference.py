@@ -59,7 +59,10 @@ def make_weights(cfg: Q35Config, full: bool, device="cuda", seed: int = 1234) ->
     t["g_in"] = (0.1 * torch.randn(cfg.hidden, generator=rep, device=device)).to(bfl)
     t["g_post"] = (0.1 * torch.randn(cfg.hidden, generator=rep, device=device)).to(bfl)
     for name, (rows, k) in fp8_mats(cfg, full).items():
-        t[f"w_{name}"], t[f"s_{name}"] = _rand_fp8(rows, k, 128, shd, device)
+        if cfg.weights == "mxfp4":  # the MXFP4 checkpoint keeps every projection in BF16
+            t[f"w_{name}"] = (torch.randn(rows, k, generator=shd, device=device) / k**0.5).to(bfl)
+        else:
+            t[f"w_{name}"], t[f"s_{name}"] = _rand_fp8(rows, k, 128, shd, device)
     if full:
         t["g_qn"] = (0.1 * torch.randn(cfg.head_dim, generator=rep, device=device)).to(bfl)
         t["g_kn"] = (0.1 * torch.randn(cfg.head_dim, generator=rep, device=device)).to(bfl)
@@ -73,8 +76,19 @@ def make_weights(cfg: Q35Config, full: bool, device="cuda", seed: int = 1234) ->
         t["g_norm"] = 1 + 0.1 * torch.randn(cfg.linear_v_dim, generator=rep, device=device)
     t["w_r"] = (torch.randn(cfg.n_experts, cfg.hidden, generator=rep, device=device) / cfg.hidden**0.5 * 4).to(bfl)
     t["w_sg"] = (torch.randn(1, cfg.hidden, generator=rep, device=device) / cfg.hidden**0.5).to(bfl)
+    inter = cfg.local_inter
+    if cfg.weights == "mxfp4":
+        # routed experts MXFP4 (packed fp4x2 codes [E, N, K / 2], E8M0 scales [E, N, K / 32]); ug rows
+        # [gate | up]; the shared expert a separate BF16 MLP
+        for name, (rows, k) in (("ug", (2 * inter, cfg.hidden)), ("dn", (cfg.hidden, inter))):
+            w = torch.randn(cfg.n_experts, rows, k, generator=shd, device=device) / k**0.5
+            codes, sc = mxfp4_quant(w)
+            t[f"w_{name}"], t[f"s_{name}"] = mxfp4_pack(codes), sc
+        t["w_sh_ug"] = (torch.randn(2 * inter, cfg.hidden, generator=shd, device=device) / cfg.hidden**0.5).to(bfl)
+        t["w_sh_dn"] = (torch.randn(cfg.hidden, inter, generator=shd, device=device) / inter**0.5).to(bfl)
+        return LayerWeights(cfg, full, t)
     # expert bank: routed experts then the shared one; ug rows are [gate | up] of this rank's slice
-    n, inter = cfg.n_experts + 1, cfg.local_inter
+    n = cfg.n_experts + 1
     t["w_ug"], t["s_ug"] = _rand_fp8(2 * inter, cfg.hidden, 128, shd, device, lead=(n,))
     t["w_dn"], t["s_dn"] = _rand_fp8(cfg.hidden, inter, 128, shd, device, lead=(n,))
     return LayerWeights(cfg, full, t)
@@ -87,7 +101,10 @@ def gemma_rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 def linear(W: LayerWeights, name: str, x: torch.Tensor) -> torch.Tensor:
-    """FP8 block-128 matrix ``name`` times the bf16 activation ``x`` [S, K], fp32 out."""
+    """Matrix ``name`` (FP8 block-128, or BF16 when it has no scale) times the bf16 activation ``x``
+    [S, K], fp32 out."""
+    if f"s_{name}" not in W.t:
+        return bf(x) @ W.t[f"w_{name}"].float().T
     return bf(x) @ dequant(W.t[f"w_{name}"], W.t[f"s_{name}"], 128).T
 
 
@@ -115,6 +132,65 @@ def act_quant(x: torch.Tensor, block: int = 128) -> torch.Tensor:
     scale = xb.abs().amax(-1, keepdim=True).clamp_min(1e-10) / FP8_MAX
     q = (xb / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).float()
     return (q * scale).reshape(x.shape)
+
+
+E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)  # FP4 E2M1 magnitudes, code = index
+
+
+def e2m1_encode(a: torch.Tensor) -> torch.Tensor:
+    """FP4 E2M1 codes (sign << 3 | index) of ``a``, round to nearest, ties to the even code, saturating
+    at 6 (v_cvt_scalef32_pk_fp4_f32 / aiter's _mxfp4_pack_bits)."""
+    lv = torch.tensor(E2M1, device=a.device)
+    m = a.float().abs().clamp(max=6.0)
+    lo = (torch.searchsorted(lv, m, right=True) - 1).clamp(0, 6)
+    d_lo, d_hi = m - lv[lo], lv[lo + 1] - m
+    idx = torch.where((d_lo < d_hi) | ((d_lo == d_hi) & (lo % 2 == 0)), lo, lo + 1)
+    return (idx | ((a < 0).to(torch.int64) << 3)).to(torch.uint8)
+
+
+def e2m1_decode(c: torch.Tensor) -> torch.Tensor:
+    lv = torch.tensor(E2M1, device=c.device)
+    v = lv[(c & 7).long()]
+    return torch.where((c & 8) != 0, -v, v)
+
+
+def mxfp4_scale_e8m0(xb: torch.Tensor) -> torch.Tensor:
+    """aiter's "even" E8M0 scale of blocks ``xb`` [..., 32] (_mxfp4_scale_from_amax): the amax rounded at
+    mantissa bit 21, floor(log2) - 2, clamped to [-127, 127]; biased by 127."""
+    amax = xb.float().abs().amax(-1)
+    bits = (amax.view(torch.int32) + 0x200000) & -0x800000  # & 0xFF800000
+    e = torch.floor(torch.log2(bits.view(torch.float32))) - 2
+    e = torch.where(torch.isfinite(e), e, torch.full_like(e, -127)).clamp(-127, 127)
+    return (e + 127).to(torch.uint8)
+
+
+def mxfp4_quant(x: torch.Tensor):
+    """Per-32 MXFP4 of the last dim: (codes [..., K] uint8, E8M0 scales [..., K / 32] uint8)."""
+    xb = x.float().reshape(*x.shape[:-1], -1, 32)
+    sc = mxfp4_scale_e8m0(xb)
+    q = xb * torch.exp2(127.0 - sc.float())[..., None]
+    return e2m1_encode(q).reshape(x.shape), sc
+
+
+def mxfp4_dequant(codes: torch.Tensor, sc: torch.Tensor) -> torch.Tensor:
+    v = e2m1_decode(codes).reshape(*codes.shape[:-1], -1, 32)
+    return (v * torch.exp2(sc.float() - 127.0)[..., None]).reshape(codes.shape)
+
+
+def mxfp4_qd(x: torch.Tensor) -> torch.Tensor:
+    """The A4W4 expert activation: per-32 MXFP4, dequantized (aiter's dynamic MXFP4 quant)."""
+    return mxfp4_dequant(*mxfp4_quant(x))
+
+
+def mxfp4_pack(codes: torch.Tensor) -> torch.Tensor:
+    """Two E2M1 codes a byte, the even element in the low nibble (the checkpoint's fp4x2)."""
+    c = codes.reshape(*codes.shape[:-1], -1, 2)
+    return (c[..., 0] | (c[..., 1] << 4)).contiguous()
+
+
+def mxfp4_unpack(packed: torch.Tensor) -> torch.Tensor:
+    p = packed.view(torch.uint8)
+    return torch.stack([p & 15, p >> 4], -1).reshape(*p.shape[:-1], -1)
 
 
 def kv_quant_dequant(x: torch.Tensor) -> torch.Tensor:
@@ -226,9 +302,11 @@ def golden_moe(W: LayerWeights, a: torch.Tensor, allreduce, xq: torch.Tensor | N
     x2 = bf(gemma_rmsnorm(a, t["g_post"], cfg.eps))
     logits = bf(x2 @ t["w_r"].float().T)
     shared_gate = torch.sigmoid(bf(x2 @ t["w_sg"].float().T))[:, 0]
+    inter = cfg.local_inter
+    if cfg.weights == "mxfp4":
+        return _golden_moe_mxfp4(W, a, allreduce, x2, logits, shared_gate, xq)
     xq_ref = act_quant(x2) if cfg.act_fp8 else x2
     xq = xq_ref if xq is None else xq.float()
-    inter = cfg.local_inter
     y = torch.zeros(S, cfg.hidden, device=a.device)
     sel, prob, mids = [], [], []
     for s in range(S):
@@ -244,6 +322,46 @@ def golden_moe(W: LayerWeights, a: torch.Tensor, allreduce, xq: torch.Tensor | N
             y[s] += wgt * (dequant(t["w_dn"][e], t["s_dn"][e], 128) @ mid)
         sel.append(torch.tensor(experts, device=a.device, dtype=torch.int32))
         prob.append(torch.tensor(weights, device=a.device))
+    x_out = (a.float() + allreduce(y)).to(torch.bfloat16)
+    return dict(
+        x2=x2,
+        xq=xq_ref,
+        logits=logits,
+        shared_gate=shared_gate,
+        sel=torch.stack(sel),
+        prob=torch.stack(prob),
+        mid=torch.stack(mids).view(S, cfg.top_k + 1, inter),
+        x_out=x_out,
+    )
+
+
+def _golden_moe_mxfp4(W, a, allreduce, x2, logits, shared_gate, xq=None):
+    """The MXFP4 checkpoint's MoE: routed experts A4W4 (per-32 MXFP4 input and intermediate, MXFP4
+    weights; fp32 accumulation), the shared expert a BF16 MLP (bf16 linear outputs), sigmoid-gated."""
+    cfg, t = W.cfg, W.t
+    S, inter = a.shape[0], cfg.local_inter
+    xq_ref = mxfp4_qd(x2)
+    xq = xq_ref if xq is None else xq.float()
+    w_ug = mxfp4_dequant(mxfp4_unpack(t["w_ug"]), t["s_ug"])
+    w_dn = mxfp4_dequant(mxfp4_unpack(t["w_dn"]), t["s_dn"])
+    # shared expert (Qwen3NextMLP): gate_up bf16, SiLU-and-mul bf16, down bf16
+    gu = bf(x2 @ t["w_sh_ug"].float().T)
+    mid_sh = bf(F.silu(gu[:, :inter]) * gu[:, inter:])
+    y_sh = bf(mid_sh @ t["w_sh_dn"].float().T)
+    y = torch.zeros(S, cfg.hidden, device=a.device)
+    sel, prob, mids = [], [], []
+    for s in range(S):
+        idx, w = route(logits[s], cfg.top_k)
+        mids.append(mid_sh[s])
+        for e, wgt in zip(idx.tolist(), w.tolist()):
+            ug = w_ug[e] @ xq[s]
+            mid = F.silu(ug[:inter]) * ug[inter:]
+            mids.append(mid)
+            y[s] += wgt * (w_dn[e] @ mxfp4_qd(mid))
+        # the kernel's slots: 0 the shared expert, then the picks
+        sel.append(torch.tensor([cfg.n_experts] + idx.tolist(), device=a.device, dtype=torch.int32))
+        prob.append(torch.tensor([float(shared_gate[s])] + w.tolist(), device=a.device))
+    y = bf(y) + bf(y_sh * shared_gate[:, None])
     x_out = (a.float() + allreduce(y)).to(torch.bfloat16)
     return dict(
         x2=x2,

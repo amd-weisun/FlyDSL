@@ -61,7 +61,9 @@ def out_k(full: bool, dims: dict) -> int:
     return dims["heads"] * dims["head_dim"] if full else gdn_dims(dims)["value_dim"]
 
 
-def layout(S: int, npes: int, full: bool, *, hidden, hk, hv, k_dim, v_dim, heads, head_dim, n_experts, top_k, inter):
+def layout(
+    S: int, npes: int, full: bool, *, hidden, hk, hv, k_dim, v_dim, heads, head_dim, n_experts, top_k, inter, weights
+):
     """Byte offsets of the per-rank scratch and of the symmetric buffer. Every mailbox holds
     ``(value, tag)`` int32 pairs (8 bytes); bf16 mailboxes pack two elements per pair."""
     dims = dict(hk=hk, hv=hv, k_dim=k_dim, v_dim=v_dim, heads=heads, head_dim=head_dim)
@@ -92,6 +94,9 @@ def layout(S: int, npes: int, full: bool, *, hidden, hk, hv, k_dim, v_dim, heads
         ("sel", S * slots * pr),
         ("prob", S * slots * pr),
         ("mid", S * slots * inter * pr),
+        # MXFP4 checkpoint: the MoE input as bf16 pairs, normed (the shared expert's) and per-32 MXFP4
+        # quantize-dequantized (the routed experts')
+        *([("x2b", S * hidden // 2 * pr), ("xb", S * hidden // 2 * pr)] if weights == "mxfp4" else []),
         ("xqd", S * hidden * 4),  # debug: dequantized MoE input (plain f32), last: not scrubbed
     ]
     off, scratch = 0, {}
@@ -105,7 +110,21 @@ def layout(S: int, npes: int, full: bool, *, hidden, hk, hv, k_dim, v_dim, heads
 
 
 def stage_tasks(
-    S: int, full: bool, *, hidden, hk, hv, k_dim, v_dim, heads, head_dim, n_experts, top_k, inter, tokens_per_seq=1
+    S: int,
+    full: bool,
+    *,
+    hidden,
+    hk,
+    hv,
+    k_dim,
+    v_dim,
+    heads,
+    head_dim,
+    n_experts,
+    top_k,
+    inter,
+    weights="fp8",
+    tokens_per_seq=1,
 ):
     """[(stage name, task count)] in execution order (``tokens_per_seq``: MTP verify, a GDN task per sequence)."""
     if full:

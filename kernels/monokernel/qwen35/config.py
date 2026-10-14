@@ -68,6 +68,10 @@ class Q35Config:
     act_fp8: bool = True
     # full-attention K/V rounded through per-token-per-head FP8, as ATOM's fp8 KV cache stores them
     kv_fp8: bool = True
+    # checkpoint format: "fp8" (FP8 128 x 128 matrices, the shared expert fused into the bank) or "mxfp4"
+    # (amd/Qwen3.5-397B-A17B-MXFP4: MXFP4 routed experts on MXFP4 activations, A4W4; BF16 projections,
+    # a separate BF16 shared expert)
+    weights: str = "fp8"
 
     def at_rank(self, rank: int) -> "Q35Config":
         return replace(self, rank=rank)
@@ -133,3 +137,4 @@ class Q35Config:
         assert self.tp % self.kv_heads == 0 or self.kv_heads % self.tp == 0
         assert self.local_inter == self.local_shared_inter, "the shared expert shares the bank's shape"
         assert self.local_inter % 128 == 0 and self.hidden % 128 == 0
+        assert self.weights in ("fp8", "mxfp4")

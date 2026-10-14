@@ -18,6 +18,7 @@ def mixer_defs(ctx):
     """``proj_stage``: a GEMV over ``rmsnorm(h) * (1 + g_in)`` whose rows go to an epilogue."""
     G = ctx["G"]
     HIDDEN = ctx["HIDDEN"]
+    MX = ctx["MX"]
     S = ctx["S"]
     emit_out = ctx["emit_out"]
     g_in1 = ctx["g_in1"]
@@ -31,6 +32,7 @@ def mixer_defs(ctx):
     start = ctx["start"]
     tid = ctx["tid"]
     unit_bf16 = ctx["unit_bf16"]
+    unit_bf16_rows = ctx["st"].unit_bf16_rows
     unit_fp8 = ctx["unit_fp8"]
     wave = ctx["wave"]
     r_h = rsrc(h_in)
@@ -49,7 +51,8 @@ def mixer_defs(ctx):
 
     def proj_stage(name, n_groups, w, sc, bf16_w, epilogue):
         """Stage ``name``: ``n_groups`` 16-row groups of FP8 (scales ``sc``) or BF16 matrix ``w``,
-        PROJ_GROUPS per task; ``epilogue(s, row, value)`` takes each output (``tid`` < S * rows)."""
+        PROJ_GROUPS per task; ``epilogue(s, row, value)`` takes each output (``tid`` < S * rows). An FP8
+        matrix of the MXFP4 checkpoint (``MX``) is BF16 there, row-major as ATOM holds it."""
         r_w, r_s = rsrc(w), (None if bf16_w else rsrc(sc))
         batch = max(1, NKC // WAVES // (4 if bf16_w else 1))  # units in flight per wave
         if const_expr(S > 8):  # past 8 samples the staged activations need the room
@@ -65,6 +68,8 @@ def mixer_defs(ctx):
                 bw = (n_sel() * HIDDEN + kc * 64) // 2
                 if const_expr(bf16_w):
                     return unit_bf16(r_w, rg, kc, NKC, bw)
+                if const_expr(MX):
+                    return unit_bf16_rows(r_w, rg, kc, HIDDEN, bw)
                 return unit_fp8(r_w, r_s, rg, kc, NKC, HIDDEN, 128, bw, shuffled=True)
 
             pre = [u(c) for c in range(batch)]
@@ -88,6 +93,7 @@ def out_stages(ctx):
     peer reduce and the residual ``h`` -> mailbox ``a``."""
     G = ctx["G"]
     HIDDEN = ctx["HIDDEN"]
+    MX = ctx["MX"]
     OUT_K = ctx["OUT_K"]
     S = ctx["S"]
     emit_out = ctx["emit_out"]
@@ -122,7 +128,10 @@ def out_stages(ctx):
 
         def u_o(c):
             kc = (wave % OUT_WPR) * OUT_UPW + c
-            return unit_fp8(r_wo, r_so, rg, kc, OUT_NKC, OUT_K, 128, (n_sel() * OUT_K + kc * 64) // 2, shuffled=True)
+            bw = (n_sel() * OUT_K + kc * 64) // 2
+            if const_expr(MX):
+                return ctx["st"].unit_bf16_rows(r_wo, rg, kc, OUT_K, bw)
+            return unit_fp8(r_wo, r_so, rg, kc, OUT_NKC, OUT_K, 128, bw, shuffled=True)
 
         pre = [u_o(c) for c in range(OUT_UPW)]
         gpu.barrier()

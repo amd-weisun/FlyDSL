@@ -4,9 +4,9 @@
 """Device helpers shared by every stage of the Qwen3.5 MonoKernel."""
 
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, as_ir_value
 from kernels.common import buffer_ops as bo
 from kernels.monokernel.dsv4.kernel.common import sort_network
 from kernels.monokernel.helpers import SHARED_SOURCE_KEY, LaunchState, traced
@@ -24,6 +24,7 @@ from kernels.monokernel.ops import (
     wave_umax,
     write_lane_i32,
     xred,
+    xshfl,
 )
 from kernels.monokernel.qwen35.config import FP8_MAX
 from kernels.monokernel.qwen35.kernel.plan import MOE_MISC, TL_COLS
@@ -35,6 +36,36 @@ def silu(x):
 
 def sigmoid(x):
     return rcp(1.0 + exp(-x))
+
+
+def mxfp4_qd(v0, v1):
+    """Per-32 MXFP4 quantize-dequantize of the pair (v0, v1) a lane holds, a 32-element block on 16
+    consecutive lanes: aiter's dynamic MXFP4 (scaling "even": the block amax rounded at mantissa bit 21,
+    E8M0 2^(floor(log2) - 2)), E2M1 round to nearest even, back to f32 (exact in bf16)."""
+    amax = fx.max(fmath.absf(v0), fmath.absf(v1))
+    for o in (1, 2, 4, 8):
+        amax = fx.max(amax, xshfl(amax, o))
+    bits = (amax.bitcast(fx.Int32) + fx.Int32(0x200000)) & fx.Int32(-0x800000)
+    ef = (bits >> 23) & 0xFF
+    e = fx.max((ef == 0).select(fx.Int32(-127), ef - 129), fx.Int32(-127))  # log2(0) clamps to -127
+    one = as_ir_value(fx.Float32(1.0))
+    word = fx.Int32(
+        rocdl.cvt_scalef32_pk_fp4_f32(
+            T.i32,
+            as_ir_value(fx.Int32(0)),
+            as_ir_value(v0 * ((127 - e) << 23).bitcast(fx.Float32)),
+            as_ir_value(v1 * ((127 - e) << 23).bitcast(fx.Float32)),
+            one,
+            0,
+        )
+    )
+    out = fx.Vector(
+        rocdl.cvt_scalef32_pk_f32_fp4(
+            res=fx.Vector.make_type(2, fx.Float32), src=as_ir_value(word), scale=one, src_sel_index=0
+        )
+    )
+    ds = ((e + 127) << 23).bitcast(fx.Float32)
+    return out[0] * ds, out[1] * ds
 
 
 def quant_floor(a0, a1):
