@@ -351,7 +351,7 @@ def ffn_stages(ctx):
     DN_S_BYTES = HIDDEN * (-(-(INTER // 32) // 8) * 8) if MX else HIDDEN // 128 * (INTER // 128) * 4
     SH_DN_CHUNKS = INTER // 64  # the shared expert's down: one 64-K chunk a wave of its row group
     # 128-k chunks per wave in flight / prefetched before the mid wait (fewer past S = 8: register room)
-    DN_BATCH = 9 if S <= 8 else 6
+    DN_BATCH = 9 if S <= 8 else 5
     DN_MID_BLOCKS = (DN_BLK + WAVES - 1) // WAVES  # mid blocks a lane quantizes
     DN_MID_ROUND = 22  # of them in flight at once: all of them up to S = 8
     for t in range(start("down"), N_DN_TILES, G):
